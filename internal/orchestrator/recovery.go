@@ -78,6 +78,10 @@ func RecoverRuns(
 
 	for _, r := range pending {
 		l := makeLoop(r.id, r.input)
+		if l == nil {
+			slog.Warn("RecoverRuns: makeLoop returned nil, skipping run", "run_id", string(r.id))
+			continue
+		}
 		go func(l *Loop) {
 			slog.Info("recovery: resuming run", "run_id", string(l.RunID))
 			if err := l.Run(ctx); err != nil {

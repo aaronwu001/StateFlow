@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aaronwu000/stateflow/internal/core"
+	"github.com/aaronwu000/stateflow/internal/transport"
 )
 
 // Store extends core.StateStore with operations the loop requires but that are
@@ -152,7 +153,14 @@ func (l *Loop) Run(ctx context.Context) error {
 				return fmt.Errorf("loop: RecordAttemptStart %q attempt %d: %w", spec.Name, attemptNum, err)
 			}
 
-			result, err := l.Transport.Dispatch(ctx, spec)
+			// Inject DispatchMeta so AsyncTransport can route the callback to
+			// the right channel. SyncTransport ignores the meta.
+			stepID := core.StepID(fmt.Sprintf("%s:%s", l.RunID, spec.Name))
+			dispatchCtx := transport.WithDispatchMeta(ctx, transport.DispatchMeta{
+				StepID:    stepID,
+				AttemptID: attemptID,
+			})
+			result, err := l.Transport.Dispatch(dispatchCtx, spec)
 			if err != nil {
 				// Transport-level error (e.g., connection refused before response).
 				// Treat as failed so Barrier 2 still fires.
