@@ -308,9 +308,15 @@ def run():
     return jsonify(result)
 ```
 
-For sync workers the input is deterministic for a given step position (StateFlow
-passes `workflow_input + history` as-is), so hashing the input is a reliable
-idempotency key.
+For sync workers, StateFlow passes `workflow_input + history` as-is, so the
+input is deterministic for a given step position — hashing it is a reliable
+idempotency key **as long as your input has no non-deterministic fields**
+(timestamps, random IDs, floating-point ordering, etc.).  If the input can
+vary across retries, prefer an external stable key (e.g., derive one from
+`workflow_input` alone, or switch to async mode where `step_id` is available).
+
+The async pattern (using `step_id`) is more robust and is recommended whenever
+you can modify the worker.
 
 ### 2.4 Production recommendations
 

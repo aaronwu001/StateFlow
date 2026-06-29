@@ -46,24 +46,24 @@ Workers must be **idempotent** (StateFlow is at-least-once). The
 
 ## Quick start
 
-**Prerequisites:** Docker (Postgres), Go 1.22+, Python 3.9+
+**Prerequisites:** Docker (Postgres), Go 1.22+
 
 ```bash
 # 1. Start Postgres
-docker run -d --name stateflow-pg-test \
+docker run -d --name stateflow-pg \
   -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=stateflow_test \
+  -e POSTGRES_DB=stateflow \
   -p 5432:5432 postgres:16-alpine
 
 # 2. Build
 go build -o stateflow ./cmd/stateflow/
 
-# 3. Apply schema
-psql postgres://postgres:postgres@localhost:5432/stateflow_test?sslmode=disable \
+# 3. Apply schema  (binary does NOT auto-migrate)
+psql postgres://postgres:postgres@localhost:5432/stateflow?sslmode=disable \
   -f migrations/001_initial.sql
 
 # 4. Run
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/stateflow_test?sslmode=disable \
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/stateflow?sslmode=disable \
   ./stateflow
 ```
 
@@ -72,6 +72,11 @@ StateFlow listens on `:8080`. Override with `LISTEN_ADDR=:9090`.
 ---
 
 ## API at a glance
+
+> **Worker URLs below are placeholders.** StateFlow calls whatever URL you
+> provide — replace them with your actual worker endpoints.
+> For a fully wired end-to-end example with real workers, see the
+> [crash-recovery demo](demo/).
 
 ```bash
 # Create a workflow (static planner)
@@ -82,8 +87,8 @@ curl -X POST http://localhost:8080/workflows \
     "planner_type": "static",
     "planner_config": {
       "steps": [
-        {"name":"step1","worker_url":"http://worker1/run","mode":"sync"},
-        {"name":"step2","worker_url":"http://worker2/run","mode":"async"}
+        {"name":"step1","worker_url":"http://YOUR-WORKER/run","mode":"sync"},
+        {"name":"step2","worker_url":"http://YOUR-WORKER/run","mode":"async"}
       ]
     }
   }'
