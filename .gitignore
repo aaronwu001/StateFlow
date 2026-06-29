@@ -1,0 +1,6 @@
+# Go binaries
+demo/stateflow
+demo/stateflow.exe
+
+# Test artifacts
+*.test

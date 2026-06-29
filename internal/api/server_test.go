@@ -84,6 +84,12 @@ func newTestServer(t *testing.T, db *sql.DB) (*httptest.Server, context.CancelFu
 				t.Errorf("NewStaticPlanner: %v", err)
 				return
 			}
+		case "http":
+			p, err = planner.NewHTTPPlanner(plannerConfig)
+			if err != nil {
+				t.Errorf("NewHTTPPlanner: %v", err)
+				return
+			}
 		default:
 			t.Errorf("unknown planner_type %q", plannerType)
 			return
@@ -432,4 +438,94 @@ func TestAPI_GetRun_NotFound(t *testing.T) {
 	}
 	resp.Body.Close()
 	t.Log("PASS — GET /runs/unknown → 404")
+}
+
+// ── Test 5: End-to-end with HTTP planner ─────────────────────────────────
+
+// TestAPI_EndToEnd_HTTPPlanner verifies the full happy path with an HTTP planner:
+//
+//	POST /workflows (planner_type="http") → POST /workflows/:id/runs →
+//	fake planner server → fake worker → run DONE
+//
+// The fake planner inspects RunState.History to decide:
+//   - empty history → continue (dispatch step1)
+//   - step1 in history → done
+//
+// This proves the loop, HTTPPlanner, and the API are wired together correctly.
+func TestAPI_EndToEnd_HTTPPlanner(t *testing.T) {
+	db := openDB(t)
+	resetSchema(t, db)
+
+	// Fake sync worker: always succeeds.
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"result":"ok"}`)
+	}))
+	defer worker.Close()
+
+	// Fake HTTP planner: stateless logic based on RunState.History length.
+	//   call 1 (history empty) → continue, dispatch step1 to worker
+	//   call 2 (step1 done)    → done
+	fakePlanner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var state core.RunState
+		if err := json.NewDecoder(r.Body).Decode(&state); err != nil {
+			t.Errorf("fake planner: decode RunState: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if len(state.History) == 0 {
+			fmt.Fprintf(w, `{"status":"continue","step":{"name":"step1","worker_url":%q,"mode":"sync","timeout_seconds":5}}`, worker.URL)
+		} else {
+			fmt.Fprint(w, `{"status":"done"}`)
+		}
+	}))
+	defer fakePlanner.Close()
+
+	apiSrv, _ := newTestServer(t, db)
+	base := apiSrv.URL
+
+	// POST /workflows with planner_type="http".
+	plannerConfig := fmt.Sprintf(`{"url":%q}`, fakePlanner.URL)
+	wfBody := fmt.Sprintf(`{"name":"http-planner-wf","planner_type":"http","planner_config":%s}`, plannerConfig)
+	resp := post(t, base+"/workflows", wfBody)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /workflows: status %d, want 201", resp.StatusCode)
+	}
+	wfData := decodeJSON(t, resp)
+	workflowID := wfData["workflow_id"].(string)
+	t.Logf("PASS — POST /workflows → workflow_id=%s", workflowID)
+
+	// POST /workflows/:id/runs.
+	resp = post(t, base+"/workflows/"+workflowID+"/runs", `{"workflow_input":{"doc":"report.pdf"}}`)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /runs: status %d, want 202", resp.StatusCode)
+	}
+	runData := decodeJSON(t, resp)
+	runID := runData["run_id"].(string)
+	t.Logf("PASS — POST /runs → run_id=%s", runID)
+
+	// Poll until the run reaches a terminal state.
+	finalStatus := pollRunStatus(t, base, runID, 10*time.Second)
+	if finalStatus != "DONE" {
+		t.Errorf("run.status = %q, want DONE", finalStatus)
+	}
+	t.Logf("PASS — run %s → %s via HTTPPlanner", runID, finalStatus)
+
+	// Verify that step1 completed successfully.
+	resp = get(t, base+"/runs/"+runID)
+	runView := decodeJSON(t, resp)
+	steps := runView["steps"].([]any)
+	if len(steps) != 1 {
+		t.Errorf("steps count = %d, want 1", len(steps))
+	} else {
+		s0 := steps[0].(map[string]any)
+		if s0["status"] != "DONE" {
+			t.Errorf("step status = %q, want DONE", s0["status"])
+		}
+		if s0["step_name"] != "step1" {
+			t.Errorf("step step_name = %q, want step1", s0["step_name"])
+		}
+		t.Logf("PASS — steps[0].step_name=%s status=%s", s0["step_name"], s0["status"])
+	}
 }

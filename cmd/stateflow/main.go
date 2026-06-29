@@ -127,14 +127,15 @@ func main() {
 }
 
 // buildPlanner instantiates the correct NextStepPlanner implementation.
-// Only "static" is supported in MVP; "http" is deferred to Session 10.
 func buildPlanner(plannerType string, plannerConfig json.RawMessage) (core.NextStepPlanner, error) {
 	switch plannerType {
 	case "static":
 		// NewStaticPlanner accepts YAML; yaml.v3 also parses JSON, so the JSONB
 		// bytes from Postgres work directly.
 		return planner.NewStaticPlanner(plannerConfig)
+	case "http":
+		return planner.NewHTTPPlanner(plannerConfig)
 	default:
-		return nil, fmt.Errorf("unsupported planner_type %q (http planner is Session 10)", plannerType)
+		return nil, fmt.Errorf("unsupported planner_type %q", plannerType)
 	}
 }
