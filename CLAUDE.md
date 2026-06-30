@@ -129,6 +129,37 @@ Do not report success based on "the code looks correct." Run the verifier. If th
 
 ---
 
+## Demo Infrastructure
+
+Interactive demo: `./demo/run_demo.sh` (menu-driven, 5 scenarios)
+Automated demo: `python demo/crash_demo.py` (single scenario, auto-run)
+
+### Files added (2026-07-01)
+- `demo/run_demo.sh` — interactive bash runner; builds binary, manages DB, runs 5 scenarios
+- `demo/worker.py` — generic Flask worker (WORKER_NAME/PORT/DELAY env vars); logs to `/tmp/worker_{name}.log`
+- `demo/configs/static_3step.yaml` — 3-step JSON planner_config (ocr:5010, ner:5011, summarize:5012)
+- `demo/configs/http_planner.yaml` — HTTP planner config pointing at llm_adapter port 9000
+
+### Go change (recovery.go)
+Added `[RECOVERY]` structured log messages with per-run step counts:
+```
+msg="[RECOVERY] found in-progress runs" count=1
+msg="[RECOVERY] resuming run" run_id=... steps_done=1 pending_step=ner
+```
+
+### Actual API paths (whitepaper says /workflow/start — code differs)
+```
+POST /workflows                          create workflow (name, planner_type, planner_config)
+POST /workflows/{workflow_id}/runs       start run (workflow_input)
+GET  /runs/{run_id}                      status + steps
+GET  /dlq                                list DLQ entries
+POST /dlq/{id}/replay                    replay DLQ entry (resets step to DECIDED, re-enters loop)
+POST /tasks/complete                     async worker callback
+POST /tasks/fail                         async worker failure callback
+```
+
+---
+
 ## Quick Reference
 
 ```

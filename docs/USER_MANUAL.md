@@ -25,12 +25,12 @@ On every step, StateFlow POSTs to your planner URL with a JSON body:
   "history": [
     {
       "name":   "ocr",
-      "status": "done",
+      "status": "DONE",
       "output": { "pages": 3, "text": "..." }
     },
     {
       "name":   "ner",
-      "status": "done",
+      "status": "DONE",
       "output": { "entities": ["Alice", "Acme Corp"] }
     }
   ]
@@ -124,7 +124,7 @@ Rules you MUST follow:
    - "input": the JSON payload the worker needs
 4. If the workflow is complete, respond with {"status": "done"}.
 5. If the workflow cannot proceed (unrecoverable error), respond with {"status": "fail"}.
-6. Do not repeat a step that appears in "history" with status "done".
+6. Do not repeat a step that appears in "history" with status "DONE" (uppercase).
 
 Example response when starting step "ocr":
 {"status":"continue","step":{"name":"ocr","worker_url":"http://my-service/ocr","mode":"sync","timeout_seconds":30,"input":{"doc_url":"https://example.com/report.pdf"}}}

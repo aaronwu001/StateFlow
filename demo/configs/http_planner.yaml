@@ -1,0 +1,4 @@
+{
+  "url": "http://localhost:9000/decide",
+  "timeout_seconds": 30
+}

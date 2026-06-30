@@ -1,0 +1,7 @@
+{
+  "steps": [
+    {"name": "ocr",       "worker_url": "http://localhost:5010/run", "mode": "sync", "timeout_seconds": 30},
+    {"name": "ner",       "worker_url": "http://localhost:5011/run", "mode": "sync", "timeout_seconds": 30},
+    {"name": "summarize", "worker_url": "http://localhost:5012/run", "mode": "sync", "timeout_seconds": 30}
+  ]
+}

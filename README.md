@@ -58,9 +58,8 @@ docker run -d --name stateflow-pg \
 # 2. Build
 go build -o stateflow ./cmd/stateflow/
 
-# 3. Apply schema  (binary does NOT auto-migrate)
-psql postgres://postgres:postgres@localhost:5432/stateflow?sslmode=disable \
-  -f migrations/001_initial.sql
+# 3. Apply schema  (binary does NOT auto-migrate; psql runs inside the container)
+docker exec -i stateflow-pg psql -U postgres -d stateflow < migrations/001_initial.sql
 
 # 4. Run
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/stateflow?sslmode=disable \

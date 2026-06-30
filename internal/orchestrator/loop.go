@@ -94,10 +94,14 @@ func (l *Loop) Run(ctx context.Context) error {
 				return fmt.Errorf("loop: LoadFrontier: %w", err)
 			}
 
+			history := frontier.History
+			if history == nil {
+				history = []core.HistoryEntry{}
+			}
 			state := core.RunState{
 				RunID:         l.RunID,
 				WorkflowInput: l.WorkflowInput,
-				History:       frontier.History,
+				History:       history,
 			}
 
 			decision, err := l.Planner.Decide(ctx, state)

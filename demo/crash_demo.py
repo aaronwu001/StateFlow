@@ -328,8 +328,8 @@ def main():
     # 8. Restart orchestrator — recovery fires
     revive("RESTARTING ORCHESTRATOR  —  RecoverRuns fires at startup")
     section("RECOVERY", "StateFlow boot 2 — watch for recovery log lines")
-    _p("  ┌─ Expected log: msg=\"RecoverRuns: complete\" count=1")
-    _p("  └─ Expected log: msg=\"recovery: resuming run\"")
+    _p("  ┌─ Expected log: msg=\"[RECOVERY] found in-progress runs\" count=1")
+    _p("  └─ Expected log: msg=\"[RECOVERY] resuming run\" steps_done=1 pending_step=ner")
     _p("")
     start_stateflow("StateFlow (boot 2 — recovery)")
 
@@ -357,7 +357,7 @@ def main():
     _p("    [NER]  ⚠️  Callback failed    (orchestrator was down)")
     _p("")
     _p("  AFTER RESTART:")
-    _p("    msg=\"recovery: resuming run\"    (recovery found the RUNNING run)")
+    _p("    msg=\"[RECOVERY] resuming run\"    (recovery found the RUNNING run)")
     _p("    [NER]  ⚡ Already processed   (re-dispatch, idempotency cache hit)")
     _p("    [NER]  📤 Callback delivered  (new attempt_id → StateFlow)")
     _p("    [SUMMARIZE] ✍️  ...            (step 3 runs for the FIRST time)")

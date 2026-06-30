@@ -76,23 +76,41 @@ func RecoverRuns(
 		return 0, fmt.Errorf("RecoverRuns: iterate rows: %w", err)
 	}
 
+	slog.Info("[RECOVERY] found in-progress runs", "count", len(pending))
+
 	for _, r := range pending {
+		// Query step context for the recovery log line.
+		var doneCount int
+		var pendingStep sql.NullString
+		_ = db.QueryRowContext(ctx, `
+			SELECT
+				(SELECT COUNT(*) FROM steps WHERE run_id = $1 AND status = 'DONE'),
+				(SELECT step_name FROM steps WHERE run_id = $1 AND status IN ('RUNNING','DECIDED') ORDER BY seq LIMIT 1)
+		`, string(r.id)).Scan(&doneCount, &pendingStep)
+
+		step := "-"
+		if pendingStep.Valid {
+			step = pendingStep.String
+		}
+		slog.Info("[RECOVERY] resuming run",
+			"run_id", string(r.id),
+			"steps_done", doneCount,
+			"pending_step", step)
+
 		l := makeLoop(r.id, r.input)
 		if l == nil {
-			slog.Warn("RecoverRuns: makeLoop returned nil, skipping run", "run_id", string(r.id))
+			slog.Warn("[RECOVERY] skipping run: makeLoop returned nil", "run_id", string(r.id))
 			continue
 		}
 		go func(l *Loop) {
-			slog.Info("recovery: resuming run", "run_id", string(l.RunID))
 			if err := l.Run(ctx); err != nil {
-				slog.Error("recovery: run ended with error",
-					"run_id", string(l.RunID), "err", err)
+				slog.Error("[RECOVERY] run ended with error", "run_id", string(l.RunID), "err", err)
 			} else {
-				slog.Info("recovery: run completed", "run_id", string(l.RunID))
+				slog.Info("[RECOVERY] run completed", "run_id", string(l.RunID))
 			}
 		}(l)
 	}
 
-	slog.Info("RecoverRuns: complete", "count", len(pending))
+	slog.Info("[RECOVERY] complete", "resumed", len(pending))
 	return len(pending), nil
 }
