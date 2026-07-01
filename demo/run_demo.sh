@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# StateFlow Interactive Demo
-# Proves three reliability claims across five scenarios.
+# StateFlow Interactive Demo — LLM Planner mode
+# Proves three reliability claims across three scenarios.
 set -euo pipefail
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -8,8 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SF_BINARY="$SCRIPT_DIR/stateflow"
-LLM_ADAPTER="$PROJECT_ROOT/llm_client_demo/llm_adapter.py"
-WORKER_SCRIPT="$SCRIPT_DIR/worker.py"
+LLM_ADAPTER="$SCRIPT_DIR/planner/llm_adapter.py"
+WORKER_SCRIPT="$SCRIPT_DIR/workers/worker.py"
 MIGRATION_SQL="$PROJECT_ROOT/migrations/001_initial.sql"
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -214,15 +214,6 @@ count_adapter_calls() {
 
 # ── StateFlow API helpers ──────────────────────────────────────────────────────
 
-# create_static_workflow <name> <planner_config_json> → workflow_id
-create_static_workflow() {
-    local name=$1 config=$2
-    curl -sf -X POST "$SF_URL/workflows" \
-        -H "Content-Type: application/json" \
-        -d "{\"name\":\"$name\",\"planner_type\":\"static\",\"planner_config\":$config}" \
-    | python3 -c "import json,sys; print(json.load(sys.stdin)['workflow_id'])"
-}
-
 # create_http_workflow <name> <planner_url> → workflow_id
 create_http_workflow() {
     local name=$1 url=$2
@@ -259,9 +250,9 @@ poll_status() {
     return 1
 }
 
-# wait_for_step_done <run_id> <step_name> [<timeout_s>] → 0 when DONE
-wait_for_step_done() {
-    local run_id=$1 step=$2 timeout=${3:-60}
+# wait_for_step_status <run_id> <step_name> <status> [<timeout_s>] → 0 when matched
+wait_for_step_status() {
+    local run_id=$1 step=$2 want_status=$3 timeout=${4:-60}
     local deadline=$(($(date +%s) + timeout))
     while [[ $(date +%s) -lt $deadline ]]; do
         local st
@@ -272,7 +263,7 @@ for s in d.get('steps',[]):
     if s['step_name']=='$step': print(s['status']); sys.exit(0)
 print('PENDING')
 " 2>/dev/null) || { sleep 1; continue; }
-        [[ "$st" == "DONE" ]] && return 0
+        [[ "$st" == "$want_status" ]] && return 0
         sleep 1
     done
     return 1
@@ -331,225 +322,24 @@ replay_dlq() {
     | python3 -c "import json,sys; print(json.load(sys.stdin).get('run_id',''))"
 }
 
-# ── Static planner config (inline JSON — same as demo/configs/static_3step.yaml) ──
-
-STATIC_3STEP_CONFIG='{
-  "steps": [
-    {"name":"ocr",      "worker_url":"http://localhost:5010/run","mode":"sync","timeout_seconds":30},
-    {"name":"ner",      "worker_url":"http://localhost:5011/run","mode":"sync","timeout_seconds":30},
-    {"name":"summarize","worker_url":"http://localhost:5012/run","mode":"sync","timeout_seconds":30}
-  ]
-}'
-
-# ── Scenario 1: Happy Path (Static Planner) ───────────────────────────────────
-
-scenario_happy_path_static() {
-    header "Scenario 1: Happy Path (Static Planner)"
-    info "Claim: StateFlow drives a 3-step pipeline to completion."
-    info "Steps: ocr (5010) → ner (5011) → summarize (5012)"
-    echo
-
-    setup_db
-
-    start_worker ocr 5010 1
-    start_worker ner 5011 1
-    start_worker summarize 5012 1
-    > /tmp/stateflow.log
-    start_orchestrator
-
-    pause "All workers and orchestrator are up. Submitting workflow."
-
-    info "Creating workflow + starting run..."
-    local wf_id run_id
-    wf_id=$(create_static_workflow "happy-path-static" "$STATIC_3STEP_CONFIG")
-    run_id=$(start_run "$wf_id" '{"doc":"report.pdf"}')
-    info "run_id = $run_id"
-
-    info "Polling for completion..."
-    local result status
-    result=$(poll_status "$run_id" 60)
-    status=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
-
-    show_status "$run_id"
-
-    if [[ "$status" == "DONE" ]]; then
-        success "PASS — All 3 steps completed, run status = DONE"
-    else
-        error "FAIL — Expected DONE, got $status"
-    fi
-
-    stop_orchestrator
-    stop_worker ocr; stop_worker ner; stop_worker summarize
-    reset_db
-}
-
-# ── Scenario 2: Worker Crash & DLQ Replay ─────────────────────────────────────
-
-scenario_worker_crash() {
-    header "Scenario 2: Worker Crash & DLQ Replay"
-    info "Claim: A failed step lands in DLQ. Replay resumes the run — one API call."
-    info "Proof: After replay, ocr is NOT re-run (called exactly once)."
-    echo
-
-    setup_db
-
-    start_worker ocr 5010 1
-    # ner (port 5011) is intentionally NOT started — connection refused → fail
-    start_worker summarize 5012 1
-    > /tmp/stateflow.log
-    start_orchestrator
-
-    warn "Worker 'ner' (port 5011) is DOWN — step 2 will fail 3 times then enter DLQ"
-    pause "Submitting workflow now. ner will retry 3×(5s delay) ≈ 15s before DLQ."
-
-    local wf_id run_id
-    wf_id=$(create_static_workflow "worker-crash-demo" "$STATIC_3STEP_CONFIG")
-    run_id=$(start_run "$wf_id" '{"doc":"report.pdf"}')
-    info "run_id = $run_id"
-
-    info "Waiting for run to reach terminal state (FAILED → DLQ)..."
-    local result
-    result=$(poll_status "$run_id" 90) || result="{}"
-
-    show_status "$run_id"
-    show_dlq
-
-    local dlq_id
-    dlq_id=$(get_dlq_entry_id)
-    if [[ -z "$dlq_id" ]]; then
-        error "FAIL — No DLQ entry found"
-        stop_orchestrator; stop_worker ocr; stop_worker summarize; reset_db
-        return 1
-    fi
-    success "DLQ entry found: id=${dlq_id}"
-
-    pause "Starting 'ner' worker now, then replaying DLQ entry ${dlq_id}."
-
-    start_worker ner 5011 1
-
-    info "Replaying DLQ entry ${dlq_id}..."
-    replay_dlq "$dlq_id" >/dev/null
-    info "Replay submitted — polling for completion..."
-
-    result=$(poll_status "$run_id" 60)
-    local status
-    status=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
-
-    show_status "$run_id"
-
-    local ocr_calls
-    ocr_calls=$(count_worker_calls ocr)
-    info "OCR worker invocation count: ${ocr_calls}"
-
-    if [[ "$status" == "DONE" ]] && [[ "$ocr_calls" -eq 1 ]]; then
-        success "PASS — Run completed after DLQ replay; OCR not re-run (called ${ocr_calls}×)"
-    else
-        error "FAIL — status=${status}, ocr_calls=${ocr_calls} (want DONE + 1)"
-    fi
-
-    stop_orchestrator
-    stop_worker ocr; stop_worker ner; stop_worker summarize
-    reset_db
-}
-
-# ── Scenario 3: Orchestrator Crash & Recovery ─────────────────────────────────
-
-scenario_orchestrator_crash() {
-    header "Scenario 3: Orchestrator Crash & Recovery"
-    info "Claim: SIGKILL the orchestrator mid-run. Restart. Completed steps NOT re-run."
-    info "Kill point: while 'ner' is dispatched (8s worker gives the window)."
-    echo
-
-    setup_db
-
-    start_worker ocr 5010 1   # fast: completes before kill
-    start_worker ner 5011 8   # slow: 8s gives crash window
-    start_worker summarize 5012 1
-    > /tmp/stateflow.log
-    start_orchestrator
-
-    pause "Workers up (ner is slow — 8s). Submitting workflow."
-
-    local wf_id run_id
-    wf_id=$(create_static_workflow "crash-recovery-demo" "$STATIC_3STEP_CONFIG")
-    run_id=$(start_run "$wf_id" '{"doc":"report.pdf"}')
-    info "run_id = $run_id"
-
-    info "Waiting for step 'ocr' to reach DONE..."
-    if wait_for_step_done "$run_id" "ocr" 30; then
-        success "Step 'ocr' is DONE"
-    else
-        error "Timed out waiting for ocr"
-        stop_orchestrator; stop_worker ocr; stop_worker ner; stop_worker summarize; reset_db
-        return 1
-    fi
-
-    # Brief pause so ner dispatch is in-flight, then kill.
-    sleep 1
-    echo
-    warn "OCR is DONE. NER is now running inside the orchestrator process."
-    warn "Killing orchestrator with SIGKILL — NER's in-process channel dies with it."
-    kill_orchestrator
-    warn "Orchestrator dead. DB still shows ner=RUNNING (no output); summarize=never started."
-
-    pause "Inspect Postgres state. Then we'll restart the orchestrator."
-
-    echo -e "${BOLD}   Raw Postgres state:${NC}"
-    pg_query "SELECT step_name, status, (current_attempt_id IS NOT NULL) AS dispatched FROM steps WHERE run_id = '$run_id' ORDER BY seq;"
-
-    pause "Restarting orchestrator. Watch for [RECOVERY] log lines."
-
-    > /tmp/stateflow.log   # fresh log so recovery messages are easy to spot
-    start_orchestrator
-
-    sleep 1
-    echo -e "${BOLD}   Recovery log (from stateflow.log):${NC}"
-    grep -i recovery /tmp/stateflow.log 2>/dev/null | head -10 | sed 's/^/   /' || true
-    echo
-
-    info "Polling for completion..."
-    local result
-    result=$(poll_status "$run_id" 60)
-    local status
-    status=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
-
-    show_status "$run_id"
-
-    local ocr_calls ner_calls
-    ocr_calls=$(count_worker_calls ocr)
-    ner_calls=$(count_worker_calls ner)
-    info "Worker invocation counts: ocr=${ocr_calls}  ner=${ner_calls}"
-    info "(ocr must be 1 — it completed before the crash and must not be re-run)"
-    info "(ner will be 2 — once before crash [no checkpoint], once after recovery)"
-
-    if [[ "$status" == "DONE" ]] && [[ "$ocr_calls" -eq 1 ]]; then
-        success "PASS — Run completed after crash recovery; OCR not re-run (called ${ocr_calls}×)"
-    else
-        error "FAIL — status=${status}, ocr_calls=${ocr_calls} (want DONE + 1)"
-    fi
-
-    stop_orchestrator
-    stop_worker ocr; stop_worker ner; stop_worker summarize
-    reset_db
-}
-
-# ── Scenario 4: Happy Path (LLM Planner) ─────────────────────────────────────
+# ── Scenario 1: Happy Path (LLM Planner) ─────────────────────────────────────
 
 scenario_happy_path_llm() {
-    header "Scenario 4: Happy Path (LLM / HTTP Planner)"
+    header "Scenario 1: Happy Path (LLM / HTTP Planner)"
     info "Claim: StateFlow can be driven by any HTTP endpoint as the planner."
     info "Using llm_adapter.py in DUMMY mode (no API key needed) — 2-step pipeline."
+    info "  step1 → :5010   step2 → :5011"
     echo
 
     setup_db
 
-    # llm_adapter (dummy) dispatches both steps to port 5010.
-    start_worker ocr 5010 1
+    start_worker step1 5010 1
+    start_worker step2 5011 1
     start_llm_adapter
     > /tmp/stateflow.log
     start_orchestrator
 
-    pause "Echo worker + LLM adapter up. Submitting workflow."
+    pause "Workers + LLM adapter up. Submitting workflow."
 
     local wf_id run_id
     wf_id=$(create_http_workflow "llm-happy-path" "http://localhost:9000/decide")
@@ -566,38 +356,114 @@ scenario_happy_path_llm() {
 
     local adapter_calls
     adapter_calls=$(count_adapter_calls)
-    info "LLM adapter was called ${adapter_calls} time(s)"
+    info "LLM adapter was called ${adapter_calls} time(s)  (expected: 3)"
+    info "  call 1: history=[]             → decides step1 → :5010"
+    info "  call 2: history=[step1]        → decides step2 → :5011"
+    info "  call 3: history=[step1,step2]  → done"
 
     if [[ "$status" == "DONE" ]]; then
-        success "PASS — LLM-driven pipeline completed (2 steps); adapter called ${adapter_calls}×"
+        success "PASS — LLM-driven pipeline completed; adapter called ${adapter_calls}×"
     else
         error "FAIL — Expected DONE, got $status"
     fi
 
     stop_orchestrator
-    stop_worker ocr
+    stop_worker step1; stop_worker step2
     stop_llm_adapter
     reset_db
 }
 
-# ── Scenario 5: Orchestrator Crash (LLM Planner) ─────────────────────────────
+# ── Scenario 2: Worker Crash & DLQ Replay (LLM Planner) ──────────────────────
 
-scenario_orchestrator_crash_llm() {
-    header "Scenario 5: Orchestrator Crash (LLM Planner)"
-    info "Claim: After crash recovery, the planner is NOT re-called for already-decided steps."
-    info "Kill point: while step1 is dispatched (5s worker). Step1 is RUNNING in DB."
-    info "Proof: total planner calls == 3 (same as no-crash; no extra call on re-dispatch)."
+scenario_worker_crash_llm() {
+    header "Scenario 2: Worker Crash & DLQ Replay (LLM Planner)"
+    info "Claim: A failed step lands in DLQ. Replay resumes — step1 not re-run."
+    info "  step1 → :5010 (UP)   step2 → :5011 (intentionally DOWN)"
     echo
 
     setup_db
 
-    # Both llm_adapter steps dispatch to port 5010.
-    start_worker ocr 5010 5   # 5s delay gives crash window
+    # Only step1 worker is started; step2 (port 5011) is intentionally absent.
+    start_worker step1 5010 1
     start_llm_adapter
     > /tmp/stateflow.log
     start_orchestrator
 
-    pause "Worker (5s delay) + LLM adapter up. Submitting workflow."
+    warn "Worker for step2 (port 5011) is DOWN — step2 will fail 3 times then enter DLQ"
+    pause "Submitting workflow. step2 retries 3×(~5s each) ≈ 15s before DLQ."
+
+    local wf_id run_id
+    wf_id=$(create_http_workflow "llm-worker-crash" "http://localhost:9000/decide")
+    run_id=$(start_run "$wf_id" '{"task":"worker crash test"}')
+    info "run_id = $run_id"
+
+    info "Waiting for run to reach terminal state (step2 → DLQ)..."
+    local result
+    result=$(poll_status "$run_id" 90) || result="{}"
+
+    show_status "$run_id"
+    show_dlq
+
+    local dlq_id
+    dlq_id=$(get_dlq_entry_id)
+    if [[ -z "$dlq_id" ]]; then
+        error "FAIL — No DLQ entry found"
+        stop_orchestrator; stop_worker step1; stop_llm_adapter; reset_db
+        return 1
+    fi
+    success "DLQ entry found: id=${dlq_id}"
+
+    local step1_calls
+    step1_calls=$(count_worker_calls step1)
+    info "step1 invocation count before replay: ${step1_calls}"
+
+    pause "Starting step2 worker now, then replaying DLQ entry ${dlq_id}."
+
+    start_worker step2 5011 1
+
+    info "Replaying DLQ entry ${dlq_id}..."
+    replay_dlq "$dlq_id" >/dev/null
+    info "Replay submitted — polling for completion..."
+
+    result=$(poll_status "$run_id" 60)
+    local status
+    status=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+
+    show_status "$run_id"
+
+    step1_calls=$(count_worker_calls step1)
+    info "step1 final invocation count: ${step1_calls}  (must be 1 — not re-run after replay)"
+
+    if [[ "$status" == "DONE" ]] && [[ "$step1_calls" -eq 1 ]]; then
+        success "PASS — Run completed after DLQ replay; step1 not re-run (called ${step1_calls}×)"
+    else
+        error "FAIL — status=${status}, step1_calls=${step1_calls} (want DONE + 1)"
+    fi
+
+    stop_orchestrator
+    stop_worker step1; stop_worker step2
+    stop_llm_adapter
+    reset_db
+}
+
+# ── Scenario 3: Orchestrator Crash & Recovery (LLM Planner) ──────────────────
+
+scenario_orchestrator_crash_llm() {
+    header "Scenario 3: Orchestrator Crash & Recovery (LLM Planner)"
+    info "Claim: After crash recovery, the planner is NOT re-called for already-decided steps."
+    info "Kill point: while step1 is dispatched (5s worker). step1 is RUNNING in DB."
+    info "Proof: total planner calls ≤ 3 (same as no-crash; no extra call on re-dispatch)."
+    echo
+
+    setup_db
+
+    start_worker step1 5010 5   # 5s delay gives crash window
+    start_worker step2 5011 1
+    start_llm_adapter
+    > /tmp/stateflow.log
+    start_orchestrator
+
+    pause "Workers (step1=5s delay) + LLM adapter up. Submitting workflow."
 
     local wf_id run_id
     wf_id=$(create_http_workflow "llm-crash-demo" "http://localhost:9000/decide")
@@ -605,12 +471,17 @@ scenario_orchestrator_crash_llm() {
     info "run_id = $run_id"
 
     # Wait for planner to decide step1 and dispatch it (adapter calls ≥ 1).
-    info "Waiting for step1 to be dispatched (~1s)..."
+    info "Waiting for step1 to be dispatched (~1s after submit)..."
     sleep 3
 
     warn "Killing orchestrator while step1 is running (5s worker, still processing)."
     kill_orchestrator
     warn "Orchestrator dead. step1 is RUNNING in DB (Barrier 1 fired; Barrier 2 not yet)."
+
+    pause "Inspect Postgres state, then restart orchestrator."
+
+    echo -e "${BOLD}   Raw Postgres state:${NC}"
+    pg_query "SELECT step_name, status, (current_attempt_id IS NOT NULL) AS dispatched FROM steps WHERE run_id = '$run_id' ORDER BY seq;"
 
     pause "Restarting orchestrator. Recovery must re-dispatch step1 WITHOUT re-calling planner."
 
@@ -633,8 +504,8 @@ scenario_orchestrator_crash_llm() {
     local adapter_calls
     adapter_calls=$(count_adapter_calls)
     info "LLM adapter call count: ${adapter_calls}"
-    info "Expected ≤ 3 calls (step1 decide, step2 decide, done check)."
-    info "If > 3: step1 was re-decided after recovery — that would be a bug."
+    info "Expected ≤ 3 (step1 decide, step2 decide, done check)."
+    info "If > 3: step1 was re-decided after recovery — Barrier 1 violation."
 
     if [[ "$status" == "DONE" ]] && [[ "$adapter_calls" -le 3 ]]; then
         success "PASS — Recovery complete; adapter called ${adapter_calls}× (≤3 — no extra re-decision)"
@@ -643,7 +514,7 @@ scenario_orchestrator_crash_llm() {
     fi
 
     stop_orchestrator
-    stop_worker ocr
+    stop_worker step1; stop_worker step2
     stop_llm_adapter
     reset_db
 }
@@ -652,13 +523,11 @@ scenario_orchestrator_crash_llm() {
 
 show_menu() {
     echo
-    echo -e "${BOLD}${CYAN}   StateFlow Interactive Demo${NC}"
-    echo -e "${BOLD}${CYAN}   ══════════════════════════${NC}"
-    echo -e "   ${BOLD}1)${NC} Happy Path (Static Planner)"
+    echo -e "${BOLD}${CYAN}   StateFlow Interactive Demo  (LLM Planner)${NC}"
+    echo -e "${BOLD}${CYAN}   ══════════════════════════════════════════${NC}"
+    echo -e "   ${BOLD}1)${NC} Happy Path"
     echo -e "   ${BOLD}2)${NC} Worker Crash & DLQ Replay"
     echo -e "   ${BOLD}3)${NC} Orchestrator Crash & Recovery"
-    echo -e "   ${BOLD}4)${NC} Happy Path (LLM Planner)"
-    echo -e "   ${BOLD}5)${NC} Orchestrator Crash (LLM Planner)"
     echo -e "   ${BOLD}A)${NC} Run All Scenarios"
     echo -e "   ${BOLD}Q)${NC} Quit"
     echo
@@ -676,7 +545,12 @@ main() {
     fi
 
     if [[ ! -f "$WORKER_SCRIPT" ]]; then
-        error "demo/worker.py not found at $WORKER_SCRIPT"
+        error "Worker script not found at $WORKER_SCRIPT"
+        exit 1
+    fi
+
+    if [[ ! -f "$LLM_ADAPTER" ]]; then
+        error "LLM adapter not found at $LLM_ADAPTER"
         exit 1
     fi
 
@@ -686,16 +560,12 @@ main() {
         show_menu
         read -rp "   Choice: " choice
         case "${choice,,}" in
-            1) scenario_happy_path_static ;;
-            2) scenario_worker_crash ;;
-            3) scenario_orchestrator_crash ;;
-            4) scenario_happy_path_llm ;;
-            5) scenario_orchestrator_crash_llm ;;
+            1) scenario_happy_path_llm ;;
+            2) scenario_worker_crash_llm ;;
+            3) scenario_orchestrator_crash_llm ;;
             a)
-                scenario_happy_path_static
-                scenario_worker_crash
-                scenario_orchestrator_crash
                 scenario_happy_path_llm
+                scenario_worker_crash_llm
                 scenario_orchestrator_crash_llm
                 echo
                 success "All scenarios complete."

@@ -1,7 +1,8 @@
 """
 Minimal sync worker: echoes its input back as output.
-Runs on port 5010.
+Runs on port 5010 by default.
 
+Used for standalone testing of the LLM adapter without the generic worker.py.
 StateFlow sends:  POST /run  body = whatever `step.input` was in the planner decision
 Worker returns:   JSON (anything) -- StateFlow stores it as the step output
 """

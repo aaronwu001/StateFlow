@@ -45,7 +45,7 @@ def run():
     ts = datetime.now(timezone.utc).isoformat()
 
     # This line is the grep target for invocation counting in run_demo.sh:
-    #   grep -c "[WORKER:ocr] received step" /tmp/worker_ocr.log
+    #   grep -c "[WORKER:step1] received step" /tmp/worker_step1.log
     _log(f"received step at {ts}  input_keys={sorted(body.keys())}")
 
     time.sleep(WORKER_DELAY)

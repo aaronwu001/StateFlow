@@ -11,7 +11,7 @@ StateFlow calls:  POST /decide
 Must return ONLY a JSON object -- no markdown, no prose.
 
 Usage:
-  python llm_client_demo/llm_adapter.py
+  python demo/planner/llm_adapter.py
 """
 
 import json
@@ -47,8 +47,8 @@ You will receive a JSON object with:
   - "history": completed steps so far, each with "name", "status", "output"
 
 Available workers:
-  - http://localhost:5010/run   An echo worker. Useful for any processing step.
-                                Input: any JSON you like (include "_step_name" so logs are readable).
+  - http://localhost:5010/run   Worker for step1.
+  - http://localhost:5011/run   Worker for step2.
 
 Rules:
 1. Respond with ONLY a JSON object. No explanation, no markdown fences, no prose.
@@ -57,6 +57,7 @@ Rules:
 4. Run at most 2 steps total (check history length).
 5. After 2 steps are done, return {"status": "done"}.
 6. Never repeat a step name that appears in history.
+7. step1 must go to http://localhost:5010/run, step2 to http://localhost:5011/run.
 
 Example:
 {"status":"continue","step":{"name":"step1","worker_url":"http://localhost:5010/run","mode":"sync","timeout_seconds":10,"input":{"_step_name":"step1","task":"do something"}}}
@@ -87,7 +88,9 @@ def decide():
 
 
 def _decide_dummy(state, done_names):
-    """Hardcoded 2-step pipeline — no LLM needed."""
+    """Hardcoded 2-step pipeline — no LLM needed.
+    step1 dispatches to :5010, step2 dispatches to :5011.
+    """
     workflow_input = state.get("workflow_input", {})
 
     if "step1" not in done_names:
@@ -109,7 +112,7 @@ def _decide_dummy(state, done_names):
             "status": "continue",
             "step": {
                 "name": "step2",
-                "worker_url": "http://localhost:5010/run",
+                "worker_url": "http://localhost:5011/run",
                 "mode": "sync",
                 "timeout_seconds": 10,
                 "input": {"_step_name": "step2", "previous": step1_output},

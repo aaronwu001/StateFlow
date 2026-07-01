@@ -131,14 +131,47 @@ Do not report success based on "the code looks correct." Run the verifier. If th
 
 ## Demo Infrastructure
 
-Interactive demo: `./demo/run_demo.sh` (menu-driven, 5 scenarios)
-Automated demo: `python demo/crash_demo.py` (single scenario, auto-run)
+**Interactive demo:** `./demo/run_demo.sh` (menu-driven, 3 LLM-planner scenarios)
+**Automated crash proof:** `python demo/crash_demo.py` (single scenario, fully automated)
 
-### Files added (2026-07-01)
-- `demo/run_demo.sh` — interactive bash runner; builds binary, manages DB, runs 5 scenarios
-- `demo/worker.py` — generic Flask worker (WORKER_NAME/PORT/DELAY env vars); logs to `/tmp/worker_{name}.log`
-- `demo/configs/static_3step.yaml` — 3-step JSON planner_config (ocr:5010, ner:5011, summarize:5012)
-- `demo/configs/http_planner.yaml` — HTTP planner config pointing at llm_adapter port 9000
+### Demo directory layout
+
+```
+demo/
+├── run_demo.sh           Interactive 3-scenario menu (LLM planner mode)
+├── crash_demo.py         Automated crash-recovery proof (static planner, specialized workers)
+├── playbook/
+│   ├── PLAYBOOK.zh.md    Manual step-by-step walkthrough (Chinese)
+│   └── PLAYBOOK.en.md    Manual step-by-step walkthrough (English)
+├── planner/
+│   ├── llm_adapter.py    HTTP planner: REAL (Claude sonnet-4-6) or DUMMY (hardcoded 2-step)
+│   └── echo_worker.py    Minimal sync echo worker (port 5010) for standalone planner testing
+├── workers/
+│   ├── worker.py         Generic configurable worker (WORKER_NAME/PORT/DELAY env vars)
+│   ├── ocr_worker.py     crash_demo only — sync, port 5001, idempotency cache
+│   ├── ner_worker.py     crash_demo only — async, port 5002, step_id-keyed cache + callback
+│   └── summarize_worker.py  crash_demo only — sync, port 5003, idempotency cache
+└── configs/
+    ├── llm_planner.yaml  HTTP planner config (port 9000) — reference only
+    └── static_3step.yaml Static 3-step config — used by crash_demo.py internally
+```
+
+### Interactive demo scenarios (run_demo.sh)
+
+All three scenarios use LLM planner (HTTP, port 9000). DUMMY mode requires no API key.
+
+1. **Happy Path** — planner drives 2-step pipeline (step1→:5010, step2→:5011) to completion
+2. **Worker Crash & DLQ Replay** — step2 worker absent → retries → DLQ → replay → complete without re-running step1
+3. **Orchestrator Crash & Recovery** — SIGKILL while step1 in-flight → restart → recovery re-dispatches (not re-decides) → planner calls ≤ 3
+
+### Automated crash demo (crash_demo.py)
+
+Single scenario: OCR (sync, port 5001) → NER (async, port 5002, 5s delay) → Summarize (sync, port 5003). Kills orchestrator while NER is in-flight. Proof: NER idempotency cache hit on re-dispatch; no steps re-run. Run from `demo/` directory.
+
+### LLM planner adapter (demo/planner/llm_adapter.py)
+
+- **DUMMY mode** (no API key): hardcoded 2-step pipeline — step1 → `:5010/run`, step2 → `:5011/run`
+- **REAL mode** (`ANTHROPIC_API_KEY` set): calls Claude `claude-sonnet-4-6` with full RunState JSON; returns StepDecision
 
 ### Go change (recovery.go)
 Added `[RECOVERY]` structured log messages with per-run step counts:
