@@ -87,7 +87,7 @@ func main() {
 	}
 
 	// Step 1: Crash recovery — resume RUNNING runs before accepting new requests.
-	n, err := orchestrator.RecoverRuns(ctx, db, func(runID core.RunID, workflowInput json.RawMessage) *orchestrator.Loop {
+	n, err := orchestrator.RecoverRuns(ctx, s, func(runID core.RunID, workflowInput json.RawMessage) *orchestrator.Loop {
 		// Look up the workflow config for this run.
 		var plannerType string
 		var plannerConfig json.RawMessage

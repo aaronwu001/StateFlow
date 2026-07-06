@@ -41,13 +41,14 @@ The worker's result is checkpointed (status `DONE`) **before** the planner is as
 
 ---
 
-## Three Recovery Rules — The Heart of the Demo
+## Four Recovery Rules — The Heart of the Demo
 
 On restart, for each unfinished run, read the frontier (`LoadFrontier`) and apply:
 
 1. **Step `RUNNING`, `output` is null** → **re-dispatch** (generate a new `attempt_id`). The in-process channel that was awaiting the callback died with the crash. Waiting is impossible. Re-dispatch and rely on worker idempotency.
 2. **Step `DECIDED`, no dispatch confirmed** → **re-dispatch the recorded `decision`** (generate a new `attempt_id` — every dispatch gets a fresh one). Do NOT call `planner.Decide`. The planner was already asked; its answer is in the DB.
 3. **Step `DONE`** → **call `planner.Decide`** with the updated frontier (all DONE steps in `seq` order).
+4. **Step `FAILED`, `output` is null** → **re-dispatch the persisted decision** (same as `DECIDED`/`RUNNING`; new `attempt_id`). This is the crash window between `Checkpoint` Path B and `ResetToDecided`: the step holds a decision that was never completed, so recovery treats it exactly like an undelivered `DECIDED` step — do NOT call `planner.Decide`. The retry budget restarts on recovery (attempt counting is per loop entry, in-memory) — a documented MVP caveat, not something to "fix" by persisting attempt counts.
 
 ### Critical distinction: RUNNING-uncertain vs FAILED
 
@@ -76,6 +77,44 @@ Using `step_id` where `attempt_id` is required (or vice versa) breaks deduplicat
 3. Return 200 to the worker
 
 It does NOT write step state. `store.Checkpoint` (Barrier 2) is called by the **orchestrator loop** after `transport.Dispatch` returns. This ordering is mandatory — two concurrent writers would race and break the barrier guarantee. The handler is a delivery mechanism; the loop is the authority.
+
+---
+
+## Store Interface
+
+`core.StateStore` (`internal/core/interfaces.go`) is the complete 11-method contract: the two write barriers and their reads (`LoadFrontier`, `PutDecision`, `Checkpoint`, `PendingDecision`), plus run/step lifecycle bookkeeping (`RecordAttemptStart`, `ResetToDecided`, `MarkDLQ`, `MarkRunDone`, `MarkRunFailed`, `MarkPlannerFailedDLQ`, `ListRunningRuns`). `orchestrator.Store` no longer exists — it was a local extension interface that has been folded into `core.StateStore`. `Loop.Store` and `RecoverRuns` both take `core.StateStore` directly.
+
+---
+
+## Running Tests
+
+Unit tests (no DB) run with plain `go test`:
+
+```bash
+go test ./...
+```
+
+Postgres-backed integration tests (in `internal/store`, `internal/api`, and `internal/orchestrator`) skip themselves unless `TEST_DATABASE_URL` is set — they don't spin up their own database. Point them at the same Postgres the docker-compose stack uses:
+
+```bash
+# Start (or reuse) the compose Postgres — the base stack is enough, no demo overlay needed.
+docker compose up -d postgres
+
+# Host port 5432 is published by docker-compose.yml, so localhost works directly.
+TEST_DATABASE_URL="postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable" \
+  go test -p 1 ./internal/store/... -v
+```
+
+Each test calls `resetSchema` (drop + re-apply `migrations/001_initial.sql`) before running, so it's safe to point at the same database the demo stack uses — but note it **wipes** whatever demo/run data was in there. Don't run the integration test suite against that Postgres while a demo run you care about is in progress.
+
+**`-p 1` is required** when running more than one package together (e.g. the full suite below): `go test` runs different packages' tests in parallel by default, and `internal/store`, `internal/api`, and `internal/orchestrator` each call `resetSchema` (DROP + re-migrate) against the *same* `TEST_DATABASE_URL` database. Two packages resetting the schema at the same moment race each other — `duplicate key value violates unique constraint "pg_type_typname_nsp_index"` or `relation "steps" does not exist` are the symptom, not a real bug. `-p 1` serializes package execution and avoids it. (A single package's own tests, e.g. `go test ./internal/store/...` alone, don't need it — `resetSchema` runs once per `TestMain`/setup, not concurrently within a package.)
+
+To run the full suite (unit + integration) in one shot:
+
+```bash
+docker compose up -d postgres
+TEST_DATABASE_URL="postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable" go test -p 1 ./...
+```
 
 ---
 
@@ -131,13 +170,20 @@ Do not report success based on "the code looks correct." Run the verifier. If th
 
 ## Demo Infrastructure
 
-**Interactive demo:** `./demo/run_demo.sh` (menu-driven, 3 LLM-planner scenarios)
-**Automated crash proof:** `python demo/crash_demo.py` (single scenario, fully automated)
+Everything the demo needs (Postgres, StateFlow, workers, the LLM planner adapter) runs as **docker compose services** — the base stack (`docker-compose.yml`) plus the demo overlay (`docker-compose.demo.yml`). One-time setup from a clean clone:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
+```
+
+**Interactive demo:** `./demo/run_demo.sh` (menu-driven, 3 LLM-planner scenarios; drives the compose stack via `docker compose up/stop/kill`)
+**Automated crash proof:** `python demo/crash_demo.py` (single scenario, fully automated; requires the compose stack already up)
 
 ### Demo directory layout
 
 ```
 demo/
+├── Dockerfile            Shared Python image for workers + LLM adapter (command differs per compose service)
 ├── run_demo.sh           Interactive 3-scenario menu (LLM planner mode)
 ├── crash_demo.py         Automated crash-recovery proof (static planner, specialized workers)
 ├── playbook/
@@ -147,14 +193,18 @@ demo/
 │   ├── llm_adapter.py    HTTP planner: REAL (Claude sonnet-4-6) or DUMMY (hardcoded 2-step)
 │   └── echo_worker.py    Minimal sync echo worker (port 5010) for standalone planner testing
 ├── workers/
-│   ├── worker.py         Generic configurable worker (WORKER_NAME/PORT/DELAY env vars)
+│   ├── worker.py         Generic configurable worker (WORKER_NAME/PORT/DELAY env vars) — backs compose services step1/step2
 │   ├── ocr_worker.py     crash_demo only — sync, port 5001, idempotency cache
 │   ├── ner_worker.py     crash_demo only — async, port 5002, step_id-keyed cache + callback
 │   └── summarize_worker.py  crash_demo only — sync, port 5003, idempotency cache
 └── configs/
     ├── llm_planner.yaml  HTTP planner config (port 9000) — reference only
-    └── static_3step.yaml Static 3-step config — used by crash_demo.py internally
+    └── static_3step.yaml Static 3-step config — reference only
+
+docker-compose.demo.yml   Overlay: step1, step2, llm-adapter, ocr-worker, ner-worker, summarize-worker
 ```
+
+`step1`/`step2` (docker-compose.demo.yml) run `worker.py` with `WORKER_DELAY` read from the `STEP1_DELAY`/`STEP2_DELAY` host env vars (default 1s) — e.g. `STEP1_DELAY=5 docker compose ... up -d --force-recreate step1` recreates step1 with a 5s delay for the crash-window scenario. `llm_adapter.py`'s DUMMY-mode worker URLs are overridable via `STEP1_URL`/`STEP2_URL` (docker-compose.demo.yml sets them to `http://step1:5010/run` / `http://step2:5011/run`; default is `localhost` for non-compose use).
 
 ### Interactive demo scenarios (run_demo.sh)
 
@@ -166,7 +216,7 @@ All three scenarios use LLM planner (HTTP, port 9000). DUMMY mode requires no AP
 
 ### Automated crash demo (crash_demo.py)
 
-Single scenario: OCR (sync, port 5001) → NER (async, port 5002, 5s delay) → Summarize (sync, port 5003). Kills orchestrator while NER is in-flight. Proof: NER idempotency cache hit on re-dispatch; no steps re-run. Run from `demo/` directory.
+Single scenario: OCR (sync, port 5001) → NER (async, port 5002, 5s delay) → Summarize (sync, port 5003). Kills the `stateflow` container (`docker compose kill stateflow`) while NER is in-flight, restarts it (`docker compose up -d stateflow`). Proof: NER idempotency cache hit on re-dispatch; no steps re-run. Run with `python demo/crash_demo.py` from anywhere in the repo — paths resolve from `__file__`.
 
 ### LLM planner adapter (demo/planner/llm_adapter.py)
 
@@ -180,7 +230,7 @@ msg="[RECOVERY] found in-progress runs" count=1
 msg="[RECOVERY] resuming run" run_id=... steps_done=1 pending_step=ner
 ```
 
-### Actual API paths (whitepaper says /workflow/start — code differs)
+### Actual API paths
 ```
 POST /workflows                          create workflow (name, planner_type, planner_config)
 POST /workflows/{workflow_id}/runs       start run (workflow_input)
@@ -202,6 +252,7 @@ Barrier 2:  Checkpoint   → then Decide
 Recovery:
   RUNNING, no output  → re-dispatch (new attempt_id)
   DECIDED, no output  → re-dispatch (same decision, new attempt_id)
+  FAILED,  no output  → re-dispatch (same decision, new attempt_id; retry budget restarts)
   DONE                → Decide (pass frontier)
 
 step_id   = "{run_id}:{step_name}"  constant

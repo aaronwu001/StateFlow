@@ -114,4 +114,4 @@ if __name__ == "__main__":
     sys.stdout.flush()
     log = logging.getLogger("werkzeug")
     log.setLevel(logging.ERROR)
-    app.run(port=port, debug=False, use_reloader=False, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)

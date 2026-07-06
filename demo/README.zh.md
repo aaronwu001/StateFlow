@@ -15,19 +15,13 @@
 
 ## Prerequisites
 
+只需要 Docker 和 Docker Compose v2（`docker compose version`）。Postgres、
+StateFlow、worker、LLM planner adapter 全部以 compose service 執行；不需要
+本機 Go 工具鏈，也不需要 `pip install`。
+
 ```bash
-# Docker Postgres
-docker run -d --name stateflow-pg-test \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=stateflow_test \
-  -p 5432:5432 \
-  postgres:16-alpine
-
-# Python 套件
-pip install flask requests
-
-# Go 1.22+（build 用）
-go version
+# 從 project root 執行 — 啟動 Postgres + StateFlow + 所有 demo worker/adapter
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
 ```
 
 ---
@@ -41,7 +35,7 @@ go version
 ./demo/run_demo.sh
 ```
 
-腳本會自動 build binary、建立乾淨的 DB，然後顯示：
+腳本會 build compose image、重置 DB，然後顯示：
 
 ```
    StateFlow Interactive Demo  (LLM Planner)
@@ -78,21 +72,21 @@ go version
 
 ## 自動化 Demo (`crash_demo.py`)
 
-約 20 秒跑完整個 crash-recovery 驗證，不需要任何手動操作。
+約 20 秒跑完整個 crash-recovery 驗證，不需要任何手動操作。需要先啟動 compose
+stack（見上方 Prerequisites）。
 
 ```bash
-cd demo
-python crash_demo.py
+python demo/crash_demo.py
 ```
 
 **流程：**
-1. Build binary
-2. 建立乾淨 DB
-3. 啟動 3 個專用 worker（OCR sync、NER async、Summarize sync）
+1. Build compose image（stateflow + workers）
+2. 重置 DB（TRUNCATE；schema 已由 compose Postgres 初始化套用）
+3. 啟動 3 個專用 worker container（OCR sync、NER async、Summarize sync）
 4. 啟動 orchestrator（第 1 次）
 5. 建立 workflow + 開始 run
 6. 等 OCR（step 1）完成
-7. **Kill orchestrator**（NER step 2 async 正在 in-flight）
+7. **Kill orchestrator**（`docker compose kill stateflow`，NER step 2 async 正在 in-flight）
 8. 等 NER 背景執行緒完成並 cache 結果
 9. 重啟 orchestrator（第 2 次）— Recovery 自動觸發
 10. NER callback 重新送達 → Summarize 執行 → DONE
@@ -119,6 +113,8 @@ Run status: DONE
 
 ```
 demo/
+├── Dockerfile               worker + LLM adapter 共用的 Python image
+├── .dockerignore
 ├── run_demo.sh              互動式 3 場景 demo（LLM planner）
 ├── crash_demo.py            自動化 crash-recovery 驗證
 ├── playbook/
@@ -134,8 +130,11 @@ demo/
 │   └── summarize_worker.py  crash_demo 專用——sync，port 5003，idempotency cache
 ├── configs/
 │   ├── llm_planner.yaml     HTTP planner config（port 9000）——僅供參考
-│   └── static_3step.yaml    Static 3-step config——crash_demo.py 使用
-└── requirements.txt         flask, requests
+│   └── static_3step.yaml    Static 3-step config——僅供參考
+└── requirements.txt         flask, requests, anthropic
+
+../docker-compose.yml         基礎 stack：postgres + stateflow
+../docker-compose.demo.yml    Demo overlay：step1, step2, llm-adapter, ocr/ner/summarize workers
 ```
 
 ---
@@ -144,8 +143,8 @@ demo/
 
 | 問題 | 解法 |
 |------|------|
-| Port 被佔用 | `lsof -i :5010` → 找出 PID → kill |
-| Worker 啟動失敗 | `pip install flask` |
-| DB 連線失敗 | `docker ps` 確認 container 在跑 |
-| Build 失敗 | `go build ./cmd/stateflow/` 看完整錯誤 |
-| LLM adapter 500 | 查 `/tmp/llm_adapter.log` |
+| Port 被佔用 | `docker ps` → 找出佔用該 port 的 container → 停掉它 |
+| 找不到 `docker compose` | 安裝/升級到 Docker Compose v2（`docker compose version`） |
+| DB 連線失敗 | `docker compose ps postgres` 確認狀態為 healthy |
+| Build 失敗 | `docker compose -f docker-compose.yml -f docker-compose.demo.yml build` 看完整錯誤 |
+| LLM adapter 500 / 沒有 log | `docker compose -f docker-compose.yml -f docker-compose.demo.yml logs llm-adapter` |

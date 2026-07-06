@@ -14,36 +14,6 @@ import (
 	"github.com/aaronwu000/stateflow/internal/transport"
 )
 
-// Store extends core.StateStore with operations the loop requires but that are
-// not yet in the minimal StateStore interface. These will be reviewed for
-// promotion to core.StateStore when the interface is finalized with the project owner.
-type Store interface {
-	core.StateStore
-
-	// RecordAttemptStart creates an attempts row (RUNNING) and updates
-	// steps.current_attempt_id before each Dispatch call.
-	RecordAttemptStart(run core.RunID, step core.StepSpec, attemptID core.AttemptID) error
-
-	// ResetToDecided transitions a step from FAILED back to DECIDED so that
-	// crash recovery can see it as a pending re-dispatch between retry attempts.
-	ResetToDecided(run core.RunID, step core.StepSpec) error
-
-	// MarkDLQ sets the step to DLQ, inserts a dead_letter_queue row, and marks
-	// the run FAILED. Called when retries are exhausted.
-	MarkDLQ(run core.RunID, step core.StepSpec, reason string, lastError string) error
-
-	// MarkRunDone sets runs.status = DONE when the planner returns "done".
-	MarkRunDone(run core.RunID) error
-
-	// MarkRunFailed sets runs.status = FAILED when the planner declares failure
-	// without a specific step being at fault.
-	MarkRunFailed(run core.RunID, reason string) error
-
-	// MarkPlannerFailedDLQ writes a dead_letter_queue entry with reason='planner_failed'
-	// (step_id=NULL) and marks the run FAILED. Called when the planner returns "fail".
-	MarkPlannerFailedDLQ(run core.RunID, detail string) error
-}
-
 // Loop is the durable driver loop for a single run.
 //
 // It is safe to construct and call Run again after a crash: PendingDecision
@@ -52,7 +22,7 @@ type Store interface {
 type Loop struct {
 	RunID         core.RunID
 	WorkflowInput json.RawMessage
-	Store         Store
+	Store         core.StateStore
 	Planner       core.NextStepPlanner
 	Transport     core.WorkerTransport
 	Retry         core.RetryPolicy
@@ -82,11 +52,9 @@ func (l *Loop) Run(ctx context.Context) error {
 		}
 
 		var spec core.StepSpec
-		var alreadyPersisted bool
 
 		if pending != nil {
 			spec = *pending
-			alreadyPersisted = true
 		} else {
 			// Normal path: read the frontier and ask the planner what's next.
 			frontier, err := l.Store.LoadFrontier(l.RunID)
@@ -146,8 +114,6 @@ func (l *Loop) Run(ctx context.Context) error {
 
 		// ── Dispatch with retry ────────────────────────────────────────────
 		for attemptNum := 1; ; attemptNum++ {
-			_ = alreadyPersisted // used only to skip PutDecision above; dispatch always creates new attempt
-
 			attemptID := newAttemptID()
 
 			// Record the attempt start BEFORE calling Dispatch. This sets
@@ -207,7 +173,6 @@ func (l *Loop) Run(ctx context.Context) error {
 		}
 
 		// Step is DONE. Loop back to top: PendingDecision → nil → ask planner.
-		alreadyPersisted = false
 	}
 }
 

@@ -15,19 +15,14 @@ Both use an **LLM / HTTP Planner** — the planner runs as a separate HTTP servi
 
 ## Prerequisites
 
+Docker and Docker Compose v2 (`docker compose version`). That's it — Postgres,
+StateFlow, the workers, and the LLM planner adapter all run as compose
+services; there's no local Go toolchain or `pip install` required.
+
 ```bash
-# Docker Postgres
-docker run -d --name stateflow-pg-test \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=stateflow_test \
-  -p 5432:5432 \
-  postgres:16-alpine
-
-# Python packages
-pip install flask requests
-
-# Go 1.22+ (for building the binary)
-go version
+# From the project root — brings up Postgres + StateFlow + all demo
+# workers/adapter on one network.
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
 ```
 
 ---
@@ -41,7 +36,7 @@ Menu-driven, pauses at each key moment so you can explain what's happening.
 ./demo/run_demo.sh
 ```
 
-The script builds the binary, creates a fresh DB, and shows:
+The script builds the compose images, resets the DB, and shows:
 
 ```
    StateFlow Interactive Demo  (LLM Planner)
@@ -79,20 +74,20 @@ For manual step-by-step instructions, see the playbook:
 ## Automated Demo (`crash_demo.py`)
 
 Runs the full crash-recovery proof in ~20 seconds, no interaction needed.
+Requires the compose stack to already be up (see Prerequisites above).
 
 ```bash
-cd demo
-python crash_demo.py
+python demo/crash_demo.py
 ```
 
 **Flow:**
-1. Build binary
-2. Create fresh DB
-3. Start 3 specialized workers (OCR sync, NER async, Summarize sync)
+1. Build compose images (stateflow + workers)
+2. Reset DB (TRUNCATE, schema already applied by the compose Postgres init)
+3. Start 3 specialized worker containers (OCR sync, NER async, Summarize sync)
 4. Start orchestrator (boot 1)
 5. Create workflow + start run
 6. Wait for OCR (step 1) to complete
-7. **Kill orchestrator** while NER (step 2, async) is mid-flight
+7. **Kill orchestrator** (`docker compose kill stateflow`) while NER (step 2, async) is mid-flight
 8. Wait for NER's background thread to cache its result
 9. Restart orchestrator (boot 2) — recovery fires
 10. NER callback re-delivered → Summarize runs → DONE
@@ -119,6 +114,8 @@ Run status: DONE
 
 ```
 demo/
+├── Dockerfile               Shared Python image for workers + LLM adapter
+├── .dockerignore
 ├── run_demo.sh              Interactive 3-scenario demo (LLM planner)
 ├── crash_demo.py            Automated crash-recovery proof
 ├── playbook/
@@ -134,8 +131,11 @@ demo/
 │   └── summarize_worker.py  crash_demo only — sync, port 5003, idempotency cache
 ├── configs/
 │   ├── llm_planner.yaml     HTTP planner config (port 9000) — reference only
-│   └── static_3step.yaml    Static 3-step config — used by crash_demo.py
-└── requirements.txt         flask, requests
+│   └── static_3step.yaml    Static 3-step config — reference only
+└── requirements.txt         flask, requests, anthropic
+
+../docker-compose.yml         Base stack: postgres + stateflow
+../docker-compose.demo.yml    Overlay: step1, step2, llm-adapter, ocr/ner/summarize workers
 ```
 
 ---
@@ -144,8 +144,8 @@ demo/
 
 | Problem | Fix |
 |---------|-----|
-| Port already in use | `lsof -i :5010` → find PID → kill it |
-| Worker won't start | `pip install flask` |
-| DB connection failed | `docker ps` — confirm container is running |
-| Build failed | `go build ./cmd/stateflow/` for full error |
-| LLM adapter 500 | Check `/tmp/llm_adapter.log` |
+| Port already in use | `docker ps` → find what's bound to the port → stop it |
+| `docker compose` not found | Install/upgrade to Docker Compose v2 (`docker compose version`) |
+| DB connection failed | `docker compose ps postgres` — confirm it's healthy |
+| Build failed | `docker compose -f docker-compose.yml -f docker-compose.demo.yml build` for full error |
+| LLM adapter 500 / no logs | `docker compose -f docker-compose.yml -f docker-compose.demo.yml logs llm-adapter` |

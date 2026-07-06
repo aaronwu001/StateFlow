@@ -61,4 +61,4 @@ def run():
 
 if __name__ == "__main__":
     _log(f"listening on :{WORKER_PORT}  delay={WORKER_DELAY}s")
-    app.run(port=WORKER_PORT, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=WORKER_PORT, debug=False, use_reloader=False)

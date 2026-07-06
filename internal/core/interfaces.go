@@ -74,6 +74,13 @@ type Frontier struct {
 	PendingDecision *StepSpec      // non-nil = re-dispatch this; do NOT re-ask the planner
 }
 
+// RunRef is a lightweight reference to a RUNNING run, returned by
+// StateStore.ListRunningRuns for the crash-recovery scan at startup.
+type RunRef struct {
+	RunID         RunID
+	WorkflowInput json.RawMessage
+}
+
 // --- The four interfaces ---
 
 // NextStepPlanner decides the next step given the current run state.
@@ -107,6 +114,8 @@ type WorkerTransport interface {
 // Reference impl: PostgresStore (internal/store/postgres.go).
 // Extension point: MySQL, SQLite, cloud KV.
 type StateStore interface {
+	// ── Correctness core: the two write barriers and their reads ──
+
 	// LoadFrontier returns the full frontier for recovery and loop re-entry.
 	// DONE steps go into History (ordered by seq ASC).
 	// A DECIDED/RUNNING step with no output becomes PendingDecision.
@@ -124,6 +133,35 @@ type StateStore interface {
 	// PendingDecision returns the DECIDED/RUNNING step with no output, if any.
 	// Used by the loop's fast path; LoadFrontier subsumes this for recovery.
 	PendingDecision(run RunID) (*StepSpec, error)
+
+	// ── Run/step lifecycle bookkeeping ──
+
+	// RecordAttemptStart creates an attempts row (RUNNING) and updates
+	// steps.current_attempt_id before each Dispatch call.
+	RecordAttemptStart(run RunID, step StepSpec, attemptID AttemptID) error
+
+	// ResetToDecided transitions a step from FAILED back to DECIDED so that
+	// crash recovery can see it as a pending re-dispatch between retry attempts.
+	ResetToDecided(run RunID, step StepSpec) error
+
+	// MarkDLQ sets the step to DLQ, inserts a dead_letter_queue row, and marks
+	// the run FAILED. Called when retries are exhausted.
+	MarkDLQ(run RunID, step StepSpec, reason string, lastError string) error
+
+	// MarkRunDone sets runs.status = DONE when the planner returns "done".
+	MarkRunDone(run RunID) error
+
+	// MarkRunFailed sets runs.status = FAILED when the planner declares failure
+	// without a specific step being at fault.
+	MarkRunFailed(run RunID, reason string) error
+
+	// MarkPlannerFailedDLQ writes a dead_letter_queue entry with reason='planner_failed'
+	// (step_id=NULL) and marks the run FAILED. Called when the planner returns "fail".
+	MarkPlannerFailedDLQ(run RunID, detail string) error
+
+	// ListRunningRuns returns a reference for every run with status RUNNING.
+	// Used once at startup by crash recovery to find runs to resume.
+	ListRunningRuns(ctx context.Context) ([]RunRef, error)
 }
 
 // RetryPolicy decides whether and when to retry a failed step.

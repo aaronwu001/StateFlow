@@ -62,4 +62,4 @@ if __name__ == "__main__":
     import logging
     log = logging.getLogger("werkzeug")
     log.setLevel(logging.ERROR)
-    app.run(port=port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

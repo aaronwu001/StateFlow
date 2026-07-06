@@ -110,6 +110,30 @@ func plantRunningStep(t *testing.T, db *sql.DB, runID, stepName string, seq int,
 	}
 }
 
+// plantFailedStep inserts a step where Checkpoint Path B fired (status=FAILED,
+// attempt row FAILED) but the process crashed before ResetToDecided could clear
+// it back to DECIDED for the next retry attempt. output stays NULL — this is
+// the gap recovery rule 4 closes: FAILED-with-no-output must be re-dispatched,
+// not left stuck (CLAUDE.md "Four Recovery Rules").
+func plantFailedStep(t *testing.T, db *sql.DB, runID, stepName string, seq int, attemptUUID string) {
+	t.Helper()
+	stepID := runID + ":" + stepName
+	dec := decisionJSON(stepName, "http://stub/"+stepName)
+	if _, err := db.Exec(`
+		INSERT INTO steps
+			(step_id, run_id, step_name, seq, status, decision, current_attempt_id, decided_at)
+		VALUES ($1, $2, $3, $4, 'FAILED', $5::jsonb, $6::uuid, now())
+	`, stepID, runID, stepName, seq, dec, attemptUUID); err != nil {
+		t.Fatalf("plantFailedStep %s: %v", stepID, err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO attempts (attempt_id, step_id, attempt_number, status, error, resolved_at)
+		VALUES ($1::uuid, $2, 1, 'FAILED', 'worker timeout before crash', now())
+	`, attemptUUID, stepID); err != nil {
+		t.Fatalf("plantFailedStep attempt %s: %v", stepID, err)
+	}
+}
+
 // pollRunStatus polls runs.status every 50 ms until it leaves 'RUNNING'.
 // Fails the test if the run is still RUNNING after timeout.
 func pollRunStatus(t *testing.T, db *sql.DB, runID string, timeout time.Duration) string {
@@ -155,7 +179,7 @@ func TestRecovery_PicksUpDecidedStep(t *testing.T) {
 	plantDecidedStep(t, db, runID, "step2", 2)
 
 	s := store.New(db)
-	n, err := orchestrator.RecoverRuns(context.Background(), db,
+	n, err := orchestrator.RecoverRuns(context.Background(), s,
 		func(id core.RunID, input json.RawMessage) *orchestrator.Loop {
 			return &orchestrator.Loop{
 				RunID:         id,
@@ -261,7 +285,7 @@ func TestRecovery_RunningUncertainReDispatched(t *testing.T) {
 	plantRunningStep(t, db, runID, "step1", 1, crashedAttempt)
 
 	s := store.New(db)
-	n, err := orchestrator.RecoverRuns(context.Background(), db,
+	n, err := orchestrator.RecoverRuns(context.Background(), s,
 		func(id core.RunID, input json.RawMessage) *orchestrator.Loop {
 			return &orchestrator.Loop{
 				RunID:         id,
@@ -349,8 +373,9 @@ func TestRecovery_SkipsTerminalRuns(t *testing.T) {
 		t.Fatalf("seed done run: %v", err)
 	}
 
+	s := store.New(db)
 	factoryCalls := 0
-	n, err := orchestrator.RecoverRuns(context.Background(), db,
+	n, err := orchestrator.RecoverRuns(context.Background(), s,
 		func(id core.RunID, _ json.RawMessage) *orchestrator.Loop {
 			factoryCalls++
 			t.Errorf("makeLoop called for run %q — terminal DONE run must not be resumed", id)
@@ -366,4 +391,127 @@ func TestRecovery_SkipsTerminalRuns(t *testing.T) {
 		t.Errorf("factory called %d times, want 0", factoryCalls)
 	}
 	t.Logf("PASS — RecoverRuns returned n=0, factory called 0 times (DONE run skipped)")
+}
+
+// ── Test 4: FAILED-with-no-output → re-dispatch, not re-decide ──────────
+
+// prematureDecidePlanner returns the SAME step name if asked with empty
+// history. This simulates the bug recovery rule 4 guards against: if
+// PendingDecision failed to surface a FAILED-no-output step, the loop would
+// fall through to LoadFrontier/Decide, the planner would re-decide a step
+// that already has a persisted decision, and the resulting PutDecision would
+// attempt a duplicate INSERT — a primary-key conflict on steps.step_id.
+type prematureDecidePlanner struct {
+	step  *core.StepSpec
+	calls []int // history length recorded at each Decide call
+}
+
+func (p *prematureDecidePlanner) Decide(_ context.Context, s core.RunState) (core.StepDecision, error) {
+	p.calls = append(p.calls, len(s.History))
+	if len(s.History) == 0 {
+		return core.StepDecision{Status: "continue", Step: p.step}, nil
+	}
+	return core.StepDecision{Status: "done"}, nil
+}
+
+// TestRecovery_FailedNoOutputReDispatched verifies recovery rule 4: a step
+// checkpointed as FAILED with no output (crash between Checkpoint Path B and
+// ResetToDecided) is re-dispatched using the persisted decision — the planner
+// is never re-asked for it.
+//
+// Planted state:
+//
+//	step1 = FAILED  (decision non-null, output NULL, 1 FAILED attempt)
+//
+// Expectations:
+//   - the planner is never called with empty history (i.e. never asked before
+//     the pending FAILED step resolves)
+//   - step1 is re-dispatched with a new attempt_id and completes DONE
+//   - exactly one steps row exists for step1 (no primary-key conflict)
+func TestRecovery_FailedNoOutputReDispatched(t *testing.T) {
+	db := openTestDB(t)
+	resetTestSchema(t, db)
+
+	const (
+		wfID           = "wf-rec-failed"
+		runID          = "run-rec-failed"
+		crashedAttempt = "30000000-0000-4000-8000-000000000003"
+	)
+	seedTestFixtures(t, db, wfID, runID)
+	plantFailedStep(t, db, runID, "step1", 1, crashedAttempt)
+
+	s := store.New(db)
+	planner := &prematureDecidePlanner{
+		step: &core.StepSpec{Name: "step1", WorkerURL: "http://stub/step1", Mode: "sync", TimeoutSeconds: 5},
+	}
+	n, err := orchestrator.RecoverRuns(context.Background(), s,
+		func(id core.RunID, input json.RawMessage) *orchestrator.Loop {
+			return &orchestrator.Loop{
+				RunID:         id,
+				WorkflowInput: input,
+				Store:         s,
+				Planner:       planner,
+				Transport:     &alwaysSucceedTransport{},
+				Retry:         &orchestrator.FixedCountPolicy{MaxRetries: 3, Delay: 0},
+			}
+		})
+	if err != nil {
+		t.Fatalf("RecoverRuns: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("RecoverRuns n = %d, want 1", n)
+	}
+
+	finalStatus := pollRunStatus(t, db, runID, 5*time.Second)
+
+	step1ID := runID + ":step1"
+
+	// ── (a) planner never asked before the pending FAILED step resolves ────
+	for _, histLen := range planner.calls {
+		if histLen == 0 {
+			t.Fatalf("planner.Decide called with empty history — PendingDecision failed to surface the FAILED-no-output step (recovery rule 4)")
+		}
+	}
+	if len(planner.calls) == 0 {
+		t.Fatalf("planner.Decide was never called")
+	}
+	t.Logf("PASS — planner.Decide call history lengths: %v (never called before the FAILED step resolved)", planner.calls)
+
+	// ── (b) step1 re-dispatched (new attempt) and completes DONE ───────────
+	var attemptCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE step_id = $1`, step1ID).
+		Scan(&attemptCount); err != nil {
+		t.Fatalf("count attempts: %v", err)
+	}
+	if attemptCount != 2 {
+		t.Errorf("step1 attempt count = %d, want 2 (1 crashed FAILED + 1 recovery dispatch)", attemptCount)
+	}
+	t.Logf("PASS — step1 has %d attempts (crashed FAILED attempt preserved, recovery added one)", attemptCount)
+
+	var step1Status string
+	if err := db.QueryRow(`SELECT status FROM steps WHERE step_id = $1`, step1ID).
+		Scan(&step1Status); err != nil {
+		t.Fatalf("query step1 status: %v", err)
+	}
+	if step1Status != "DONE" {
+		t.Errorf("step1.status = %q, want DONE", step1Status)
+	}
+	t.Logf("PASS — step1.status = DONE (re-dispatched successfully from FAILED)")
+
+	// ── (c) no primary-key conflict: exactly one steps row for step1 ───────
+	var stepRowCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM steps WHERE step_id = $1`, step1ID).
+		Scan(&stepRowCount); err != nil {
+		t.Fatalf("count step1 rows: %v", err)
+	}
+	if stepRowCount != 1 {
+		t.Errorf("steps table has %d rows for step_id %q, want 1", stepRowCount, step1ID)
+	}
+	t.Logf("PASS — exactly 1 steps row for %q (no PK conflict)", step1ID)
+
+	// ── run: DONE ────────────────────────────────────────────────────────
+	if finalStatus != "DONE" {
+		t.Errorf("run.status = %q, want DONE", finalStatus)
+	}
+	t.Logf("PASS — run.status = DONE")
 }

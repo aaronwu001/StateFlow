@@ -187,10 +187,12 @@ func TestBarrierInvariant(t *testing.T) {
 //  2. steps.status transitions to FAILED.
 //  3. The attempts row records status=FAILED and the error message.
 //  4. LoadFrontier.History is empty — a FAILED step must never appear as DONE.
-//  5. LoadFrontier.PendingDecision is nil — FAILED does not match DECIDED/RUNNING.
+//  5. LoadFrontier.PendingDecision is the FAILED step's persisted decision (recovery
+//     rule 4, CLAUDE.md): a FAILED step with no output holds a decision that was never
+//     completed, so it is re-dispatched, not re-decided by the planner.
 //
-// Points 4 and 5 are the critical planner-safety checks: if a failed step leaked
-// into History, the planner would treat the failure output as a success and make
+// Point 4 is the critical planner-safety check: if a failed step leaked into
+// History, the planner would treat the failure output as a success and make
 // decisions on a false premise.
 func TestCheckpointPathB_FailedStepNotInHistory(t *testing.T) {
 	db := openDB(t)
@@ -277,9 +279,12 @@ func TestCheckpointPathB_FailedStepNotInHistory(t *testing.T) {
 	}
 	t.Logf("PASS — attempts row: status=FAILED error=%q", attemptError)
 
-	// ── Assert 4+5: LoadFrontier excludes FAILED step ───────────────────────────
+	// ── Assert 4+5: LoadFrontier excludes FAILED step from History, but surfaces
+	//    it as PendingDecision (recovery rule 4) ─────────────────────────────────
 	// History must be empty: FAILED ≠ DONE, planner must not see this step as complete.
-	// PendingDecision must be nil: FAILED ≠ DECIDED/RUNNING, no re-dispatch triggered.
+	// PendingDecision must be the FAILED step's decision: a FAILED-with-no-output
+	// step holds a persisted decision that was never completed (crash between
+	// Checkpoint Path B and ResetToDecided), so recovery re-dispatches it.
 	f, err := s.LoadFrontier(run)
 	if err != nil {
 		t.Fatalf("LoadFrontier: %v", err)
@@ -289,13 +294,16 @@ func TestCheckpointPathB_FailedStepNotInHistory(t *testing.T) {
 			"a FAILED step must never appear in History (planner would treat failure as success)",
 			len(f.History))
 	}
-	if f.PendingDecision != nil {
-		t.Fatalf("FAIL — LoadFrontier.PendingDecision = %+v, want nil; "+
-			"FAILED status does not trigger re-dispatch (loop decides retry/DLQ)",
-			f.PendingDecision)
+	if f.PendingDecision == nil {
+		t.Fatal("FAIL — LoadFrontier.PendingDecision = nil, want the FAILED step's decision; " +
+			"FAILED-with-no-output must be re-dispatched (recovery rule 4)")
 	}
-	t.Log("PASS — LoadFrontier: History=[], PendingDecision=nil (FAILED excluded from frontier)")
-	t.Log("PASS — Path B complete: FAILED state recorded faithfully; retry/DLQ is the loop's decision")
+	if f.PendingDecision.Name != step.Name {
+		t.Fatalf("FAIL — LoadFrontier.PendingDecision.Name = %q, want %q",
+			f.PendingDecision.Name, step.Name)
+	}
+	t.Logf("PASS — LoadFrontier: History=[], PendingDecision=%+v (FAILED step re-dispatchable)", f.PendingDecision)
+	t.Log("PASS — Path B complete: FAILED state recorded faithfully; recovery re-dispatches it")
 }
 
 // TestRecordAttemptStart_AttemptNumberIncrements verifies that each call to

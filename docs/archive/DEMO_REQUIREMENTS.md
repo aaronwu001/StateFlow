@@ -1,3 +1,5 @@
+> HISTORICAL — pre-implementation spec. Endpoints and file layout are outdated. Authoritative demo docs: demo/README.md and demo/playbook/.
+
 # StateFlow Interactive Demo — Requirements & Design
 
 **Status:** Pre-implementation spec  

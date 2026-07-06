@@ -192,6 +192,15 @@ func (s *stubStore) MarkPlannerFailedDLQ(_ core.RunID, _ string) error {
 	return nil
 }
 
+// ListRunningRuns is unused by Loop.Run (it is the recovery entry point's
+// concern); the stub satisfies core.StateStore with a no-op.
+func (s *stubStore) ListRunningRuns(_ context.Context) ([]core.RunRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log("ListRunningRuns")
+	return nil, nil
+}
+
 // callsContaining returns all calls that contain substr.
 func (s *stubStore) callsContaining(substr string) []string {
 	var out []string
@@ -539,6 +548,10 @@ func (p *loggingStoreProxy) MarkRunFailed(run core.RunID, reason string) error {
 func (p *loggingStoreProxy) MarkPlannerFailedDLQ(run core.RunID, detail string) error {
 	p.onCall("MarkPlannerFailedDLQ")
 	return p.inner.MarkPlannerFailedDLQ(run, detail)
+}
+func (p *loggingStoreProxy) ListRunningRuns(ctx context.Context) ([]core.RunRef, error) {
+	p.onCall("ListRunningRuns")
+	return p.inner.ListRunningRuns(ctx)
 }
 
 // loggingTransport delegates Dispatch, calling onCall before forwarding.

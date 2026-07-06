@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -58,9 +59,6 @@ func (s *PostgresStore) PutDecision(run core.RunID, step core.StepSpec) error {
 // RecordAttemptStart records the beginning of a worker dispatch.
 // It must be called after PutDecision and before WorkerTransport.Dispatch.
 // It creates an attempts row (status RUNNING) and updates the step to RUNNING.
-//
-// This is NOT in the StateStore interface — the loop calls it on the concrete
-// type. It will be promoted to the interface when the loop session defines needs.
 //
 // attempt_number increments per step (not per run): the Nth attempt of this step.
 func (s *PostgresStore) RecordAttemptStart(run core.RunID, step core.StepSpec, attemptID core.AttemptID) error {
@@ -226,12 +224,13 @@ func checkpointFailed(tx *sql.Tx, stepID string, attemptID sql.NullString, r cor
 
 // LoadFrontier reads the complete frontier for a run.
 // Returns DONE steps as History (ordered by seq ASC) and the first
-// DECIDED/RUNNING step with no output as PendingDecision.
+// DECIDED/RUNNING/FAILED step with no output as PendingDecision.
 //
-// FAILED and DLQ steps are deliberately excluded:
-//   - FAILED steps that will be retried will have their retry decision re-created
-//     as DECIDED by the loop; that DECIDED row will appear as PendingDecision.
-//   - DLQ steps are terminal and do not drive the next decision.
+// FAILED steps with no output are treated the same as DECIDED/RUNNING: the step
+// holds a persisted decision that was never completed (crash between Checkpoint
+// Path B and ResetToDecided), so recovery re-dispatches it rather than re-asking
+// the planner. DLQ steps are terminal and are excluded — they never drive the
+// next decision.
 //
 // This is the primary read for crash recovery and loop re-entry.
 // It is NOT the status endpoint read — see DESIGN.md §9.4.
@@ -266,8 +265,14 @@ func (s *PostgresStore) LoadFrontier(run core.RunID) (core.Frontier, error) {
 				Output: json.RawMessage(outputJSON),
 			})
 
-		case (status == "DECIDED" || status == "RUNNING") && outputJSON == nil:
-			// Barrier 1 fired but Barrier 2 did not. Re-dispatch without re-asking the planner.
+		case (status == "DECIDED" || status == "RUNNING" || status == "FAILED") && outputJSON == nil:
+			// Barrier 1 fired but Barrier 2 did not (DECIDED/RUNNING), or the step was
+			// checkpointed as FAILED but never got its retry decision re-persisted as
+			// DECIDED before a crash (FAILED with no output). In all three cases the
+			// step holds a persisted decision that was never completed; recovery
+			// re-dispatches it without re-asking the planner (Barrier 1 already fired).
+			// Attempt counting is per loop entry (in-memory), so a crash mid-retry grants
+			// a fresh retry budget — a documented MVP caveat, not a bug to fix here.
 			// Only the first such step is returned; a linear MVP run has at most one.
 			if frontier.PendingDecision == nil && decisionJSON != nil {
 				var spec core.StepSpec
@@ -277,10 +282,6 @@ func (s *PostgresStore) LoadFrontier(run core.RunID) (core.Frontier, error) {
 				frontier.PendingDecision = &spec
 			}
 
-		// FAILED: output IS NULL and status is not DECIDED/RUNNING, so neither case above
-		// matches. The step is deliberately invisible to LoadFrontier. The loop handles
-		// retry/DLQ; on recovery the loop re-examines the step via direct query if needed.
-		//
 		// DLQ: terminal, never drives the next decision.
 		}
 	}
@@ -303,7 +304,7 @@ func (s *PostgresStore) PendingDecision(run core.RunID) (*core.StepSpec, error) 
 		FROM steps
 		WHERE run_id = $1
 		  AND output IS NULL
-		  AND status IN ('DECIDED', 'RUNNING')
+		  AND status IN ('DECIDED', 'RUNNING', 'FAILED')
 		ORDER BY seq ASC
 		LIMIT 1
 	`, string(run)).Scan(&decisionJSON)
@@ -440,4 +441,33 @@ func (s *PostgresStore) MarkPlannerFailedDLQ(run core.RunID, detail string) erro
 	}
 
 	return tx.Commit()
+}
+
+// ListRunningRuns returns a reference for every run with status RUNNING.
+// Called once at startup by crash recovery to find runs to resume.
+func (s *PostgresStore) ListRunningRuns(ctx context.Context) ([]core.RunRef, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT run_id, workflow_input
+		FROM runs
+		WHERE status = 'RUNNING'
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListRunningRuns: query: %w", err)
+	}
+	defer rows.Close()
+
+	var refs []core.RunRef
+	for rows.Next() {
+		var runID string
+		var input json.RawMessage
+		if err := rows.Scan(&runID, &input); err != nil {
+			return nil, fmt.Errorf("ListRunningRuns: scan row: %w", err)
+		}
+		refs = append(refs, core.RunRef{RunID: core.RunID(runID), WorkflowInput: input})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListRunningRuns: rows iteration: %w", err)
+	}
+
+	return refs, nil
 }

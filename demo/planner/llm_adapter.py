@@ -23,6 +23,14 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# ── Worker URLs ──────────────────────────────────────────────────────────────
+# Overridable so the same DUMMY 2-step pipeline works whether workers run on
+# localhost (bare-metal demo) or as compose services (STEP1_URL/STEP2_URL set
+# to http://step1:5010/run etc. by docker-compose.demo.yml).
+
+STEP1_URL = os.environ.get("STEP1_URL", "http://localhost:5010/run")
+STEP2_URL = os.environ.get("STEP2_URL", "http://localhost:5011/run")
+
 # ── Detect mode ──────────────────────────────────────────────────────────────
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -39,7 +47,7 @@ else:
 
 # ── System prompt (used in REAL mode) ────────────────────────────────────────
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = f"""
 You are a workflow planner for a document processing pipeline.
 
 You will receive a JSON object with:
@@ -47,20 +55,20 @@ You will receive a JSON object with:
   - "history": completed steps so far, each with "name", "status", "output"
 
 Available workers:
-  - http://localhost:5010/run   Worker for step1.
-  - http://localhost:5011/run   Worker for step2.
+  - {STEP1_URL}   Worker for step1.
+  - {STEP2_URL}   Worker for step2.
 
 Rules:
 1. Respond with ONLY a JSON object. No explanation, no markdown fences, no prose.
 2. The JSON must have "status": "continue", "done", or "fail".
 3. If "continue", include "step" with "name", "worker_url", "mode" (use "sync"), "input".
 4. Run at most 2 steps total (check history length).
-5. After 2 steps are done, return {"status": "done"}.
+5. After 2 steps are done, return {{"status": "done"}}.
 6. Never repeat a step name that appears in history.
-7. step1 must go to http://localhost:5010/run, step2 to http://localhost:5011/run.
+7. step1 must go to {STEP1_URL}, step2 to {STEP2_URL}.
 
 Example:
-{"status":"continue","step":{"name":"step1","worker_url":"http://localhost:5010/run","mode":"sync","timeout_seconds":10,"input":{"_step_name":"step1","task":"do something"}}}
+{{"status":"continue","step":{{"name":"step1","worker_url":"{STEP1_URL}","mode":"sync","timeout_seconds":10,"input":{{"_step_name":"step1","task":"do something"}}}}}}
 """
 
 # ── Planner endpoint ──────────────────────────────────────────────────────────
@@ -98,7 +106,7 @@ def _decide_dummy(state, done_names):
             "status": "continue",
             "step": {
                 "name": "step1",
-                "worker_url": "http://localhost:5010/run",
+                "worker_url": STEP1_URL,
                 "mode": "sync",
                 "timeout_seconds": 10,
                 "input": {"_step_name": "step1", "task": workflow_input},
@@ -112,7 +120,7 @@ def _decide_dummy(state, done_names):
             "status": "continue",
             "step": {
                 "name": "step2",
-                "worker_url": "http://localhost:5011/run",
+                "worker_url": STEP2_URL,
                 "mode": "sync",
                 "timeout_seconds": 10,
                 "input": {"_step_name": "step2", "previous": step1_output},
@@ -147,4 +155,4 @@ def _decide_with_llm(state):
 
 if __name__ == "__main__":
     print("[ADAPTER] LLM adapter listening on :9000")
-    app.run(port=9000, debug=False)
+    app.run(host="0.0.0.0", port=9000, debug=False)

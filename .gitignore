@@ -1,6 +1,15 @@
 # Go binaries
 demo/stateflow
 demo/stateflow.exe
+/stateflow
+/stateflow.exe
+*.exe~
 
 # Test artifacts
 *.test
+
+# Windows zone-identifier metadata
+*Zone.Identifier
+
+# Python virtualenv
+venv/

@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: stateflow
+      POSTGRES_PASSWORD: stateflow
+      POSTGRES_DB: stateflow
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Migration mechanism decision: postgres:16's entrypoint runs every
+      # *.sql file in /docker-entrypoint-initdb.d/ alphabetically, but only
+      # on first init (empty PGDATA). This is the simplest option that
+      # satisfies "apply migrations/001_initial.sql on first startup" for
+      # an MVP with a single migration file; it does not replay on restart
+      # or track schema versions, so it is not a substitute for a real
+      # migration tool if/when more migrations are added.
+      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stateflow -d stateflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  stateflow:
+    build: .
+    environment:
+      DATABASE_URL: postgres://stateflow:stateflow@postgres:5432/stateflow?sslmode=disable
+      LISTEN_ADDR: ":8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The demo overlay (docker-compose.demo.yml) runs workers/planner as
+    # compose services reachable by name (step1, ocr-worker, etc.) — this
+    # entry only matters if you point a workflow at a worker running directly
+    # on the host instead. Required on Linux Docker Engine for that case;
+    # Docker Desktop (Mac/Windows) resolves host.docker.internal without it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:

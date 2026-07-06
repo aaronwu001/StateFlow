@@ -1,10 +1,9 @@
 // Package orchestrator — crash recovery on startup.
-// Authoritative: DESIGN.md §9.3, CLAUDE.md "Three Recovery Rules".
+// Authoritative: DESIGN.md §9.3, CLAUDE.md "Four Recovery Rules".
 package orchestrator
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -18,13 +17,13 @@ import (
 //
 // Design (DESIGN.md §9.3):
 //
-//	SELECT run_id FROM runs WHERE status = 'RUNNING'
-//	for each run_id → call makeLoop → go loop.Run(ctx)
+//	store.ListRunningRuns(ctx)
+//	for each run → call makeLoop → go loop.Run(ctx)
 //
-// The three CLAUDE.md recovery rules are handled transparently by Loop.Run:
-//   - Loop.Run calls PendingDecision first; if non-nil (DECIDED or RUNNING
-//     step with no output), it re-dispatches without re-asking the planner
-//     (Barrier 1 already fired — rules 1 and 2).
+// The four CLAUDE.md recovery rules are handled transparently by Loop.Run:
+//   - Loop.Run calls PendingDecision first; if non-nil (DECIDED, RUNNING, or
+//     FAILED step with no output), it re-dispatches without re-asking the
+//     planner (Barrier 1 already fired — rules 1, 2, and 4).
 //   - If PendingDecision returns nil, the loop asks the planner against the
 //     persisted frontier of DONE steps (rule 3).
 //
@@ -45,61 +44,35 @@ import (
 // errors are logged but do not surface to the caller — runs are independent.
 func RecoverRuns(
 	ctx context.Context,
-	db *sql.DB,
+	store core.StateStore,
 	makeLoop func(runID core.RunID, workflowInput json.RawMessage) *Loop,
 ) (int, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT run_id, workflow_input
-		FROM   runs
-		WHERE  status = 'RUNNING'
-	`)
+	runs, err := store.ListRunningRuns(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("RecoverRuns: query running runs: %w", err)
-	}
-	defer rows.Close()
-
-	type runEntry struct {
-		id    core.RunID
-		input json.RawMessage
+		return 0, fmt.Errorf("RecoverRuns: list running runs: %w", err)
 	}
 
-	var pending []runEntry
-	for rows.Next() {
-		var id string
-		var input json.RawMessage
-		if err := rows.Scan(&id, &input); err != nil {
-			return 0, fmt.Errorf("RecoverRuns: scan row: %w", err)
+	slog.Info("[RECOVERY] found in-progress runs", "count", len(runs))
+
+	for _, r := range runs {
+		frontier, err := store.LoadFrontier(r.RunID)
+		if err != nil {
+			slog.Error("[RECOVERY] load frontier", "run_id", string(r.RunID), "err", err)
+			continue
 		}
-		pending = append(pending, runEntry{id: core.RunID(id), input: input})
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("RecoverRuns: iterate rows: %w", err)
-	}
-
-	slog.Info("[RECOVERY] found in-progress runs", "count", len(pending))
-
-	for _, r := range pending {
-		// Query step context for the recovery log line.
-		var doneCount int
-		var pendingStep sql.NullString
-		_ = db.QueryRowContext(ctx, `
-			SELECT
-				(SELECT COUNT(*) FROM steps WHERE run_id = $1 AND status = 'DONE'),
-				(SELECT step_name FROM steps WHERE run_id = $1 AND status IN ('RUNNING','DECIDED') ORDER BY seq LIMIT 1)
-		`, string(r.id)).Scan(&doneCount, &pendingStep)
 
 		step := "-"
-		if pendingStep.Valid {
-			step = pendingStep.String
+		if frontier.PendingDecision != nil {
+			step = frontier.PendingDecision.Name
 		}
 		slog.Info("[RECOVERY] resuming run",
-			"run_id", string(r.id),
-			"steps_done", doneCount,
+			"run_id", string(r.RunID),
+			"steps_done", len(frontier.History),
 			"pending_step", step)
 
-		l := makeLoop(r.id, r.input)
+		l := makeLoop(r.RunID, r.WorkflowInput)
 		if l == nil {
-			slog.Warn("[RECOVERY] skipping run: makeLoop returned nil", "run_id", string(r.id))
+			slog.Warn("[RECOVERY] skipping run: makeLoop returned nil", "run_id", string(r.RunID))
 			continue
 		}
 		go func(l *Loop) {
@@ -111,6 +84,6 @@ func RecoverRuns(
 		}(l)
 	}
 
-	slog.Info("[RECOVERY] complete", "resumed", len(pending))
-	return len(pending), nil
+	slog.Info("[RECOVERY] complete", "resumed", len(runs))
+	return len(runs), nil
 }

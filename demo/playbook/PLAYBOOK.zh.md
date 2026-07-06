@@ -2,7 +2,7 @@
 
 **Demo 模式：LLM / HTTP Planner**
 
-每個場景示範 StateFlow 的一個可靠性保證。Planner 以 HTTP endpoint 形式運行——DUMMY 模式不需要 API key，REAL 模式接 Claude。
+每個場景示範 StateFlow 的一個可靠性保證。Planner 以 HTTP endpoint 形式運行——DUMMY 模式不需要 API key，REAL 模式接 Claude。所有元件（Postgres、StateFlow、worker、planner adapter）都以 **docker compose service** 運行。
 
 > **想用自動化腳本跑完整個 crash-recovery demo？** 見 [../crash_demo.py](../crash_demo.py)
 
@@ -10,54 +10,26 @@
 
 ## 一次性準備
 
-開 **4 個 terminal tab**，標好名字：`ORCH` `PLANNER` `WORKER` `CMD`
+開 **2 個 terminal tab**，標好名字：`LOGS` `CMD`
 
 ```bash
-# 任一 tab — Build binary（從 project root 執行）
-go build -o demo/stateflow ./cmd/stateflow/
-
-# 任一 tab — 啟動 Postgres（若尚未跑）
-docker run -d --name stateflow-pg-test \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=stateflow_test \
-  -p 5432:5432 \
-  postgres:16-alpine
-
-# CMD tab — 等 Postgres ready，建 DB + schema
-until docker exec stateflow-pg-test pg_isready -U postgres; do sleep 1; done
-docker exec stateflow-pg-test psql -U postgres \
-  -c "CREATE DATABASE stateflow_demo;" postgres
-docker exec -i stateflow-pg-test psql -U postgres -d stateflow_demo \
-  < migrations/001_initial.sql
+# CMD tab — 從 project root 執行：build 並啟動 Postgres、StateFlow，
+# 以及所有 demo service（step1、step2、llm-adapter、ocr/ner/summarize workers）。
+docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
 ```
-
-驗證：`curl -s http://localhost:8080/health` 或 `docker ps | grep stateflow-pg-test`
-
----
-
-## 每個場景的固定元件
-
-**PLANNER tab** — 每個場景前啟動，整個 session 保持跑著：
 
 ```bash
-# DUMMY 模式（不需要 API key）：
-python3 demo/planner/llm_adapter.py
-
-# 或接真正的 Claude：
-# ANTHROPIC_API_KEY="sk-ant-..." python3 demo/planner/llm_adapter.py
+# LOGS tab — 持續串流每個 service 的 stdout，取代以前分開的 terminal tab。
+docker compose -f docker-compose.yml -f docker-compose.demo.yml \
+  logs -f --no-log-prefix step1 step2 llm-adapter stateflow
 ```
 
-應看到：
-```
-[ADAPTER] mode=DUMMY (ANTHROPIC_API_KEY not set — using hardcoded logic)
-[ADAPTER] LLM adapter listening on :9000
-```
+驗證：`curl -s http://localhost:8080/runs/__probe__` 回傳 404（server 已啟動，路由不存在——預期行為）。
 
-**ORCH tab** — 每個場景前啟動：
+為簡潔起見，以下步驟都假設：
 
 ```bash
-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/stateflow_demo?sslmode=disable" \
-LISTEN_ADDR=":8080" ./demo/stateflow
+alias dc='docker compose -f docker-compose.yml -f docker-compose.demo.yml'
 ```
 
 ---
@@ -66,9 +38,7 @@ LISTEN_ADDR=":8080" ./demo/stateflow
 
 ```bash
 # CMD tab
-docker exec stateflow-pg-test psql -U postgres -d stateflow_demo \
-  -c "TRUNCATE workflows CASCADE;"
-> /tmp/worker_step1.log; > /tmp/worker_step2.log
+dc exec -T postgres psql -U stateflow -d stateflow -c "TRUNCATE workflows CASCADE;"
 ```
 
 ---
@@ -80,18 +50,18 @@ docker exec stateflow-pg-test psql -U postgres -d stateflow_demo \
 curl -s http://localhost:8080/runs/$RUN_ID | python3 -m json.tool
 
 # Postgres 原始狀態
-docker exec stateflow-pg-test psql -U postgres -d stateflow_demo \
+dc exec -T postgres psql -U stateflow -d stateflow \
   -c "SELECT step_name, status, output IS NOT NULL AS done FROM steps ORDER BY seq;"
 
 # DLQ
 curl -s http://localhost:8080/dlq | python3 -m json.tool
 
 # Worker 被呼叫幾次
-grep -c "received step" /tmp/worker_step1.log
-grep -c "received step" /tmp/worker_step2.log
+dc logs --no-log-prefix step1 2>/dev/null | grep -c "received step"
+dc logs --no-log-prefix step2 2>/dev/null | grep -c "received step"
 
 # Planner 被呼叫幾次
-grep -c "Planner called" /tmp/llm_adapter.log
+dc logs --no-log-prefix llm-adapter 2>/dev/null | grep -c "Planner called"
 ```
 
 ---
@@ -102,22 +72,18 @@ grep -c "Planner called" /tmp/llm_adapter.log
 
 ## 步驟
 
-**WORKER tab：**
-```bash
-# Dummy adapter 把 step1 → :5010，step2 → :5011
-WORKER_NAME=step1 WORKER_PORT=5010 WORKER_DELAY=1 python3 demo/workers/worker.py &
-WORKER_NAME=step2 WORKER_PORT=5011 WORKER_DELAY=1 python3 demo/workers/worker.py
-```
+`step1`/`step2` 在一次性準備階段已經啟動（各自 delay=1s，來自
+docker-compose.demo.yml 的預設值）。Dummy adapter 把 step1 導向
+`step1:5010`，step2 導向 `step2:5011`，主機上也能用相同的 port 存取。
 
 **CMD tab：**
 ```bash
-# 建 workflow（HTTP planner）
 WORKFLOW_ID=$(curl -s -X POST http://localhost:8080/workflows \
   -H "Content-Type: application/json" \
   -d '{
     "name": "demo-A",
     "planner_type": "http",
-    "planner_config": {"url": "http://localhost:9000/decide"}
+    "planner_config": {"url": "http://llm-adapter:9000/decide"}
   }' | python3 -c "import json,sys; print(json.load(sys.stdin)['workflow_id'])")
 
 # 啟動 run
@@ -135,10 +101,10 @@ echo "run_id: $RUN_ID"
 curl -s http://localhost:8080/runs/$RUN_ID | python3 -m json.tool
 ```
 
-**PLANNER tab** 應看到 3 次呼叫：
+**LOGS tab** 應看到剛好 3 次 planner 呼叫：
 ```
-[ADAPTER] Planner called  history=[]                 → step1 決定（→ :5010）
-[ADAPTER] Planner called  history=['step1']          → step2 決定（→ :5011）
+[ADAPTER] Planner called  history=[]                 → step1 決定（→ step1:5010）
+[ADAPTER] Planner called  history=['step1']          → step2 決定（→ step2:5011）
 [ADAPTER] Planner called  history=['step1', 'step2'] → done
 ```
 
@@ -154,19 +120,18 @@ curl -s http://localhost:8080/runs/$RUN_ID | python3 -m json.tool
 
 ## 步驟
 
-**WORKER tab：只啟動 step1（step2 故意不啟動）**
+**CMD tab：停掉 step2（故意不在線）**
 ```bash
-WORKER_NAME=step1 WORKER_PORT=5010 WORKER_DELAY=1 python3 demo/workers/worker.py
+dc stop step2
 ```
 
-**CMD tab：**
 ```bash
 WORKFLOW_ID=$(curl -s -X POST http://localhost:8080/workflows \
   -H "Content-Type: application/json" \
   -d '{
     "name": "demo-B",
     "planner_type": "http",
-    "planner_config": {"url": "http://localhost:9000/decide"}
+    "planner_config": {"url": "http://llm-adapter:9000/decide"}
   }' | python3 -c "import json,sys; print(json.load(sys.stdin)['workflow_id'])")
 
 RUN_ID=$(curl -s -X POST "http://localhost:8080/workflows/$WORKFLOW_ID/runs" \
@@ -183,7 +148,7 @@ echo "run_id: $RUN_ID"
 
 **Step2 retry 歷史：**
 ```bash
-docker exec stateflow-pg-test psql -U postgres -d stateflow_demo \
+dc exec -T postgres psql -U stateflow -d stateflow \
   -c "SELECT s.step_name, a.attempt_number, a.status
       FROM attempts a JOIN steps s ON a.step_id = s.step_id
       ORDER BY a.dispatched_at;"
@@ -196,12 +161,11 @@ curl -s http://localhost:8080/dlq | python3 -m json.tool
 
 ## Replay
 
-**WORKER tab：另開 pane，啟動 step2**
+**CMD tab：把 step2 啟動回來**
 ```bash
-WORKER_NAME=step2 WORKER_PORT=5011 WORKER_DELAY=1 python3 demo/workers/worker.py
+dc up -d step2
 ```
 
-**CMD tab：**
 ```bash
 # 取 DLQ entry id
 DLQ_ID=$(curl -s http://localhost:8080/dlq | \
@@ -218,7 +182,7 @@ curl -s -X POST "http://localhost:8080/dlq/$DLQ_ID/replay" \
 curl -s http://localhost:8080/runs/$RUN_ID | python3 -m json.tool
 
 # step1 必須只被呼叫 1 次
-grep -c "received step" /tmp/worker_step1.log   # → 1
+dc logs --no-log-prefix step1 2>/dev/null | grep -c "received step"   # → 1
 ```
 
 **成功條件：**
@@ -231,24 +195,23 @@ grep -c "received step" /tmp/worker_step1.log   # → 1
 
 # 場景 C：Orchestrator 崩潰 → Recovery
 
-**示範：** SIGKILL orchestrator → 重啟 → Recovery 只 re-dispatch step1，planner 不被重新呼叫。
+**示範：** Kill orchestrator → 重啟 → Recovery 只 re-dispatch step1，planner 不被重新呼叫（Barrier 1）。
 
 ## 步驟
 
-**WORKER tab：step1 設慢（5s）提供 crash 視窗**
+**CMD tab：把 step1 用 5s delay 重新建立，製造 crash 視窗**
 ```bash
-WORKER_NAME=step1 WORKER_PORT=5010 WORKER_DELAY=5 python3 demo/workers/worker.py &
-WORKER_NAME=step2 WORKER_PORT=5011 WORKER_DELAY=1 python3 demo/workers/worker.py
+STEP1_DELAY=5 dc up -d --force-recreate step1
+dc up -d step2   # 確保 step2（delay=1s）也在跑
 ```
 
-**CMD tab：**
 ```bash
 WORKFLOW_ID=$(curl -s -X POST http://localhost:8080/workflows \
   -H "Content-Type: application/json" \
   -d '{
     "name": "demo-C",
     "planner_type": "http",
-    "planner_config": {"url": "http://localhost:9000/decide"}
+    "planner_config": {"url": "http://llm-adapter:9000/decide"}
   }' | python3 -c "import json,sys; print(json.load(sys.stdin)['workflow_id'])")
 
 RUN_ID=$(curl -s -X POST "http://localhost:8080/workflows/$WORKFLOW_ID/runs" \
@@ -259,27 +222,28 @@ RUN_ID=$(curl -s -X POST "http://localhost:8080/workflows/$WORKFLOW_ID/runs" \
 echo "run_id: $RUN_ID"
 ```
 
-等 **PLANNER tab** 看到第一次 Planner called（step1 已被 DECIDED），然後：
+等 **LOGS tab** 看到第一次 Planner called（step1 已被 DECIDED 並 dispatch），然後：
 
-**ORCH tab：Ctrl+C**（或 `kill -9 $(pgrep -f demo/stateflow)`）
+**CMD tab：kill orchestrator container**
+```bash
+dc kill stateflow
+```
 
 ## 查看 Crash 後狀態
 
 ```bash
-docker exec stateflow-pg-test psql -U postgres -d stateflow_demo \
-  -c "SELECT step_name, status, output IS NOT NULL AS checkpointed FROM steps ORDER BY seq;"
+dc exec -T postgres psql -U stateflow -d stateflow \
+  -c "SELECT step_name, status, output IS NOT NULL AS checkpointed FROM steps WHERE run_id = '$RUN_ID' ORDER BY seq;"
 # step1: RUNNING, checkpointed=f  ← Barrier 1 已 fire（decision in DB），Barrier 2 尚未
 ```
 
 ## 重啟 Orchestrator
 
-**ORCH tab：**
 ```bash
-DATABASE_URL="postgresql://postgres:postgres@localhost:5432/stateflow_demo?sslmode=disable" \
-LISTEN_ADDR=":8080" ./demo/stateflow
+dc up -d stateflow
 ```
 
-應看到 recovery log：
+**LOGS tab** 應看到 recovery log：
 ```
 msg="[RECOVERY] found in-progress runs" count=1
 msg="[RECOVERY] resuming run" steps_done=0 pending_step=step1
@@ -291,9 +255,9 @@ msg="[RECOVERY] resuming run" steps_done=0 pending_step=step1
 curl -s http://localhost:8080/runs/$RUN_ID | python3 -m json.tool
 ```
 
-**PLANNER tab** 計算總呼叫次數（應 ≤ 3）：
+**計算總呼叫次數（應 ≤ 3）：**
 ```bash
-grep -c "Planner called" /tmp/llm_adapter.log
+dc logs --no-log-prefix llm-adapter 2>/dev/null | grep -c "Planner called"
 ```
 
 **成功條件：**
@@ -301,11 +265,20 @@ grep -c "Planner called" /tmp/llm_adapter.log
 - Planner 總呼叫次數 ≤ 3（recovery re-dispatch 不觸發新的 planner call）
 - `[RECOVERY] resuming run` log 出現
 
+## 把 step1 的 delay 改回預設值，方便下次執行
+
+```bash
+STEP1_DELAY=1 dc up -d --force-recreate step1
+```
+
 ---
 
 ## 接你自己的 Worker
 
-把 `worker_url` 換成任何能接 `POST /run` 的服務：
+把 `worker_url` 換成任何能接 `POST /run` 的服務。如果你的服務也是同一個
+compose 網路上的 service，用 service 名稱定址（例如
+`http://my-service:PORT/run`）；否則任何可連到的 URL 都可以（例如主機上跑的
+服務用 `http://host.docker.internal:PORT/run`）：
 
 ```json
 {

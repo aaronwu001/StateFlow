@@ -1,0 +1,103 @@
+# Demo overlay — adds the Python workers and the LLM planner adapter as
+# services on the same compose network as postgres/stateflow (docker-compose.yml).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+#
+# All services build from the one demo/Dockerfile Python image; the script to
+# run differs per service via `command:`, behavior differs via `environment:`
+# (worker.py's existing WORKER_NAME/WORKER_PORT/WORKER_DELAY contract).
+#
+# Each service has a healthcheck that probes its own port from inside the
+# container. This matters on Docker Desktop (Mac/Windows): the host-published
+# port can start accepting connections (via the desktop VM's proxy) slightly
+# before the Flask app inside the container actually binds its listen socket,
+# so polling the host-mapped port from outside can report "ready" a moment
+# too early. Container-to-container calls (e.g. stateflow -> ocr-worker) go
+# straight over the bridge network with no such proxy, so they see the real
+# state — waiting for `healthy` (checked from inside the container's own
+# namespace) instead of a host-side port probe avoids that race.
+#
+# step1/step2 back run_demo.sh's LLM-planner scenarios. Their delay is
+# overridable per scenario from the host shell, e.g.:
+#   STEP1_DELAY=5 docker compose -f docker-compose.yml -f docker-compose.demo.yml \
+#     up -d --force-recreate step1
+#
+# ocr-worker/ner-worker/summarize-worker back crash_demo.py's fixed 3-step
+# pipeline and are never reconfigured at runtime.
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 1s
+  timeout: 2s
+  retries: 20
+  start_period: 5s
+
+services:
+  step1:
+    build: ./demo
+    command: ["workers/worker.py"]
+    environment:
+      WORKER_NAME: step1
+      WORKER_PORT: "5010"
+      WORKER_DELAY: "${STEP1_DELAY:-1}"
+    ports:
+      - "5010:5010"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5010), timeout=2)"]
+
+  step2:
+    build: ./demo
+    command: ["workers/worker.py"]
+    environment:
+      WORKER_NAME: step2
+      WORKER_PORT: "5011"
+      WORKER_DELAY: "${STEP2_DELAY:-1}"
+    ports:
+      - "5011:5011"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5011), timeout=2)"]
+
+  llm-adapter:
+    build: ./demo
+    command: ["planner/llm_adapter.py"]
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      STEP1_URL: "http://step1:5010/run"
+      STEP2_URL: "http://step2:5011/run"
+    ports:
+      - "9000:9000"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9000), timeout=2)"]
+
+  ocr-worker:
+    build: ./demo
+    command: ["workers/ocr_worker.py"]
+    ports:
+      - "5001:5001"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5001), timeout=2)"]
+
+  ner-worker:
+    build: ./demo
+    command: ["workers/ner_worker.py"]
+    environment:
+      # ner_worker calls back to StateFlow's /tasks/complete; from inside the
+      # compose network that's the "stateflow" service, not localhost.
+      STATEFLOW_URL: "http://stateflow:8080"
+    ports:
+      - "5002:5002"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5002), timeout=2)"]
+
+  summarize-worker:
+    build: ./demo
+    command: ["workers/summarize_worker.py"]
+    ports:
+      - "5003:5003"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5003), timeout=2)"]

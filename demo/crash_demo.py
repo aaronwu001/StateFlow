@@ -9,20 +9,18 @@ Proves the headline promise in one script:
   3. Restart.  Recovery fires.
   4. Step 3 runs.  Steps 1-2 do NOT re-run.
 
-Prerequisites (must be running before this script):
-  • Docker container 'stateflow-pg-test'  (postgres:16-alpine)
-  • Python packages: flask, requests  (pip install -r requirements.txt)
-  • Go toolchain  (go build is run automatically)
+Everything (Postgres, StateFlow, the three workers) runs as docker compose
+services — the base stack (docker-compose.yml) plus the demo overlay
+(docker-compose.demo.yml).
 
-Usage (from the project root):
-  cd demo
-  python crash_demo.py
+Prerequisites (must be running before this script):
+  docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d
+
+Usage (from the project root or from demo/ — path-independent):
+  python demo/crash_demo.py
 """
 
 import atexit
-import json
-import logging
-import os
 import pathlib
 import subprocess
 import sys
@@ -38,22 +36,27 @@ import requests
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
-DEMO_DIR    = pathlib.Path(__file__).parent.resolve()
+DEMO_DIR     = pathlib.Path(__file__).parent.resolve()
 PROJECT_ROOT = DEMO_DIR.parent
-WORKERS_DIR  = DEMO_DIR / "workers"
-SF_BINARY    = DEMO_DIR / "stateflow"          # built by this script
-MIGRATION_SQL = PROJECT_ROOT / "migrations" / "001_initial.sql"
+
+COMPOSE_BASE = [
+    "-f", str(PROJECT_ROOT / "docker-compose.yml"),
+    "-f", str(PROJECT_ROOT / "docker-compose.demo.yml"),
+]
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-STATEFLOW_URL   = "http://localhost:8080"
-DB_CONTAINER    = "stateflow-pg-test"
-DB_NAME         = "stateflow_demo"
-DB_USER         = "postgres"
-DB_PASS         = "postgres"
-DATABASE_URL    = f"postgres://{DB_USER}:{DB_PASS}@localhost:5432/{DB_NAME}?sslmode=disable"
+STATEFLOW_URL = "http://localhost:8080"
+DB_USER       = "stateflow"
+DB_NAME       = "stateflow"
 
-WORKER_PORTS    = {"ocr": 5001, "ner": 5002, "summarize": 5003}
+WORKER_SERVICES = ["ocr-worker", "ner-worker", "summarize-worker"]
+WORKER_URLS = {
+    "ocr":       "http://ocr-worker:5001/run",
+    "ner":       "http://ner-worker:5002/run",
+    "summarize": "http://summarize-worker:5003/run",
+}
+WORKER_PORTS = {"ocr": 5001, "ner": 5002, "summarize": 5003}  # host-mapped, for readiness polling
 
 # ── Output helpers ───────────────────────────────────────────────────────────
 
@@ -76,96 +79,102 @@ def ok(msg):    _p(f"  ✅ {msg}")
 def boom(msg):  _p(f"\n  💥 {msg}")
 def revive(msg):_p(f"\n  🔄 {msg}")
 
+# ── docker compose helper ────────────────────────────────────────────────────
+
+def compose(*args, check=True):
+    """Run `docker compose -f docker-compose.yml -f docker-compose.demo.yml <args>`."""
+    cmd = ["docker", "compose", *COMPOSE_BASE, *args]
+    r = subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+    if check and r.returncode != 0:
+        _p(f"ERROR: {' '.join(cmd)}")
+        _p(r.stdout)
+        _p(r.stderr)
+        sys.exit(1)
+    return r
+
 # ── Build ────────────────────────────────────────────────────────────────────
 
 def build():
-    section("BUILD", "go build ./cmd/stateflow/")
-    r = subprocess.run(
-        ["go", "build", "-o", str(SF_BINARY), "./cmd/stateflow/"],
-        cwd=str(PROJECT_ROOT),
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        _p(r.stderr)
-        sys.exit(1)
-    ok(f"Binary ready → {SF_BINARY.name}")
+    section("BUILD", "docker compose build (stateflow + demo workers)")
+    compose("build", "stateflow", *WORKER_SERVICES)
+    ok("Images built")
 
 # ── Database ─────────────────────────────────────────────────────────────────
 
 def setup_db():
-    section("DB", f"Creating fresh '{DB_NAME}' in Docker Postgres")
+    section("DB", f"Resetting '{DB_NAME}' in the compose Postgres service")
+    compose("up", "-d", "postgres")
 
-    def docker_psql(sql, db="postgres"):
-        return subprocess.run(
-            ["docker", "exec", DB_CONTAINER, "psql", "-U", DB_USER, "-d", db, "-c", sql],
-            capture_output=True, text=True,
-        )
-
-    docker_psql(f"DROP DATABASE IF EXISTS {DB_NAME};")
-    r = docker_psql(f"CREATE DATABASE {DB_NAME};")
-    if r.returncode != 0:
-        _p(f"ERROR: {r.stderr}")
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        r = compose("exec", "-T", "postgres", "pg_isready", "-U", DB_USER, "-d", DB_NAME, check=False)
+        if r.returncode == 0:
+            break
+        time.sleep(0.5)
+    else:
+        _p("ERROR: Postgres did not become ready in time")
         sys.exit(1)
 
-    migration = MIGRATION_SQL.read_bytes()
-    r = subprocess.run(
-        ["docker", "exec", "-i", DB_CONTAINER, "psql", "-U", DB_USER, "-d", DB_NAME],
-        input=migration,
-        capture_output=True,
-    )
-    if r.returncode != 0:
-        _p(f"ERROR: {r.stderr.decode()}")
-        sys.exit(1)
+    compose("exec", "-T", "postgres", "psql", "-U", DB_USER, "-d", DB_NAME,
+             "-c", "TRUNCATE workflows CASCADE;")
 
-    ok(f"Schema applied — {DB_NAME} ready")
+    ok(f"Schema clean — '{DB_NAME}' ready")
 
 # ── Workers ──────────────────────────────────────────────────────────────────
 
-_worker_procs: list = []
+def wait_healthy(service: str, timeout: float = 30):
+    """Poll the service's own container healthcheck (docker-compose.demo.yml)
+    rather than probing the host-published port: on Docker Desktop the
+    host-side port can accept connections slightly before the app inside the
+    container actually binds its listen socket, which would let stateflow
+    (a container-to-container caller) race ahead of a truly-ready worker."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cid = compose("ps", "-q", service, check=False).stdout.strip()
+        if cid:
+            h = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Health.Status}}", cid],
+                capture_output=True, text=True,
+            )
+            if h.stdout.strip() == "healthy":
+                return
+        time.sleep(0.3)
+    _p(f"ERROR: {service} did not become healthy in time")
+    sys.exit(1)
 
 def start_workers():
-    section("WORKERS", "Starting Python Flask workers")
-    env = {**os.environ, "STATEFLOW_URL": STATEFLOW_URL}
-    scripts = {
-        "ocr":       WORKERS_DIR / "ocr_worker.py",
-        "ner":       WORKERS_DIR / "ner_worker.py",
-        "summarize": WORKERS_DIR / "summarize_worker.py",
-    }
-    for name, path in scripts.items():
-        p = subprocess.Popen([sys.executable, str(path)], env=env)
-        _worker_procs.append(p)
+    section("WORKERS", "Starting worker containers (ocr-worker, ner-worker, summarize-worker)")
+    compose("up", "-d", "--force-recreate", *WORKER_SERVICES)
 
-    # Wait for all Flask servers to be listening (TCP connect probe).
-    import socket
     info("Waiting for workers to be ready...")
-    for name, port in WORKER_PORTS.items():
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            try:
-                with socket.create_connection(("localhost", port), timeout=0.5):
-                    break
-            except OSError:
-                time.sleep(0.3)
-        else:
-            _p(f"ERROR: {name} worker (:{port}) didn't start in time")
-            sys.exit(1)
+    for name in WORKER_SERVICES:
+        wait_healthy(name)
 
     ok(f"Workers ready  OCR:{WORKER_PORTS['ocr']}  NER:{WORKER_PORTS['ner']}  "
        f"Summarize:{WORKER_PORTS['summarize']}")
 
-# ── StateFlow process ─────────────────────────────────────────────────────────
+_log_stream_proc = None
 
-_sf_proc = None
+def start_log_stream():
+    """Stream container logs into this terminal so the demo's [OCR]/[NER]/[SUMMARIZE]
+    and [RECOVERY] markers still appear live, interleaved with this script's own
+    output. Started only once the stateflow container definitely exists."""
+    global _log_stream_proc
+    _log_stream_proc = subprocess.Popen(
+        ["docker", "compose", *COMPOSE_BASE, "logs", "-f", "--no-log-prefix",
+         "--tail", "0", *WORKER_SERVICES, "stateflow"],
+        cwd=str(PROJECT_ROOT),
+    )
 
-def _sf_env():
-    return {**os.environ, "DATABASE_URL": DATABASE_URL, "LISTEN_ADDR": ":8080"}
+# ── StateFlow service ─────────────────────────────────────────────────────────
+
+def _container_id(service: str) -> str:
+    r = compose("ps", "-q", service, check=False)
+    return r.stdout.strip()[:12] or "?"
 
 def start_stateflow(label="StateFlow"):
-    global _sf_proc
-    _sf_proc = subprocess.Popen([str(SF_BINARY)], env=_sf_env())
+    compose("up", "-d", "stateflow")
 
-    # Poll until HTTP server answers.
     for _ in range(30):
         try:
             r = requests.get(f"{STATEFLOW_URL}/runs/__probe__", timeout=1)
@@ -178,17 +187,12 @@ def start_stateflow(label="StateFlow"):
         _p("ERROR: StateFlow did not start in time")
         sys.exit(1)
 
-    ok(f"{label} ready on :8080  pid={_sf_proc.pid}")
+    ok(f"{label} ready on :8080  container={_container_id('stateflow')}")
 
 def kill_stateflow():
-    global _sf_proc
-    if _sf_proc and _sf_proc.poll() is None:
-        pid = _sf_proc.pid
-        _sf_proc.kill()
-        _sf_proc.wait()
-        _sf_proc = None
-        return pid
-    return None
+    cid = _container_id("stateflow")
+    compose("kill", "stateflow")
+    return cid
 
 # ── StateFlow HTTP API ────────────────────────────────────────────────────────
 
@@ -197,19 +201,19 @@ def create_workflow() -> str:
         "steps": [
             {
                 "name":            "ocr",
-                "worker_url":      f"http://localhost:{WORKER_PORTS['ocr']}/run",
+                "worker_url":      WORKER_URLS["ocr"],
                 "mode":            "sync",
                 "timeout_seconds": 30,
             },
             {
                 "name":            "ner",
-                "worker_url":      f"http://localhost:{WORKER_PORTS['ner']}/run",
+                "worker_url":      WORKER_URLS["ner"],
                 "mode":            "async",
                 "timeout_seconds": 60,
             },
             {
                 "name":            "summarize",
-                "worker_url":      f"http://localhost:{WORKER_PORTS['summarize']}/run",
+                "worker_url":      WORKER_URLS["summarize"],
                 "mode":            "sync",
                 "timeout_seconds": 30,
             },
@@ -267,12 +271,9 @@ def step_running(data: dict, name: str) -> bool:
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
 def cleanup():
-    kill_stateflow()
-    for p in _worker_procs:
-        try:
-            p.kill()
-        except Exception:
-            pass
+    if _log_stream_proc and _log_stream_proc.poll() is None:
+        _log_stream_proc.kill()
+    compose("stop", "stateflow", *WORKER_SERVICES, check=False)
 
 atexit.register(cleanup)
 
@@ -290,6 +291,7 @@ def main():
     # 2. Start orchestrator
     section("START", "Starting StateFlow orchestrator (first boot)")
     start_stateflow("StateFlow (boot 1)")
+    start_log_stream()
 
     # 3. Create workflow + run
     section("RUN", "Creating 3-step workflow and launching run")
@@ -311,10 +313,10 @@ def main():
 
     # 6. Kill orchestrator while NER is mid-flight
     time.sleep(1.0)   # brief pause to let the dispatch POST reach the NER worker
-    boom("KILLING ORCHESTRATOR  —  pid " + str(_sf_proc.pid if _sf_proc else "?"))
+    cid = kill_stateflow()
+    boom(f"KILLING ORCHESTRATOR  —  container {cid}")
     boom("NER's async callback channel dies with the process")
     boom("DB still shows step 2 RUNNING (no output); step 3 never started")
-    pid = kill_stateflow()
     _p("")
 
     # 7. Wait for NER's first background thread to finish and cache its result

@@ -1,0 +1,13 @@
+.git
+demo/
+docs/
+venv/
+*.md
+*.exe
+*.exe~
+stateflow
+stateflow.exe
+*.test
+.dockerignore
+Dockerfile
+docker-compose*.yml

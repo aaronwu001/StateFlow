@@ -67,7 +67,14 @@ type Result struct {
 type Frontier struct {
     RunID           RunID
     History         []HistoryEntry // DONE steps, ordered by seq ASC
-    PendingDecision *StepSpec      // non-nil = DECIDED-not-DONE step; re-dispatch this
+    PendingDecision *StepSpec      // non-nil = DECIDED, RUNNING, or FAILED step with no output; re-dispatch this
+}
+
+// RunRef is a lightweight reference to a RUNNING run, returned by
+// StateStore.ListRunningRuns for the crash-recovery scan at startup.
+type RunRef struct {
+    RunID         RunID
+    WorkflowInput json.RawMessage
 }
 ```
 
@@ -94,13 +101,27 @@ type WorkerTransport interface {
 }
 
 // StateStore is the durable source of truth. All correctness rests here.
+// This is the complete 11-method contract: the two write barriers and their
+// reads, plus run/step lifecycle bookkeeping. There is no separate
+// orchestrator-level store interface — Loop.Store and RecoverRuns both take
+// core.StateStore directly.
 // Reference impl: PostgresStore.
 // Extension point: MySQL, SQLite, cloud KV.
 type StateStore interface {
+    // Correctness core: the two write barriers and their reads.
     LoadFrontier(run RunID) (Frontier, error)
     PutDecision(run RunID, step StepSpec) error           // Barrier 1
     Checkpoint(run RunID, step StepSpec, r Result) error  // Barrier 2
     PendingDecision(run RunID) (*StepSpec, error)
+
+    // Run/step lifecycle bookkeeping.
+    RecordAttemptStart(run RunID, step StepSpec, attemptID AttemptID) error
+    ResetToDecided(run RunID, step StepSpec) error
+    MarkDLQ(run RunID, step StepSpec, reason string, lastError string) error
+    MarkRunDone(run RunID) error
+    MarkRunFailed(run RunID, reason string) error
+    MarkPlannerFailedDLQ(run RunID, detail string) error
+    ListRunningRuns(ctx context.Context) ([]RunRef, error)
 }
 
 // RetryPolicy decides whether and when to retry a failed step.
@@ -141,13 +162,14 @@ DECIDED ──► RUNNING ──► DONE
 
 A run is `FAILED` when the planner declares `status: fail`, or when a step lands in DLQ and the run cannot continue.
 
-### Three Recovery Rules (§3.1)
+### Four Recovery Rules (§3.1)
 
 These are applied on restart, for each unfinished run, after reading the frontier:
 
-1. **Step `RUNNING`, no `output`** → re-dispatch (new `attempt_id`). The in-process channel is gone; waiting is impossible.
-2. **Step `DECIDED`, no `output`** → re-dispatch the recorded decision. Do NOT re-ask the planner; the decision is already persisted.
-3. **Step `DONE`** → ask the planner for the next step, passing the updated frontier (all DONE steps in `seq` order).
+1. **Step `RUNNING`, no `output`** → re-dispatch (new `attempt_id`). The in-process channel is gone; waiting is impossible. This is *uncertain*, not `FAILED` — the worker may have succeeded and only the sync response was lost to the crash.
+2. **Step `DECIDED`, no `output`** → re-dispatch the recorded decision (new `attempt_id`). Do NOT re-ask the planner; the decision is already persisted.
+3. **Step `FAILED`, no `output`** → re-dispatch the persisted decision (new `attempt_id`), same as `DECIDED`. This is the crash window between `Checkpoint` Path B and `ResetToDecided`: the step holds a decision that was never completed, so recovery treats it exactly like an undelivered `DECIDED` step — do NOT re-ask the planner. The retry budget restarts on recovery (attempt counting is per loop entry, in-memory) — a documented MVP caveat.
+4. **Step `DONE`** → ask the planner for the next step, passing the updated frontier (all DONE steps in `seq` order).
 
 ---
 
@@ -217,7 +239,7 @@ CREATE INDEX idx_attempts_step_id ON attempts(step_id);
 CREATE TABLE dead_letter_queue (
     id         BIGSERIAL   PRIMARY KEY,
     run_id     TEXT        NOT NULL REFERENCES runs(run_id),   -- denormalized for queries
-    step_id    TEXT        NOT NULL REFERENCES steps(step_id),
+    step_id    TEXT        REFERENCES steps(step_id),           -- NULL for planner_failed (no step at fault)
     reason     TEXT        NOT NULL CHECK (reason IN ('retry_exhausted', 'planner_failed', 'hard_failure')),
     context    JSONB       NOT NULL, -- snapshot: run state, last error, retry history, last output
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -225,6 +247,9 @@ CREATE TABLE dead_letter_queue (
 
 CREATE INDEX idx_dlq_run_id ON dead_letter_queue(run_id);
 ```
+
+-- `dead_letter_queue.step_id` is nullable: `MarkPlannerFailedDLQ` writes a row with
+-- `step_id=NULL` because a planner-declared failure has no step at fault.
 
 ---
 
@@ -392,8 +417,8 @@ On startup:
   rows = SELECT run_id FROM runs WHERE status = 'RUNNING'
   for each run_id:
       frontier = store.LoadFrontier(run_id)
-      apply the three recovery rules (§3.1):
-        - PendingDecision non-nil (DECIDED or RUNNING, no output) → re-dispatch
+      apply the four recovery rules (§3.1):
+        - PendingDecision non-nil (DECIDED, RUNNING, or FAILED, no output) → re-dispatch
         - else → ask planner with frontier.History
       re-enter the driver loop for that run (one goroutine per run)
 ```

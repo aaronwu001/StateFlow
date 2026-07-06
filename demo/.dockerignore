@@ -1,0 +1,7 @@
+stateflow
+stateflow.exe
+*.gif
+__pycache__
+*.pyc
+playbook/
+configs/
