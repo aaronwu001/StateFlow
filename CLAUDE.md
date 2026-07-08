@@ -1,263 +1,121 @@
-# StateFlow — Development Discipline
+# StateFlow — Development Discipline (TRANSITIONAL — v1.0 refactor in progress)
 
-**Authoritative design:** `docs/StateFlow_Whitepaper_v0.8.md`
-**Technical blueprint:** `DESIGN.md`
+> **⚠ REFACTOR IN PROGRESS.** The codebase is being migrated from the v0.9 five-state model to the v1.0 three-state model via numbered sessions (0–8). Until Session 7 replaces this file with the final version, this transitional file governs.
 
-Read both before touching any code. When in doubt, the whitepaper wins.
+**Authoritative design:** `docs/StateFlow_Whitepaper_v1_0.md`
+**Rule-by-rule spec:** `docs/StateFlow_Rules_Consolidation_v3_EN.md` (a Chinese mirror exists; English governs)
+**Session instructions:** provided per-session by the owner (Master Context + Session N). The Master Context's rules override anything else, including this file.
+
+**VOID — do not read as authority, do not imitate:** `docs/archive/DESIGN.md`, `docs/archive/StateFlow_Whitepaper_v0.8.md` (and any v0.9 whitepaper), the pre-refactor `docs/USER_MANUAL.md` (rewritten in Session 7), and any code or test that asserts the old model. If existing code contradicts the two authoritative documents, the documents win — report the conflict, do not imitate the code.
 
 ---
 
 ## What This Project Is
 
-StateFlow is a durable execution layer for AI pipelines. It checkpoints every step, retries failures, and resumes after a crash exactly where it left off — without re-running completed work. The core mechanism is a **frontier model**: persist each `(decision, result)` pair as it happens; on recovery, read the frontier and resume. No replay; no determinism requirement.
+StateFlow is a durable execution layer for AI pipelines. It checkpoints every step, retries failures, and resumes after a crash exactly where it left off — without re-running completed work. Mechanism: a **frontier model** — persist each (decision, result) pair as it happens; on recovery, read the frontier and resume. No replay; no determinism requirement; the planner (which may be an LLM) is asked exactly once per persisted step.
 
 ---
 
-## The Two Write Barriers — Never Violate
+## The v1.0 Model — Quick Reference
 
-These are the load-bearing correctness invariants of the entire system. Violating their ordering is a correctness bug, not a style issue. There are no exceptions.
-
-### Barrier 1 — persist-decision-before-dispatch
+**States (3×3×3):**
 
 ```
-store.PutDecision(run, step)   ← must commit
-        ↓
-transport.Dispatch(step)       ← only then
+run:     RUNNING | DONE | DLQ
+step:    RUNNING | DONE | DLQ          (DECIDED and FAILED no longer exist)
+attempt: RUNNING | DONE | FAILED(reason: worker_reported | timeout | malformed | orphaned)
 ```
 
-The planner's chosen next step is written to the DB (status `DECIDED`) **before** any worker is dispatched. If the process crashes between these two lines, recovery re-dispatches the persisted decision — the planner is not re-asked.
-
-### Barrier 2 — persist-result-before-next-decision
+**The two write barriers (now transactions TX1/TX2):**
 
 ```
-store.Checkpoint(run, step, result)   ← must commit
-        ↓
-planner.Decide(state)                 ← only then
+TX1 (Barrier 1): create step+decision+first attempt+current_attempt_id  → commit → only then dispatch
+TX2 (Barrier 2): attempt→DONE + step→DONE + output                     → commit → only then ask planner
 ```
 
-The worker's result is checkpointed (status `DONE`) **before** the planner is asked for the next step. If you find yourself calling `Decide` before `Checkpoint` returns, stop and fix it.
+**Combination table (run × last_step) and restart actions:**
 
-**If you are tempted to reorder these for performance or convenience, that is the signal to stop and ask for explicit sign-off.**
+```
+RUNNING / done-or-no-steps → re-ask planner
+RUNNING / running          → claim orphan (attempt→FAILED(orphaned), count++) → budget check → re-dispatch or already-DLQ'd
+DONE    / done             → untouched
+DLQ     / DLQ              → untouched (worker-side; replay = TX5)
+DLQ     / done             → untouched (planner-side; replay = TX6)
+```
 
----
+**Timeout doctrine:** every attempt is timed from its creation (TX1/TX4 commit). The loop computes `deadline = attempt created_at + effective timeout` (step override > workflow default > 60s) and passes it via `context.WithDeadline` into `Dispatch`. **Timeout = failure** (reason `timeout`), consuming the budget like any other failure. Retry delay between attempts: 5s. The retry budget is the persisted `steps.attempt_count` — incremented only in TX3, reset only in TX5 (replay), touched nowhere else.
 
-## Four Recovery Rules — The Heart of the Demo
+**The Atomic Transaction Ledger (every entry = exactly one DB transaction):**
 
-On restart, for each unfinished run, read the frontier (`LoadFrontier`) and apply:
+```
+TX-W create workflow      TX0 create run          TX1 step+attempt (Barrier 1)
+TX2 success checkpoint (Barrier 2)
+TX3 attempt→FAILED(reason)+count++; if count=X: same tx → step DLQ + run DLQ + DLQ record
+TX4 new attempt + CAS current_attempt_id          TX5 replay worker-side (count→0, all-in-one)
+TX6 replay planner-side   TX7 run→DONE            TX8 planner declared fail → DLQ
+TX9 planner budget exhausted → DLQ                CAS-A: UPDATE … WHERE attempt_id=? AND status='RUNNING'
+```
 
-1. **Step `RUNNING`, `output` is null** → **re-dispatch** (generate a new `attempt_id`). The in-process channel that was awaiting the callback died with the crash. Waiting is impossible. Re-dispatch and rely on worker idempotency.
-2. **Step `DECIDED`, no dispatch confirmed** → **re-dispatch the recorded `decision`** (generate a new `attempt_id` — every dispatch gets a fresh one). Do NOT call `planner.Decide`. The planner was already asked; its answer is in the DB.
-3. **Step `DONE`** → **call `planner.Decide`** with the updated frontier (all DONE steps in `seq` order).
-4. **Step `FAILED`, `output` is null** → **re-dispatch the persisted decision** (same as `DECIDED`/`RUNNING`; new `attempt_id`). This is the crash window between `Checkpoint` Path B and `ResetToDecided`: the step holds a decision that was never completed, so recovery treats it exactly like an undelivered `DECIDED` step — do NOT call `planner.Decide`. The retry budget restarts on recovery (attempt counting is per loop entry, in-memory) — a documented MVP caveat, not something to "fix" by persisting attempt counts.
+Full ledger with contents and rationale: whitepaper §19 ≡ rules §21. Never split, merge, or reorder a TX.
 
-### Critical distinction: RUNNING-uncertain vs FAILED
+**Wire formats (binding):** sync workers receive the **bare input** as the POST body plus headers `X-StateFlow-Step-ID` / `X-StateFlow-Attempt-ID` (sync's zero-modification promise); async workers receive the `{step_id, attempt_id, input}` envelope; **every status string on the wire is UPPERCASE** ("DONE"), identical to the stored values.
 
-A step that is `RUNNING`-with-no-`output` is **uncertain** — the worker may have successfully completed, but the sync response was lost to a crash. This is NOT `FAILED`. `FAILED` means the worker explicitly reported failure (`/tasks/fail` or sync non-2xx). Treating uncertain-RUNNING as FAILED would corrupt a successfully-completed step. Recovery for RUNNING-uncertain is always re-dispatch, never mark-failed.
-
----
-
-## step_id / attempt_id — Never Conflate
-
-| Field | Identifies | Lifetime | Format |
-|-------|------------|----------|--------|
-| `step_id` | The step within its run | Constant across all retries | `{run_id}:{step_name}` |
-| `attempt_id` | One specific dispatch | New UUID every (re-)dispatch | UUID |
-
-The callback handler validates that the incoming `attempt_id` matches `current_attempt_id` in the DB before acting. A superseded `attempt_id` is ACKed with 200 but has zero effect on run state — this is the dedup guard for at-least-once delivery.
-
-Using `step_id` where `attempt_id` is required (or vice versa) breaks deduplication and risks double-execution. These are never interchangeable.
+**Other iron rules:** single writer (only the loop writes state; the callback handler validates + pushes to channel + returns 200, nothing more); every report lands through CAS; a success report arriving after a timeout verdict is rejected; all persisted timestamps come from DB `now()`, never `time.Now()`, never worker/planner payloads; history sent to the planner is ordered by `seq` only.
 
 ---
 
-## Async Dispatch — Barrier 2 Lives in the Loop, Not the Handler
+## During-Refactor Rules
 
-`POST /tasks/complete` callback handler does exactly three things:
-1. Validate `attempt_id == current_attempt_id` (reads DB)
-2. Push result into the in-process channel
-3. Return 200 to the worker
-
-It does NOT write step state. `store.Checkpoint` (Barrier 2) is called by the **orchestrator loop** after `transport.Dispatch` returns. This ordering is mandatory — two concurrent writers would race and break the barrier guarantee. The handler is a delivery mechanism; the loop is the authority.
-
----
-
-## Store Interface
-
-`core.StateStore` (`internal/core/interfaces.go`) is the complete 11-method contract: the two write barriers and their reads (`LoadFrontier`, `PutDecision`, `Checkpoint`, `PendingDecision`), plus run/step lifecycle bookkeeping (`RecordAttemptStart`, `ResetToDecided`, `MarkDLQ`, `MarkRunDone`, `MarkRunFailed`, `MarkPlannerFailedDLQ`, `ListRunningRuns`). `orchestrator.Store` no longer exists — it was a local extension interface that has been folded into `core.StateStore`. `Loop.Store` and `RecoverRuns` both take `core.StateStore` directly.
+1. Follow the current session's prompt exactly; respect its scope; stop and report instead of editing out-of-scope files.
+2. Old-model tests are **expected to fail or be deleted** in their owning session (per the Session 0 audit). Never weaken new-model code to satisfy an old test.
+3. Every session ends with the mandatory seven-question report defined in the Master Context.
+4. The pre-release freedom applies: schema changes rewrite `migrations/001_initial.sql` in place; reset with `docker compose down -v`; no migration tooling.
 
 ---
 
 ## Running Tests
 
-Unit tests (no DB) run with plain `go test`:
+Unit tests (no DB): `go test ./...`
+
+Postgres-backed integration tests (in `internal/store`, `internal/api`, `internal/orchestrator`) skip themselves unless `TEST_DATABASE_URL` is set:
 
 ```bash
-go test ./...
-```
-
-Postgres-backed integration tests (in `internal/store`, `internal/api`, and `internal/orchestrator`) skip themselves unless `TEST_DATABASE_URL` is set — they don't spin up their own database. Point them at the same Postgres the docker-compose stack uses:
-
-```bash
-# Start (or reuse) the compose Postgres — the base stack is enough, no demo overlay needed.
 docker compose up -d postgres
-
-# Host port 5432 is published by docker-compose.yml, so localhost works directly.
 TEST_DATABASE_URL="postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable" \
-  go test -p 1 ./internal/store/... -v
+  go test -p 1 ./...
 ```
 
-Each test calls `resetSchema` (drop + re-apply `migrations/001_initial.sql`) before running, so it's safe to point at the same database the demo stack uses — but note it **wipes** whatever demo/run data was in there. Don't run the integration test suite against that Postgres while a demo run you care about is in progress.
-
-**`-p 1` is required** when running more than one package together (e.g. the full suite below): `go test` runs different packages' tests in parallel by default, and `internal/store`, `internal/api`, and `internal/orchestrator` each call `resetSchema` (DROP + re-migrate) against the *same* `TEST_DATABASE_URL` database. Two packages resetting the schema at the same moment race each other — `duplicate key value violates unique constraint "pg_type_typname_nsp_index"` or `relation "steps" does not exist` are the symptom, not a real bug. `-p 1` serializes package execution and avoids it. (A single package's own tests, e.g. `go test ./internal/store/...` alone, don't need it — `resetSchema` runs once per `TestMain`/setup, not concurrently within a package.)
-
-To run the full suite (unit + integration) in one shot:
-
-```bash
-docker compose up -d postgres
-TEST_DATABASE_URL="postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable" go test -p 1 ./...
-```
+Each integration test calls `resetSchema` (drop + re-apply `migrations/001_initial.sql`) — it **wipes** whatever demo/run data is in that database; don't run it while a demo run you care about is in progress. **`-p 1` is required** when running more than one package: the store/api/orchestrator packages each reset the same database's schema, and parallel package execution makes them race (symptoms: `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`, `relation "steps" does not exist`). `-p 1` serializes packages. A single package alone doesn't need it.
 
 ---
 
-## Session Discipline: One Step Per Session
+## Demo Infrastructure (operational facts — still valid; scenario *semantics* are updated in Session 7)
 
-Each work session addresses **exactly one clearly scoped step** with a verifiable completion condition.
-
-**Before starting, state explicitly:**
-- What you are building (one sentence)
-- What "done" looks like (a runnable check or specific test output)
-
-Do not begin the next step until the current one is verified complete. Do not implement multiple steps in one session without explicit sign-off from the project owner.
-
-Example completion conditions:
-- "Migration applies cleanly; `psql` shows all five tables matching DESIGN.md schema"
-- "Interfaces and types compile: `go build ./internal/core/...` exits 0"
-- "Barrier invariant test passes: insert decision, insert result, read frontier, assert barrier ordering holds"
-
----
-
-## Deferred Items — Do Not Implement
-
-§9.2 of the whitepaper lists features explicitly deferred to Phase 2 and Phase 3. Do not implement any of the following, regardless of how natural or easy they appear:
-
-- **Ghost Mode** / soft-retry / patient retry
-- **Async timeout sweeper**
-- **LLM-aware rate limiting** (`retry_after` field behavior — accept the field, ignore it)
-- **Full `response_mapping`** — only `output_field` is in MVP scope; `status`/`error`/`retry_after` extraction is deferred
-- **Summary-plus-fetch** planner state (sending full history is the MVP behavior)
-- **DAG / fan-in parallelism**
-- **Replicated orchestrator** with leader election
-- **MCP transport**
-- **DLQ webhooks**
-- **Semantic repair** of malformed LLM planner output
-- **Redis activation** — provisioned but dark; Postgres carries the entire MVP
-
-**If you find yourself starting to implement any item on this list, that is the explicit signal to stop and ask the project owner before continuing.**
-
-The interfaces must be designed to allow these extensions later (§11 of the whitepaper), but they must not be implemented now.
-
----
-
-## Progress Reporting Protocol
-
-Before reporting a task complete:
-1. Run the stated completion condition verifier (test, build, or manual check)
-2. Confirm it passes
-3. Report what changed, what was verified, and what the next step is
-
-Do not report success based on "the code looks correct." Run the verifier. If the verifier does not exist yet, that is the first thing to build.
-
----
-
-## Demo Infrastructure
-
-Everything the demo needs (Postgres, StateFlow, workers, the LLM planner adapter) runs as **docker compose services** — the base stack (`docker-compose.yml`) plus the demo overlay (`docker-compose.demo.yml`). One-time setup from a clean clone:
+Full stack from a clean clone:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build
 ```
 
-**Interactive demo:** `./demo/run_demo.sh` (menu-driven, 3 LLM-planner scenarios; drives the compose stack via `docker compose up/stop/kill`)
-**Automated crash proof:** `python demo/crash_demo.py` (single scenario, fully automated; requires the compose stack already up)
+- Interactive demo: `./demo/run_demo.sh` (3 scenarios, LLM planner via HTTP :9000; DUMMY mode needs no API key)
+- Automated crash proof: `python demo/crash_demo.py` (static planner; OCR :5001 sync → NER :5002 async 5s delay → Summarize :5003 sync; kills/restarts the `stateflow` container mid-NER)
+- `step1`/`step2` run `demo/workers/worker.py`; delays via `STEP1_DELAY`/`STEP2_DELAY` host env vars (default 1s), e.g. `STEP1_DELAY=5 docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --force-recreate step1`
+- DUMMY-planner worker URLs overridable via `STEP1_URL`/`STEP2_URL` (compose sets `http://step1:5010/run` / `http://step2:5011/run`)
 
-### Demo directory layout
+API paths:
 
 ```
-demo/
-├── Dockerfile            Shared Python image for workers + LLM adapter (command differs per compose service)
-├── run_demo.sh           Interactive 3-scenario menu (LLM planner mode)
-├── crash_demo.py         Automated crash-recovery proof (static planner, specialized workers)
-├── playbook/
-│   ├── PLAYBOOK.zh.md    Manual step-by-step walkthrough (Chinese)
-│   └── PLAYBOOK.en.md    Manual step-by-step walkthrough (English)
-├── planner/
-│   ├── llm_adapter.py    HTTP planner: REAL (Claude sonnet-4-6) or DUMMY (hardcoded 2-step)
-│   └── echo_worker.py    Minimal sync echo worker (port 5010) for standalone planner testing
-├── workers/
-│   ├── worker.py         Generic configurable worker (WORKER_NAME/PORT/DELAY env vars) — backs compose services step1/step2
-│   ├── ocr_worker.py     crash_demo only — sync, port 5001, idempotency cache
-│   ├── ner_worker.py     crash_demo only — async, port 5002, step_id-keyed cache + callback
-│   └── summarize_worker.py  crash_demo only — sync, port 5003, idempotency cache
-└── configs/
-    ├── llm_planner.yaml  HTTP planner config (port 9000) — reference only
-    └── static_3step.yaml Static 3-step config — reference only
-
-docker-compose.demo.yml   Overlay: step1, step2, llm-adapter, ocr-worker, ner-worker, summarize-worker
-```
-
-`step1`/`step2` (docker-compose.demo.yml) run `worker.py` with `WORKER_DELAY` read from the `STEP1_DELAY`/`STEP2_DELAY` host env vars (default 1s) — e.g. `STEP1_DELAY=5 docker compose ... up -d --force-recreate step1` recreates step1 with a 5s delay for the crash-window scenario. `llm_adapter.py`'s DUMMY-mode worker URLs are overridable via `STEP1_URL`/`STEP2_URL` (docker-compose.demo.yml sets them to `http://step1:5010/run` / `http://step2:5011/run`; default is `localhost` for non-compose use).
-
-### Interactive demo scenarios (run_demo.sh)
-
-All three scenarios use LLM planner (HTTP, port 9000). DUMMY mode requires no API key.
-
-1. **Happy Path** — planner drives 2-step pipeline (step1→:5010, step2→:5011) to completion
-2. **Worker Crash & DLQ Replay** — step2 worker absent → retries → DLQ → replay → complete without re-running step1
-3. **Orchestrator Crash & Recovery** — SIGKILL while step1 in-flight → restart → recovery re-dispatches (not re-decides) → planner calls ≤ 3
-
-### Automated crash demo (crash_demo.py)
-
-Single scenario: OCR (sync, port 5001) → NER (async, port 5002, 5s delay) → Summarize (sync, port 5003). Kills the `stateflow` container (`docker compose kill stateflow`) while NER is in-flight, restarts it (`docker compose up -d stateflow`). Proof: NER idempotency cache hit on re-dispatch; no steps re-run. Run with `python demo/crash_demo.py` from anywhere in the repo — paths resolve from `__file__`.
-
-### LLM planner adapter (demo/planner/llm_adapter.py)
-
-- **DUMMY mode** (no API key): hardcoded 2-step pipeline — step1 → `:5010/run`, step2 → `:5011/run`
-- **REAL mode** (`ANTHROPIC_API_KEY` set): calls Claude `claude-sonnet-4-6` with full RunState JSON; returns StepDecision
-
-### Go change (recovery.go)
-Added `[RECOVERY]` structured log messages with per-run step counts:
-```
-msg="[RECOVERY] found in-progress runs" count=1
-msg="[RECOVERY] resuming run" run_id=... steps_done=1 pending_step=ner
-```
-
-### Actual API paths
-```
-POST /workflows                          create workflow (name, planner_type, planner_config)
-POST /workflows/{workflow_id}/runs       start run (workflow_input)
-GET  /runs/{run_id}                      status + steps
-GET  /dlq                                list DLQ entries
-POST /dlq/{id}/replay                    replay DLQ entry (resets step to DECIDED, re-enters loop)
-POST /tasks/complete                     async worker callback
-POST /tasks/fail                         async worker failure callback
+POST /workflows                      create workflow (name, planner_type, planner_config)
+POST /workflows/{workflow_id}/runs   start run (workflow_input)
+GET  /runs/{run_id}                  status + steps (+ attempt summaries + dlq_reason after Session 6)
+GET  /dlq                            list DLQ entries
+POST /dlq/{id}/replay                replay (worker-side = TX5, planner-side = TX6, after Session 6)
+POST /tasks/complete                 async worker callback
+POST /tasks/fail                     async worker failure callback (optional retry_after_seconds: accepted, ignored)
 ```
 
 ---
 
-## Quick Reference
+## Progress Reporting Protocol
 
-```
-Barrier 1:  PutDecision  → then Dispatch
-Barrier 2:  Checkpoint   → then Decide
-
-Recovery:
-  RUNNING, no output  → re-dispatch (new attempt_id)
-  DECIDED, no output  → re-dispatch (same decision, new attempt_id)
-  FAILED,  no output  → re-dispatch (same decision, new attempt_id; retry budget restarts)
-  DONE                → Decide (pass frontier)
-
-step_id   = "{run_id}:{step_name}"  constant
-attempt_id = UUID                   new every dispatch
-
-Deferred: Ghost Mode | sweeper | rate limiting | full response_mapping |
-          DAG | replicated orchestrator | MCP | DLQ webhooks | Redis
-```
+Before reporting a task complete: run the stated completion-condition verifier, confirm it passes, then deliver the seven-question report (Master Context). Never report success from "the code looks correct." If the verifier doesn't exist yet, building it is the first task.
