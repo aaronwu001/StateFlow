@@ -57,7 +57,9 @@ CREATE TABLE attempts (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),  -- renamed from dispatched_at: inserted at TX1/TX4, before dispatch — the timeout anchor. No attempt_number; order by created_at
     resolved_at     TIMESTAMPTZ,
     CONSTRAINT attempts_failure_reason_required_when_failed
-        CHECK (status <> 'FAILED' OR failure_reason IS NOT NULL)
+        CHECK (status <> 'FAILED' OR failure_reason IS NOT NULL),
+    CONSTRAINT attempts_reason_absent_unless_failed
+        CHECK (status = 'FAILED' OR failure_reason IS NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_attempts_step_id ON attempts(step_id);
