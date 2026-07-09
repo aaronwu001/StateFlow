@@ -210,11 +210,22 @@ type Result struct {
 //     (§8.3) using PendingAttemptID (the live attempt to claim/supersede)
 //     and AttemptCount (the persisted retry budget, for the budget check).
 type Frontier struct {
-	RunID            RunID
-	History          []HistoryEntry
-	PendingStep      *StepSpec
-	PendingAttemptID AttemptID // valid only when PendingStep != nil
-	AttemptCount     int       // valid only when PendingStep != nil; steps.attempt_count
+	RunID       RunID
+	History     []HistoryEntry
+	PendingStep *StepSpec
+
+	// PendingAttemptID is the attempt to claim on recovery: pass it
+	// straight to RecordFailure(reason=orphaned) unconditionally. Recovery
+	// never reads the attempt's current status first — CAS-A inside
+	// RecordFailure already handles "no longer RUNNING" as a no-op
+	// (ReportSuperseded), so a claim on an attempt that somehow already
+	// resolved is safe and requires no separate check.
+	// Valid only when PendingStep != nil.
+	PendingAttemptID AttemptID
+
+	// AttemptCount is the persisted retry budget (steps.attempt_count).
+	// Valid only when PendingStep != nil.
+	AttemptCount int
 }
 
 // RunRef is a lightweight reference to a RUNNING run, returned by
@@ -242,6 +253,11 @@ type WorkflowDef struct {
 
 	// RetryLimit is X: the attempt_count threshold at which a step's next
 	// failure routes to the DLQ instead of a new attempt (whitepaper §7.1).
+	// Not an independent persisted column: it lives inside PlannerConfig's
+	// JSON under the key "retry_limit". This field is the parsed-out,
+	// typed convenience value — CreateWorkflow/GetWorkflow are responsible
+	// for keeping it in sync with PlannerConfig, never a second source of
+	// truth.
 	RetryLimit int
 }
 
@@ -461,6 +477,12 @@ type StateStore interface {
 	MarkRunDLQPlannerExhausted(ctx context.Context, run RunID, reason DLQReason, detail string) error
 
 	// ── Reads ──
+
+	// GetWorkflow returns a workflow definition by id. The loop and
+	// recovery call this on every iteration to reconstruct the planner
+	// instance from the stored row (whitepaper §12.1) — RunRef.WorkflowID
+	// (from ListRunningRuns) and steps' owning run are what feed the id in.
+	GetWorkflow(ctx context.Context, workflow WorkflowID) (WorkflowDef, error)
 
 	// LoadFrontier returns the full frontier for the loop's fast path and
 	// for crash recovery in a single read.
