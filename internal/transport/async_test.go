@@ -3,9 +3,10 @@ package transport_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,294 +15,343 @@ import (
 )
 
 const (
-	testStepID         = core.StepID("run-async-test:step1")
-	testAttemptIDAsync = core.AttemptID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	asyncTestRunID     = core.RunID("run-async-test")
+	asyncTestStepID    = core.StepID("run-async-test:step1")
+	asyncTestAttemptID = core.AttemptID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 )
 
-// makeAsyncStep returns a StepSpec for async mode pointing at workerURL.
-func makeAsyncStep(workerURL string, timeoutSec int) core.StepSpec {
-	return core.StepSpec{
-		Name:           "step1",
-		WorkerURL:      workerURL,
-		Mode:           "async",
-		TimeoutSeconds: timeoutSec,
-		Input:          json.RawMessage(`{"doc":"test.pdf"}`),
+// fakeAttemptStore is a minimal in-memory read-only store fake satisfying
+// transport.AttemptStore. It exercises the real DeliverCallback validation
+// path (no stubbing-out of the check) without needing live Postgres.
+type fakeAttemptStore struct {
+	mu        sync.Mutex
+	frontiers map[core.RunID]core.Frontier
+}
+
+func newFakeAttemptStore() *fakeAttemptStore {
+	return &fakeAttemptStore{frontiers: make(map[core.RunID]core.Frontier)}
+}
+
+// setCurrent records that run's live pending step has attempt as its
+// current_attempt_id — mirroring what LoadFrontier would return from a real
+// store for a step in status='RUNNING'.
+func (f *fakeAttemptStore) setCurrent(run core.RunID, attempt core.AttemptID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frontiers[run] = core.Frontier{
+		RunID:            run,
+		PendingStep:      &core.StepSpec{Name: "step1"},
+		PendingAttemptID: attempt,
 	}
 }
 
-// withTestMeta injects the standard test StepID and AttemptID into ctx.
-func withTestMeta(ctx context.Context) context.Context {
-	return transport.WithDispatchMeta(ctx, transport.DispatchMeta{
-		StepID:    testStepID,
-		AttemptID: testAttemptIDAsync,
-	})
+func (f *fakeAttemptStore) LoadFrontier(ctx context.Context, run core.RunID) (core.Frontier, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fr, ok := f.frontiers[run]
+	if !ok {
+		return core.Frontier{RunID: run}, nil // no pending step for this run
+	}
+	return fr, nil
 }
 
-// ─── Test 1: happy path ───────────────────────────────────────────────────────
+func withAsyncMeta(ctx context.Context, step core.StepID, attempt core.AttemptID) context.Context {
+	return transport.WithDispatchMeta(ctx, transport.DispatchMeta{StepID: step, AttemptID: attempt})
+}
 
-// TestAsyncTransport_HappyPath verifies the normal async flow:
-// worker returns 202 → goroutine calls DeliverCallback with a success result →
-// Dispatch wakes and returns Result{Status:"done"}.
-//
-// Also verifies that the dispatch body sent to the worker contains step_id and
-// attempt_id (whitepaper §6.2), so the worker knows what to call back with.
-func TestAsyncTransport_HappyPath(t *testing.T) {
-	var gotStepID, gotAttemptID string
+func makeAsyncStep(url string) core.StepSpec {
+	return core.StepSpec{
+		Name:      "step1",
+		WorkerURL: url,
+		Mode:      core.StepModeAsync,
+		Input:     json.RawMessage(`{"doc":"test.pdf"}`),
+	}
+}
+
+// ── Wire test ────────────────────────────────────────────────────────────
+
+// TestAsyncTransport_Wire verifies the {step_id, attempt_id, input}
+// envelope shape (§13.1).
+func TestAsyncTransport_Wire(t *testing.T) {
+	var gotBody struct {
+		StepID    string          `json:"step_id"`
+		AttemptID string          `json:"attempt_id"`
+		Input     json.RawMessage `json:"input"`
+	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("want POST, got %s", r.Method)
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode dispatch envelope: %v", err)
 		}
-		var body struct {
-			StepID    string          `json:"step_id"`
-			AttemptID string          `json:"attempt_id"`
-			Input     json.RawMessage `json:"input"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decode dispatch body: %v", err)
-		}
-		gotStepID = body.StepID
-		gotAttemptID = body.AttemptID
-		w.WriteHeader(http.StatusAccepted) // 202
+		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
 
-	tr := transport.NewAsyncTransport()
-	step := makeAsyncStep(srv.URL, 5)
+	store := newFakeAttemptStore()
+	store.setCurrent(asyncTestRunID, asyncTestAttemptID)
+	tr := transport.NewAsyncTransport(store)
+	step := makeAsyncStep(srv.URL)
 
-	successResult := core.Result{
-		Status: "done",
-		Output: json.RawMessage(`{"text":"hello","pages":3}`),
-	}
-
-	// Simulate the async worker finishing 50ms after dispatch.
 	go func() {
-		time.Sleep(50 * time.Millisecond)
-		tr.DeliverCallback(testStepID, testAttemptIDAsync, successResult)
+		time.Sleep(20 * time.Millisecond)
+		tr.DeliverCallback(context.Background(), asyncTestStepID, asyncTestAttemptID, core.Result{
+			Status: core.ResultStatusDone,
+			Output: json.RawMessage(`{}`),
+		})
 	}()
 
-	result, err := tr.Dispatch(withTestMeta(context.Background()), step)
-
+	_, err := tr.Dispatch(withAsyncMeta(context.Background(), asyncTestStepID, asyncTestAttemptID), step)
 	if err != nil {
-		t.Fatalf("Dispatch returned non-nil error: %v", err)
-	}
-	if result.Status != "done" {
-		t.Errorf("Status = %q, want done", result.Status)
-	}
-	if result.Error != "" {
-		t.Errorf("Error = %q, want empty", result.Error)
+		t.Fatalf("Dispatch: %v", err)
 	}
 
-	// Verify dispatch body contained the IDs so the worker can call back.
-	if gotStepID != string(testStepID) {
-		t.Errorf("dispatch body step_id = %q, want %q", gotStepID, testStepID)
+	if gotBody.StepID != string(asyncTestStepID) {
+		t.Fatalf("FAIL — envelope step_id = %q, want %q", gotBody.StepID, asyncTestStepID)
 	}
-	if gotAttemptID != string(testAttemptIDAsync) {
-		t.Errorf("dispatch body attempt_id = %q, want %q", gotAttemptID, testAttemptIDAsync)
+	if gotBody.AttemptID != string(asyncTestAttemptID) {
+		t.Fatalf("FAIL — envelope attempt_id = %q, want %q", gotBody.AttemptID, asyncTestAttemptID)
 	}
+	if string(gotBody.Input) != `{"doc":"test.pdf"}` {
+		t.Fatalf("FAIL — envelope input = %s, want the step's input", gotBody.Input)
+	}
+	t.Logf("PASS — async wire: envelope = {step_id:%q attempt_id:%q input:%s}", gotBody.StepID, gotBody.AttemptID, gotBody.Input)
+}
 
+// ── Outcome mapping ──────────────────────────────────────────────────────
+
+// TestAsyncTransport_HappyPath verifies DeliverCallback(done) wakes Dispatch
+// with the delivered Result.
+func TestAsyncTransport_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	store := newFakeAttemptStore()
+	store.setCurrent(asyncTestRunID, asyncTestAttemptID)
+	tr := transport.NewAsyncTransport(store)
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		tr.DeliverCallback(context.Background(), asyncTestStepID, asyncTestAttemptID, core.Result{
+			Status: core.ResultStatusDone,
+			Output: json.RawMessage(`{"text":"hello"}`),
+		})
+	}()
+
+	result, err := tr.Dispatch(withAsyncMeta(context.Background(), asyncTestStepID, asyncTestAttemptID), makeAsyncStep(srv.URL))
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if result.Status != core.ResultStatusDone {
+		t.Fatalf("FAIL — Status = %q, want done", result.Status)
+	}
 	var out map[string]any
 	if err := json.Unmarshal(result.Output, &out); err != nil {
 		t.Fatalf("unmarshal Output: %v", err)
 	}
 	if out["text"] != "hello" {
-		t.Errorf("Output[text] = %v, want %q", out["text"], "hello")
+		t.Fatalf("FAIL — Output[text] = %v, want hello", out["text"])
 	}
-
-	t.Logf("PASS — 202 + DeliverCallback(done) → Status=done, Output=%s", result.Output)
-	t.Logf("       dispatch body: step_id=%q, attempt_id=%q", gotStepID, gotAttemptID)
+	t.Log("PASS — 202 + DeliverCallback(done) → Dispatch returns Status=done with the delivered output")
 }
 
-// ─── Test 2: 失敗回撥 ─────────────────────────────────────────────────────────
-
-// TestAsyncTransport_FailedCallback verifies that DeliverCallback with a failed
-// result causes Dispatch to return Result{Status:"failed"}.
-// Barrier 2 still fires: the loop calls Checkpoint with this failed result
-// (Checkpoint Path B — does not write output, step becomes FAILED).
-func TestAsyncTransport_FailedCallback(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer srv.Close()
-
-	tr := transport.NewAsyncTransport()
-
-	failedResult := core.Result{
-		Status: "failed",
-		Error:  "worker ran out of memory",
-	}
-
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		tr.DeliverCallback(testStepID, testAttemptIDAsync, failedResult)
-	}()
-
-	result, err := tr.Dispatch(withTestMeta(context.Background()), makeAsyncStep(srv.URL, 5))
-
-	if err != nil {
-		t.Fatalf("Dispatch non-nil error: %v", err)
-	}
-	if result.Status != "failed" {
-		t.Errorf("Status = %q, want failed", result.Status)
-	}
-	if result.Error != failedResult.Error {
-		t.Errorf("Error = %q, want %q", result.Error, failedResult.Error)
-	}
-
-	t.Logf("PASS — DeliverCallback(failed) → Status=failed, Error=%q", result.Error)
-}
-
-// ─── Test 3: timeout ──────────────────────────────────────────────────────────
-
-// TestAsyncTransport_Timeout verifies that when the worker accepts the dispatch
-// (202) but never calls back, Dispatch returns Result{Status:"failed"} when
-// the context deadline expires. The loop's Barrier 2 still fires cleanly.
-func TestAsyncTransport_Timeout(t *testing.T) {
+// TestAsyncTransport_Silence_ReturnsError verifies that when the worker
+// accepts (202) but never calls back, Dispatch returns a non-nil error once
+// ctx's deadline fires — never a fabricated Result with Reason=timeout.
+func TestAsyncTransport_Silence_ReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted) // accepts but never calls back
 	}))
 	defer srv.Close()
 
-	tr := transport.NewAsyncTransport()
+	store := newFakeAttemptStore()
+	store.setCurrent(asyncTestRunID, asyncTestAttemptID)
+	tr := transport.NewAsyncTransport(store)
 
-	// Apply a 120ms deadline via parent context (much shorter than step timeout of 30s).
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	result, err := tr.Dispatch(withTestMeta(ctx), makeAsyncStep(srv.URL, 30))
+	result, err := tr.Dispatch(withAsyncMeta(ctx, asyncTestStepID, asyncTestAttemptID), makeAsyncStep(srv.URL))
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("Dispatch non-nil error: %v", err)
+	if err == nil {
+		t.Fatalf("FAIL — Dispatch returned nil error for a silent worker; result=%+v", result)
 	}
-	if result.Status != "failed" {
-		t.Errorf("Status = %q, want failed", result.Status)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FAIL — err = %v, want context.DeadlineExceeded", err)
 	}
-	if result.Error == "" {
-		t.Error("Error is empty — should describe the timeout")
+	if result.Status != "" || result.Output != nil || result.Failure != nil {
+		t.Fatalf("FAIL — result = %+v, want the zero Result alongside a non-nil error", result)
 	}
 	if elapsed > 500*time.Millisecond {
-		t.Errorf("Dispatch took %v — timeout was not enforced (want < 500ms)", elapsed)
+		t.Fatalf("FAIL — Dispatch took %v, want close to the 100ms deadline", elapsed)
 	}
-
-	t.Logf("PASS — no callback → Status=failed in %v, Error=%q", elapsed.Round(time.Millisecond), result.Error)
+	t.Logf("PASS — silent worker: Dispatch returned a non-nil deadline error (%v) after %v, zero Result", err, elapsed.Round(time.Millisecond))
 }
 
-// ─── Test 4: 孤兒回撥 ────────────────────────────────────────────────────────
-
-// TestAsyncTransport_OrphanCallback verifies that DeliverCallback for an
-// unregistered stepID is silently ignored — no panic, no error.
-//
-// This occurs in two legitimate scenarios:
-//  1. Crash + restart: the old in-process channel is gone; recovery re-dispatches
-//     the step with a new attempt_id. The old worker's callback arrives late.
-//  2. Timeout: Dispatch already returned (Result{failed}); the worker's belated
-//     callback arrives after the channel was removed from the registry.
-//
-// The API handler validates attempt_id against the DB and rejects stale callbacks
-// before calling DeliverCallback. But even if DeliverCallback is called with a
-// stale stepID, it must not panic.
-func TestAsyncTransport_OrphanCallback(t *testing.T) {
-	tr := transport.NewAsyncTransport()
-
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("DeliverCallback panicked on orphan stepID: %v", r)
-		}
-	}()
-
-	tr.DeliverCallback(
-		core.StepID("run-unknown:step-never-registered"),
-		core.AttemptID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
-		core.Result{Status: "done", Output: json.RawMessage(`{}`)},
-	)
-
-	t.Log("PASS — orphan DeliverCallback silently ignored, no panic")
-}
-
-// ─── Test 5: 工人拒絕 dispatch (非 202) ───────────────────────────────────────
-
-// TestAsyncTransport_WorkerRejectsDispatch verifies that a non-202 response
-// from the worker causes Dispatch to return Result{failed} immediately,
-// without waiting for a callback that will never arrive.
-func TestAsyncTransport_WorkerRejectsDispatch(t *testing.T) {
+// TestAsyncTransport_NonAccepted_WorkerReported verifies a non-202 dispatch
+// ack maps to failed(worker_reported), returned immediately without
+// waiting for a callback that will never arrive.
+func TestAsyncTransport_NonAccepted_WorkerReported(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError) // 500 instead of 202
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
-	tr := transport.NewAsyncTransport()
-	result, err := tr.Dispatch(withTestMeta(context.Background()), makeAsyncStep(srv.URL, 5))
+	store := newFakeAttemptStore()
+	tr := transport.NewAsyncTransport(store)
 
+	result, err := tr.Dispatch(withAsyncMeta(context.Background(), asyncTestStepID, asyncTestAttemptID), makeAsyncStep(srv.URL))
 	if err != nil {
-		t.Fatalf("Dispatch non-nil error: %v", err)
+		t.Fatalf("Dispatch returned an error (should encode failure in Result): %v", err)
 	}
-	if result.Status != "failed" {
-		t.Errorf("Status = %q, want failed (worker returned 500 not 202)", result.Status)
+	if result.Status != core.ResultStatusFailed {
+		t.Fatalf("FAIL — Status = %q, want failed", result.Status)
 	}
-	if result.Error == "" {
-		t.Error("Error is empty")
+	if result.Failure == nil || result.Failure.Reason != core.FailureReasonWorkerReported {
+		t.Fatalf("FAIL — Failure = %+v, want Reason=worker_reported", result.Failure)
 	}
-
-	t.Logf("PASS — 500 (not 202) → Status=failed immediately, Error=%q", result.Error)
+	if result.Failure.HTTPStatus != http.StatusInternalServerError {
+		t.Fatalf("FAIL — HTTPStatus = %d, want 500", result.Failure.HTTPStatus)
+	}
+	t.Logf("PASS — non-202 ack (500) → failed(worker_reported) immediately: %+v", result.Failure)
 }
 
-// ─── Test 6: 並行安全 ─────────────────────────────────────────────────────────
-
-// TestAsyncTransport_ConcurrentDispatch verifies that the registry mutex
-// correctly serializes concurrent access: multiple Dispatch calls for different
-// steps run concurrently, each receives only its own result.
-func TestAsyncTransport_ConcurrentDispatch(t *testing.T) {
+// TestAsyncTransport_FailCallback_WorkerReported verifies that a worker's
+// explicit POST /tasks/fail (simulated directly via DeliverCallback, since
+// the HTTP handler itself is Session 6's API layer) wakes Dispatch with the
+// delivered failed(worker_reported) result.
+func TestAsyncTransport_FailCallback_WorkerReported(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
 
-	tr := transport.NewAsyncTransport()
+	store := newFakeAttemptStore()
+	store.setCurrent(asyncTestRunID, asyncTestAttemptID)
+	tr := transport.NewAsyncTransport(store)
 
-	type callResult struct {
-		stepID core.StepID
+	failed := core.Result{
+		Status: core.ResultStatusFailed,
+		Failure: &core.ResultFailure{
+			Reason: core.FailureReasonWorkerReported,
+			Error:  "worker ran out of memory",
+		},
+	}
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		tr.DeliverCallback(context.Background(), asyncTestStepID, asyncTestAttemptID, failed)
+	}()
+
+	result, err := tr.Dispatch(withAsyncMeta(context.Background(), asyncTestStepID, asyncTestAttemptID), makeAsyncStep(srv.URL))
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if result.Status != core.ResultStatusFailed {
+		t.Fatalf("FAIL — Status = %q, want failed", result.Status)
+	}
+	if result.Failure == nil || result.Failure.Reason != core.FailureReasonWorkerReported {
+		t.Fatalf("FAIL — Failure = %+v, want Reason=worker_reported", result.Failure)
+	}
+	t.Logf("PASS — POST /tasks/fail callback → failed(worker_reported): %+v", result.Failure)
+}
+
+// ── Registry hygiene ─────────────────────────────────────────────────────
+
+// TestAsyncTransport_RegistryHygiene_StaleCallbackAfterTimeout verifies that
+// once ctx's deadline fires and Dispatch returns, the channel is
+// deregistered — a subsequently-arriving callback for that same step is a
+// silent no-op (never panics, never blocks), even when the store still
+// reports that attempt as current.
+func TestAsyncTransport_RegistryHygiene_StaleCallbackAfterTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted) // accepts but never calls back
+	}))
+	defer srv.Close()
+
+	store := newFakeAttemptStore()
+	store.setCurrent(asyncTestRunID, asyncTestAttemptID)
+	tr := transport.NewAsyncTransport(store)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	_, err := tr.Dispatch(withAsyncMeta(ctx, asyncTestStepID, asyncTestAttemptID), makeAsyncStep(srv.URL))
+	if err == nil {
+		t.Fatalf("FAIL — expected Dispatch to time out before the late callback")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// The channel was deregistered when Dispatch returned above. Even
+		// though the store still reports asyncTestAttemptID as current,
+		// there is no channel left to route into.
+		tr.DeliverCallback(context.Background(), asyncTestStepID, asyncTestAttemptID, core.Result{
+			Status: core.ResultStatusDone,
+			Output: json.RawMessage(`{"late":true}`),
+		})
+	}()
+
+	select {
+	case <-done:
+		t.Log("PASS — stale callback after deadline is a silent no-op: returned immediately, no panic")
+	case <-time.After(2 * time.Second):
+		t.Fatal("FAIL — DeliverCallback blocked on a callback with no registered channel")
+	}
+}
+
+// TestAsyncTransport_DeliverCallback_StaleAttempt_StoreMismatch verifies the
+// store-read half of the validation: even while the channel IS still
+// registered (Dispatch still waiting), a callback whose attempt no longer
+// matches the store's live current_attempt_id must not be routed — it
+// would otherwise hand the waiting Dispatch call a stale answer.
+func TestAsyncTransport_DeliverCallback_StaleAttempt_StoreMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	const newerAttempt = core.AttemptID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+	store := newFakeAttemptStore()
+	// The store says a NEWER attempt is now current — as if a retry already
+	// superseded asyncTestAttemptID via TX3/TX4 in another path.
+	store.setCurrent(asyncTestRunID, newerAttempt)
+	tr := transport.NewAsyncTransport(store)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	type dispatchOutcome struct {
 		result core.Result
+		err    error
 	}
-	done := make(chan callResult, 3)
+	outcomeCh := make(chan dispatchOutcome, 1)
+	go func() {
+		result, err := tr.Dispatch(withAsyncMeta(ctx, asyncTestStepID, asyncTestAttemptID), makeAsyncStep(srv.URL))
+		outcomeCh <- dispatchOutcome{result, err}
+	}()
 
-	for i := range 3 {
-		stepID := core.StepID(fmt.Sprintf("run-concurrent:step%d", i))
-		attemptID := core.AttemptID(fmt.Sprintf("cccccccc-cccc-4ccc-8ccc-cc%010d", i))
-		step := core.StepSpec{
-			Name:           fmt.Sprintf("step%d", i),
-			WorkerURL:      srv.URL,
-			Mode:           "async",
-			TimeoutSeconds: 5,
-			Input:          json.RawMessage(`{}`),
-		}
-		meta := transport.DispatchMeta{StepID: stepID, AttemptID: attemptID}
+	// Give Dispatch time to register the channel and POST to the worker
+	// (near-instant against an httptest server) before delivering the stale
+	// callback — otherwise DeliverCallback would hit the "no channel"
+	// no-op path instead of exercising the store-mismatch check.
+	time.Sleep(30 * time.Millisecond)
+	tr.DeliverCallback(context.Background(), asyncTestStepID, asyncTestAttemptID, core.Result{
+		Status: core.ResultStatusDone,
+		Output: json.RawMessage(`{"stale":true}`),
+	})
 
-		// Dispatch in goroutine.
-		go func() {
-			ctx := transport.WithDispatchMeta(context.Background(), meta)
-			result, _ := tr.Dispatch(ctx, step)
-			done <- callResult{stepID: stepID, result: result}
-		}()
-
-		// Deliver callback staggered so goroutines are truly concurrent.
-		localI := i
-		go func() {
-			time.Sleep(time.Duration(30+localI*15) * time.Millisecond)
-			tr.DeliverCallback(stepID, attemptID, core.Result{
-				Status: "done",
-				Output: json.RawMessage(fmt.Sprintf(`{"step":%d}`, localI)),
-			})
-		}()
+	outcome := <-outcomeCh
+	if outcome.err == nil {
+		t.Fatalf("FAIL — expected Dispatch to time out (the stale callback must not have satisfied it); result=%+v", outcome.result)
 	}
-
-	for range 3 {
-		r := <-done
-		if r.result.Status != "done" {
-			t.Errorf("step %q: Status = %q, want done", r.stepID, r.result.Status)
-		} else {
-			t.Logf("PASS — %q: Status=done, Output=%s", r.stepID, r.result.Output)
-		}
+	if !errors.Is(outcome.err, context.DeadlineExceeded) {
+		t.Fatalf("FAIL — err = %v, want context.DeadlineExceeded", outcome.err)
 	}
+	t.Logf("PASS — stale-attempt callback rejected by the store-read check: Dispatch still timed out (%v)", outcome.err)
 }

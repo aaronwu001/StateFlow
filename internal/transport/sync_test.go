@@ -1,11 +1,12 @@
 package transport_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -13,219 +14,252 @@ import (
 	"github.com/aaronwu000/stateflow/internal/transport"
 )
 
-// makeStep returns a minimal StepSpec pointing at the given URL.
-func makeStep(url string, outputField string, timeoutSec int) core.StepSpec {
+const (
+	syncTestStepID    = core.StepID("run-sync-test:step1")
+	syncTestAttemptID = core.AttemptID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+)
+
+// withSyncMeta injects the standard test StepID/AttemptID — Dispatch panics
+// without a DispatchMeta in ctx (it needs the ids for the wire headers).
+func withSyncMeta(ctx context.Context) context.Context {
+	return transport.WithDispatchMeta(ctx, transport.DispatchMeta{
+		StepID:    syncTestStepID,
+		AttemptID: syncTestAttemptID,
+	})
+}
+
+func makeSyncStep(url, outputField string) core.StepSpec {
 	return core.StepSpec{
-		Name:           "test-step",
-		WorkerURL:      url,
-		Mode:           "sync",
-		TimeoutSeconds: timeoutSec,
-		Input:          json.RawMessage(`{"key":"value"}`),
-		OutputField:    outputField,
+		Name:        "test-step",
+		WorkerURL:   url,
+		Mode:        core.StepModeSync,
+		Input:       json.RawMessage(`{"key":"value","nested":{"n":1}}`),
+		OutputField: outputField,
 	}
 }
 
-// ─── Test 1: 成功 — 200 回應,無 output_field ─────────────────────────────────
+// ── Wire test ────────────────────────────────────────────────────────────
 
-// TestSyncTransport_Success verifies that a 200 response is classified as
-// Result.Status="done" and the full response body becomes Result.Output.
-func TestSyncTransport_Success(t *testing.T) {
-	responseBody := `{"result":"hello","count":3}`
+// TestSyncTransport_Wire verifies the zero-modification wire contract
+// (§13.1): the request body is EXACTLY the planner-decided input, byte for
+// byte — no wrapper — and both ID headers are present with the correct
+// values.
+func TestSyncTransport_Wire(t *testing.T) {
+	step := makeSyncStep("", "")
+
+	var gotBody []byte
+	var gotStepIDHeader, gotAttemptIDHeader string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify the transport sends the right method and Content-Type.
-		if r.Method != http.MethodPost {
-			t.Errorf("want POST, got %s", r.Method)
-		}
-		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
-			t.Errorf("Content-Type = %q, want application/json", ct)
-		}
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.Bytes()
+		gotStepIDHeader = r.Header.Get("X-StateFlow-Step-ID")
+		gotAttemptIDHeader = r.Header.Get("X-StateFlow-Attempt-ID")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(responseBody))
+		w.Write([]byte(`{"ok":true}`))
 	}))
 	defer srv.Close()
+	step.WorkerURL = srv.URL
 
 	tr := transport.NewSyncTransport()
-	result, err := tr.Dispatch(context.Background(), makeStep(srv.URL, "", 5))
-
+	_, err := tr.Dispatch(withSyncMeta(context.Background()), step)
 	if err != nil {
-		t.Fatalf("Dispatch returned non-nil error: %v", err)
-	}
-	if result.Status != "done" {
-		t.Errorf("Status = %q, want %q", result.Status, "done")
-	}
-	if result.HTTPStatus != 200 {
-		t.Errorf("HTTPStatus = %d, want 200", result.HTTPStatus)
-	}
-	if result.Error != "" {
-		t.Errorf("Error = %q, want empty", result.Error)
+		t.Fatalf("Dispatch: %v", err)
 	}
 
-	// Full body should be Result.Output (no output_field set).
-	var got map[string]any
-	if err := json.Unmarshal(result.Output, &got); err != nil {
-		t.Fatalf("unmarshal Output: %v", err)
+	if !bytes.Equal(gotBody, step.Input) {
+		t.Fatalf("FAIL — request body = %s, want byte-for-byte %s", gotBody, step.Input)
 	}
-	if got["result"] != "hello" {
-		t.Errorf("Output[result] = %v, want %q", got["result"], "hello")
+	if gotStepIDHeader != string(syncTestStepID) {
+		t.Fatalf("FAIL — X-StateFlow-Step-ID = %q, want %q", gotStepIDHeader, syncTestStepID)
 	}
-	if got["count"] != float64(3) {
-		t.Errorf("Output[count] = %v, want 3", got["count"])
+	if gotAttemptIDHeader != string(syncTestAttemptID) {
+		t.Fatalf("FAIL — X-StateFlow-Attempt-ID = %q, want %q", gotAttemptIDHeader, syncTestAttemptID)
 	}
-
-	t.Logf("PASS — 200 → Status=done, HTTPStatus=200, Output=%s", result.Output)
+	t.Log("PASS — sync wire: body is the bare input byte-for-byte, both ID headers present and correct")
 }
 
-// ─── Test 2: output_field 抽取 ────────────────────────────────────────────────
+// ── Outcome mapping ──────────────────────────────────────────────────────
 
-// TestSyncTransport_OutputField verifies that when step.OutputField is set to
-// "data", only the "data" sub-object from the response body is stored as
-// Result.Output — the "meta" key is not included.
-func TestSyncTransport_OutputField(t *testing.T) {
+// TestSyncTransport_SlowServer_ReturnsError verifies that a worker exceeding
+// ctx's deadline produces a non-nil error (context.DeadlineExceeded), NOT a
+// Result with any Failure.Reason — §6 assigns timeout classification to the
+// loop, never the transport.
+func TestSyncTransport_SlowServer_ReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		// Response has two top-level keys; only "data" should be forwarded.
-		w.Write([]byte(`{"data":{"text":"extracted","pages":5},"meta":{"took_ms":123}}`))
-	}))
-	defer srv.Close()
-
-	tr := transport.NewSyncTransport()
-	result, err := tr.Dispatch(context.Background(), makeStep(srv.URL, "data", 5))
-
-	if err != nil {
-		t.Fatalf("Dispatch error: %v", err)
-	}
-	if result.Status != "done" {
-		t.Errorf("Status = %q, want done", result.Status)
-	}
-
-	var got map[string]any
-	if err := json.Unmarshal(result.Output, &got); err != nil {
-		t.Fatalf("unmarshal Output: %v", err)
-	}
-	if _, hasMeta := got["meta"]; hasMeta {
-		t.Errorf("Output contains 'meta' key — should only contain the 'data' sub-object")
-	}
-	if got["text"] != "extracted" {
-		t.Errorf("Output[text] = %v, want %q", got["text"], "extracted")
-	}
-	if got["pages"] != float64(5) {
-		t.Errorf("Output[pages] = %v, want 5", got["pages"])
-	}
-
-	t.Logf("PASS — output_field=data: Output=%s (meta excluded)", result.Output)
-}
-
-// ─── Test 3: 500 失敗 ────────────────────────────────────────────────────────
-
-// TestSyncTransport_ServerError verifies that an HTTP 500 response is
-// classified as Result.Status="failed", HTTPStatus=500, and Error is non-empty.
-func TestSyncTransport_ServerError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error":"database connection lost"}`))
-	}))
-	defer srv.Close()
-
-	tr := transport.NewSyncTransport()
-	result, err := tr.Dispatch(context.Background(), makeStep(srv.URL, "", 5))
-
-	if err != nil {
-		t.Fatalf("Dispatch returned non-nil error (should encode failure in Result): %v", err)
-	}
-	if result.Status != "failed" {
-		t.Errorf("Status = %q, want %q", result.Status, "failed")
-	}
-	if result.HTTPStatus != 500 {
-		t.Errorf("HTTPStatus = %d, want 500", result.HTTPStatus)
-	}
-	if result.Error == "" {
-		t.Error("Error is empty — should contain the failure message")
-	}
-	if !strings.Contains(result.Error, "500") {
-		t.Errorf("Error %q does not mention HTTP status 500", result.Error)
-	}
-	if result.Output != nil {
-		t.Errorf("Output = %s, want nil on failure", result.Output)
-	}
-
-	t.Logf("PASS — 500 → Status=failed, HTTPStatus=500, Error=%q", result.Error)
-}
-
-// ─── Test 4: timeout ──────────────────────────────────────────────────────────
-
-// TestSyncTransport_Timeout verifies that when the worker takes longer than
-// step.TimeoutSeconds, Dispatch returns Result.Status="failed" (not a panic or
-// non-nil error). The loop's Barrier 2 must still fire cleanly.
-func TestSyncTransport_Timeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Sleep longer than the transport timeout.
 		time.Sleep(500 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"result":"too late"}`))
 	}))
 	defer srv.Close()
 
-	tr := transport.NewSyncTransport()
-
-	start := time.Now()
-	// TimeoutSeconds=0 is treated as the 30s default — too long for a test.
-	// Use a very short timeout via a custom step with TimeoutSeconds set to
-	// something small. Since TimeoutSeconds is int (seconds), the minimum is 1s.
-	// Instead we apply a 100ms deadline via the parent context.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	step := makeStep(srv.URL, "", 30) // step timeout is 30s, but ctx deadline is 100ms
-	result, err := tr.Dispatch(ctx, step)
-	elapsed := time.Since(start)
+	tr := transport.NewSyncTransport()
+	result, err := tr.Dispatch(withSyncMeta(ctx), makeSyncStep(srv.URL, ""))
 
-	if err != nil {
-		t.Fatalf("Dispatch returned non-nil error: %v", err)
+	if err == nil {
+		t.Fatalf("FAIL — Dispatch returned nil error, want a non-nil deadline error; result=%+v", result)
 	}
-	if result.Status != "failed" {
-		t.Errorf("Status = %q, want %q", result.Status, "failed")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FAIL — err = %v, want context.DeadlineExceeded", err)
 	}
-	if result.Error == "" {
-		t.Error("Error is empty — should describe the timeout")
+	if result.Status != "" || result.Output != nil || result.Failure != nil {
+		t.Fatalf("FAIL — result = %+v, want the zero Result alongside a non-nil error", result)
 	}
-	// Should complete well before the worker's 500ms sleep.
-	if elapsed > 400*time.Millisecond {
-		t.Errorf("Dispatch took %v — timeout was not enforced", elapsed)
-	}
-
-	t.Logf("PASS — timeout: Status=failed in %v, Error=%q", elapsed.Round(time.Millisecond), result.Error)
+	t.Logf("PASS — slow server: Dispatch returned a non-nil deadline error (%v), zero Result", err)
 }
 
-// ─── Test 5: 非 2xx 各種狀態碼 ───────────────────────────────────────────────
+// TestSyncTransport_DialRefused_ReturnsError verifies that a connection
+// refused (server not listening) is likewise a non-nil error, not a Result.
+func TestSyncTransport_DialRefused_ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := srv.URL
+	srv.Close() // now nothing is listening on this URL
 
-// TestSyncTransport_Various4xx verifies that 4xx codes also map to "failed".
-func TestSyncTransport_Various4xx(t *testing.T) {
-	cases := []int{400, 401, 403, 404, 422, 429}
+	tr := transport.NewSyncTransport()
+	result, err := tr.Dispatch(withSyncMeta(context.Background()), makeSyncStep(deadURL, ""))
 
+	if err == nil {
+		t.Fatalf("FAIL — Dispatch returned nil error for a refused connection; result=%+v", result)
+	}
+	t.Logf("PASS — dial refused: Dispatch returned a non-nil error (%v)", err)
+}
+
+// TestSyncTransport_GarbageBody_Malformed verifies that a 2xx response whose
+// body is not valid JSON is failed(malformed), even with no output_field
+// declared.
+func TestSyncTransport_GarbageBody_Malformed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not json at all {{{`))
+	}))
+	defer srv.Close()
+
+	tr := transport.NewSyncTransport()
+	result, err := tr.Dispatch(withSyncMeta(context.Background()), makeSyncStep(srv.URL, ""))
+	if err != nil {
+		t.Fatalf("Dispatch returned an error (should encode failure in Result): %v", err)
+	}
+	if result.Status != core.ResultStatusFailed {
+		t.Fatalf("FAIL — Status = %q, want failed", result.Status)
+	}
+	if result.Failure == nil || result.Failure.Reason != core.FailureReasonMalformed {
+		t.Fatalf("FAIL — Failure = %+v, want Reason=malformed", result.Failure)
+	}
+	t.Logf("PASS — 200 + invalid JSON body → failed(malformed): %+v", result.Failure)
+}
+
+// TestSyncTransport_MissingOutputField_Malformed verifies that a valid JSON
+// 2xx body missing the declared output_field is failed(malformed).
+func TestSyncTransport_MissingOutputField_Malformed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"other_field":123}`))
+	}))
+	defer srv.Close()
+
+	tr := transport.NewSyncTransport()
+	result, err := tr.Dispatch(withSyncMeta(context.Background()), makeSyncStep(srv.URL, "expected_field"))
+	if err != nil {
+		t.Fatalf("Dispatch returned an error: %v", err)
+	}
+	if result.Status != core.ResultStatusFailed {
+		t.Fatalf("FAIL — Status = %q, want failed", result.Status)
+	}
+	if result.Failure == nil || result.Failure.Reason != core.FailureReasonMalformed {
+		t.Fatalf("FAIL — Failure = %+v, want Reason=malformed", result.Failure)
+	}
+	t.Logf("PASS — declared output_field absent → failed(malformed): %+v", result.Failure)
+}
+
+// TestSyncTransport_NonTwoXX_WorkerReported verifies that non-2xx responses
+// map to failed(worker_reported) with HTTPStatus set.
+func TestSyncTransport_NonTwoXX_WorkerReported(t *testing.T) {
+	cases := []int{400, 404, 500, 503}
 	for _, code := range cases {
 		code := code
 		t.Run(http.StatusText(code), func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(code)
-				w.Write([]byte(`{"error":"client problem"}`))
+				w.Write([]byte(`{"error":"nope"}`))
 			}))
 			defer srv.Close()
 
 			tr := transport.NewSyncTransport()
-			result, err := tr.Dispatch(context.Background(), makeStep(srv.URL, "", 5))
+			result, err := tr.Dispatch(withSyncMeta(context.Background()), makeSyncStep(srv.URL, ""))
 			if err != nil {
-				t.Fatalf("non-nil error: %v", err)
+				t.Fatalf("Dispatch returned an error: %v", err)
 			}
-			if result.Status != "failed" {
-				t.Errorf("HTTP %d → Status=%q, want failed", code, result.Status)
+			if result.Status != core.ResultStatusFailed {
+				t.Fatalf("FAIL — HTTP %d: Status = %q, want failed", code, result.Status)
 			}
-			if result.HTTPStatus != code {
-				t.Errorf("HTTPStatus=%d, want %d", result.HTTPStatus, code)
+			if result.Failure == nil || result.Failure.Reason != core.FailureReasonWorkerReported {
+				t.Fatalf("FAIL — HTTP %d: Failure = %+v, want Reason=worker_reported", code, result.Failure)
 			}
-			t.Logf("PASS — HTTP %d → Status=failed, HTTPStatus=%d", code, result.HTTPStatus)
+			if result.Failure.HTTPStatus != code {
+				t.Fatalf("FAIL — HTTP %d: Failure.HTTPStatus = %d, want %d", code, result.Failure.HTTPStatus, code)
+			}
+			t.Logf("PASS — HTTP %d → failed(worker_reported), HTTPStatus=%d", code, result.Failure.HTTPStatus)
 		})
 	}
+}
+
+// TestSyncTransport_Success_WholeBody verifies the done path with no
+// output_field: the whole valid-JSON body becomes Result.Output.
+func TestSyncTransport_Success_WholeBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result":"hello","count":3}`))
+	}))
+	defer srv.Close()
+
+	tr := transport.NewSyncTransport()
+	result, err := tr.Dispatch(withSyncMeta(context.Background()), makeSyncStep(srv.URL, ""))
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if result.Status != core.ResultStatusDone {
+		t.Fatalf("FAIL — Status = %q, want done", result.Status)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(result.Output, &got); err != nil {
+		t.Fatalf("unmarshal Output: %v", err)
+	}
+	if got["result"] != "hello" {
+		t.Fatalf("FAIL — Output[result] = %v, want hello", got["result"])
+	}
+	t.Logf("PASS — 200 + valid JSON, no output_field → done, Output=%s", result.Output)
+}
+
+// TestSyncTransport_Success_OutputField verifies the done path with
+// output_field set: only that subtree is stored as Result.Output.
+func TestSyncTransport_Success_OutputField(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"data":{"text":"extracted"},"meta":{"took_ms":1}}`))
+	}))
+	defer srv.Close()
+
+	tr := transport.NewSyncTransport()
+	result, err := tr.Dispatch(withSyncMeta(context.Background()), makeSyncStep(srv.URL, "data"))
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if result.Status != core.ResultStatusDone {
+		t.Fatalf("FAIL — Status = %q, want done", result.Status)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(result.Output, &got); err != nil {
+		t.Fatalf("unmarshal Output: %v", err)
+	}
+	if _, hasMeta := got["meta"]; hasMeta {
+		t.Fatalf("FAIL — Output contains 'meta' — output_field should isolate only 'data'")
+	}
+	if got["text"] != "extracted" {
+		t.Fatalf("FAIL — Output[text] = %v, want extracted", got["text"])
+	}
+	t.Logf("PASS — output_field=data → done, Output=%s (meta excluded)", result.Output)
 }
