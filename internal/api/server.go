@@ -8,12 +8,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aaronwu000/stateflow/internal/core"
+	"github.com/aaronwu000/stateflow/internal/orchestrator"
 	"github.com/aaronwu000/stateflow/internal/transport"
 )
 
@@ -37,15 +39,30 @@ import (
 // own wiring). It builds the Loop for a run — from RunID/WorkflowID/
 // WorkflowInput alone, since Loop.Run reconstructs the planner from the
 // workflow row itself (whitepaper §12.1) — and starts `go loop.Run(ctx)`.
-// The server calls it when a new run is created and when a DLQ entry is
-// replayed (both TX5 and TX6 branches re-enter the SAME generic loop entry
-// point; see handleDLQReplay's doc comment for the worker-side nuance).
+// The server calls it when a new run is created and for the planner-side
+// (TX6) branch of a DLQ replay, where re-asking the planner via the generic
+// entry point is exactly correct (see handleDLQReplay's doc comment). The
+// worker-side (TX5) branch does NOT use startLoop — see replayTransport and
+// handleDLQReplay's doc comment for why (Session 6.5).
 type Server struct {
 	db        *sql.DB
 	store     core.StateStore
 	async     *transport.AsyncTransport
 	ctx       context.Context // parent context for all loop goroutines
 	startLoop func(ctx context.Context, runID core.RunID, workflowID core.WorkflowID, workflowInput json.RawMessage)
+
+	// replayTransport is a sync+async routed core.WorkerTransport, built
+	// once here from the same `async` instance the server already receives
+	// (so the async callback registry stays the single one the rest of the
+	// system uses) plus a fresh transport.NewSyncTransport(). It exists
+	// solely so handleDLQReplay's worker-side branch can construct an
+	// orchestrator.Loop directly and call Loop.ResumeReplayedStep (Session
+	// 6.5) without widening New()'s exported signature or touching
+	// cmd/stateflow/main.go — both out of this fix session's scope. This
+	// mirrors exactly what main.go's own buildLoop and the test suite's
+	// newTestServer already construct for the SAME async instance; no new
+	// transport concept is introduced.
+	replayTransport core.WorkerTransport
 }
 
 // New returns a Server ready to serve HTTP.
@@ -56,7 +73,14 @@ func New(
 	ctx context.Context,
 	startLoop func(context.Context, core.RunID, core.WorkflowID, json.RawMessage),
 ) *Server {
-	return &Server{db: db, store: store, async: async, ctx: ctx, startLoop: startLoop}
+	return &Server{
+		db:              db,
+		store:           store,
+		async:           async,
+		ctx:             ctx,
+		startLoop:       startLoop,
+		replayTransport: &transport.MultiTransport{Sync: transport.NewSyncTransport(), Async: async},
+	}
 }
 
 // Handler returns the HTTP mux with all routes registered.
@@ -414,41 +438,36 @@ func (s *Server) handleGetDLQ(w http.ResponseWriter, r *http.Request) {
 // Branches on the DLQ entry (whitepaper §11):
 //   - worker-side (StepID != nil, run=DLQ/last_step=DLQ) → ReplayWorkerSide
 //     (Ledger TX5: attempt_count→0, step→RUNNING, run→RUNNING, a fresh
-//     attempt, current_attempt_id set) → re-enter the loop.
+//     attempt, current_attempt_id set) → dispatch that fresh attempt
+//     directly via orchestrator.Loop.ResumeReplayedStep.
 //   - planner-side (StepID == nil, run=DLQ/last_step=done) → ReplayPlannerSide
-//     (Ledger TX6: run→RUNNING) → re-enter the loop.
+//     (Ledger TX6: run→RUNNING) → re-enter the loop via the generic
+//     startLoop/Loop.Run entry point.
 //
-// Both branches re-enter through the SAME generic startLoop/Loop.Run entry
-// point used for a brand-new run and for crash recovery — "recovery is not
-// a special mode; it is the same loop entered from a DB-persisted mid-run
-// state" (whitepaper §2) applies equally to an operator-triggered replay.
+// The planner-side branch re-entering through startLoop/Loop.Run is exact:
+// after TX6, LoadFrontier's PendingStep is nil (the last step is still
+// DONE), so Loop.Run's steady-state loop asks the planner directly —
+// precisely TX6's prescribed "re-ask the planner". "Recovery is not a
+// special mode; it is the same loop entered from a DB-persisted mid-run
+// state" (whitepaper §2) applies cleanly here.
 //
-// For the planner-side branch this is exact: after TX6, LoadFrontier's
-// PendingStep is nil (the last step is still DONE), so Loop.Run's
-// steady-state loop asks the planner directly — precisely TX6's prescribed
-// "re-ask the planner".
-//
-// For the worker-side branch this is a deliberate, flagged approximation.
-// The whitepaper describes TX5 as being followed directly by "dispatch the
-// worker" — but Loop.Run has no entry point that dispatches an existing
-// PendingStep without first performing the one-time recovery check (claim
-// the pending attempt as failed(orphaned), whitepaper §8.3), and adding one
-// would mean touching internal/orchestrator/loop.go, which is out of this
-// session's scope (internal/api/ + cmd/stateflow/main.go only). Re-entering
-// generically means the fresh attempt TX5 just created — which was never
-// actually dispatched to a worker — gets claimed as `orphaned` (this is
-// actually the correct bucket for it under the timeout taxonomy's "stuck
-// before dispatch" rule, whitepaper §6: no worker was ever contacted for
-// that attempt id, so no duplicate invocation occurs) before a SECOND new
-// attempt is created via TX4 and actually dispatched. Net effect: replay is
-// safe (no double dispatch, no data loss, still bounded and convergent) but
-// costs one extra unit of the just-reset retry budget — the operator
-// effectively gets X-1, not X, fresh attempts after a replay. For a
-// workflow configured with retry_limit=1 this means a worker-side replay
-// never dispatches at all before re-DLQing. Flagged as a 🔴 open question in
-// the Session 6 report; the clean fix (an exported Loop method that resumes
-// a PendingStep by dispatching directly, skipping the orphan-claim) belongs
-// to a session that owns internal/orchestrator/.
+// The worker-side branch does NOT use startLoop/Loop.Run (Session 6.5 fix).
+// Session 6 originally routed it through the same generic entry point, but
+// Loop.Run's one-time crash-recovery check unconditionally treats any
+// PendingStep it finds as a possibly-orphaned attempt whose fate is
+// unknown — correct after a real orchestrator crash, wrong here: TX5 just
+// created a brand-new attempt that was never dispatched to any worker, so
+// there is nothing "possibly orphaned" about it. Routing it through Run()
+// burned one unit of the retry budget TX5 had just reset
+// (RecordFailure(orphaned)) before a worker was ever contacted — for
+// retry_limit=1 this re-DLQ'd the run without ever dispatching, reproducing
+// exactly the failure whitepaper §11 says the TX5 reset exists to prevent
+// ("without it... the button would be decorative"), by a different
+// mechanism. Fixed by calling orchestrator.Loop.ResumeReplayedStep, a
+// dedicated entry point (internal/orchestrator/replay.go) that dispatches
+// the TX5-created attempt directly — matching the whitepaper's literal §11
+// phrasing, "TX5: ... → dispatch the worker" — and only then falls into the
+// same steady-state loop Run() uses for the rest of the run.
 func (s *Server) handleDLQReplay(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -481,20 +500,39 @@ func (s *Server) handleDLQReplay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if entry.StepID != nil {
-		// Worker-side: TX5.
+		// Worker-side: TX5, then dispatch the freshly-created attempt
+		// directly (Session 6.5) — NOT the generic startLoop/Loop.Run entry
+		// point; see this handler's doc comment for why.
 		if _, _, err := s.store.ReplayWorkerSide(r.Context(), entry.RunID); err != nil {
 			jsonErr(w, http.StatusInternalServerError, "replay worker-side: "+err.Error())
 			return
 		}
+
+		l := &orchestrator.Loop{
+			RunID:         entry.RunID,
+			WorkflowID:    core.WorkflowID(workflowID),
+			WorkflowInput: workflowInput,
+			Store:         s.store,
+			Transport:     s.replayTransport,
+			Retry:         orchestrator.DefaultRetryPolicy(),
+		}
+		go func() {
+			slog.Info("[REPLAY] resuming worker-side-replayed run", "run_id", string(entry.RunID))
+			if err := l.ResumeReplayedStep(s.ctx); err != nil {
+				slog.Error("[REPLAY] worker-side replay ended with error", "run_id", string(entry.RunID), "err", err)
+			} else {
+				slog.Info("[REPLAY] worker-side replay completed", "run_id", string(entry.RunID))
+			}
+		}()
 	} else {
-		// Planner-side: TX6.
+		// Planner-side: TX6, then re-enter the SAME generic loop entry point
+		// used for a brand-new run — exactly correct here (see doc comment).
 		if err := s.store.ReplayPlannerSide(r.Context(), entry.RunID); err != nil {
 			jsonErr(w, http.StatusInternalServerError, "replay planner-side: "+err.Error())
 			return
 		}
+		s.startLoop(s.ctx, entry.RunID, core.WorkflowID(workflowID), workflowInput)
 	}
-
-	s.startLoop(s.ctx, entry.RunID, core.WorkflowID(workflowID), workflowInput)
 
 	jsonResp(w, http.StatusAccepted, map[string]string{"run_id": string(entry.RunID)})
 }

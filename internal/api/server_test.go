@@ -486,11 +486,23 @@ func TestAPI_EndToEnd_HTTPPlanner(t *testing.T) {
 // verifies GET /runs surfaces dlq_reason and GET /dlq lists the entry, then
 // replays it and asserts:
 //   - the DONE step is never re-dispatched (its worker call count stays 0);
-//   - attempt_count was genuinely reset (retry_limit is set equal to the
-//     pre-replay count, so the run can only reach DONE if TX5 reset the
-//     count back to 0 before the loop's post-replay orphan-claim + retry —
-//     if the reset did not happen, the very first orphan-claim after replay
-//     would immediately exceed retry_limit and re-DLQ the run instead).
+//   - attempt_count was genuinely reset (retry_limit is set to 1 — the
+//     exact value that made the Session 6.5 bug fatal: under the OLD
+//     generic-Loop.Run()-re-entry behavior, TX5's freshly-reset attempt got
+//     immediately claimed as orphaned by Run()'s crash-recovery check,
+//     which alone would exceed retry_limit=1 and re-DLQ the run WITHOUT
+//     ever dispatching a worker. retry_limit=1 therefore only passes under
+//     the fixed ResumeReplayedStep path — this is deliberately the
+//     tightest possible regression test for the bug, not an arbitrary
+//     choice);
+//   - the process worker is dispatched EXACTLY once (not zero, not more —
+//     proving both "TX5's attempt got a real dispatch" and "no phantom
+//     extra attempt/redispatch happened");
+//   - no attempt for the replayed step ever carries
+//     failure_reason='orphaned' (the direct, DB-observable form of "the
+//     freshly-replayed attempt was never misclassified as a crash orphan");
+//   - attempt_count is back to 0 after the successful replay (TX2, the
+//     success checkpoint, never writes attempt_count — only TX3/TX5 do).
 func TestAPI_DLQ_ReplayWorkerSide(t *testing.T) {
 	db := openDB(t)
 	resetSchema(t, db)
@@ -517,10 +529,11 @@ func TestAPI_DLQ_ReplayWorkerSide(t *testing.T) {
 	const wfID = "wf-dlq-worker"
 	const runID = "run-dlq-worker"
 
-	// retry_limit=2, matching the two FAILED attempts seeded below exactly —
-	// see the test's doc comment for why this proves the reset happened.
+	// retry_limit=1, matching the one FAILED attempt seeded below exactly —
+	// see the test's doc comment for why this specific value is the tightest
+	// possible regression test for the Session 6.5 bug.
 	plannerConfig := fmt.Sprintf(
-		`{"steps":[{"name":"extract","worker_url":%q,"mode":"sync","timeout_seconds":5},{"name":"process","worker_url":%q,"mode":"sync","timeout_seconds":5}],"retry_limit":2}`,
+		`{"steps":[{"name":"extract","worker_url":%q,"mode":"sync","timeout_seconds":5},{"name":"process","worker_url":%q,"mode":"sync","timeout_seconds":5}],"retry_limit":1}`,
 		extractWorker.URL, processWorker.URL,
 	)
 	if _, err := db.Exec(`
@@ -558,17 +571,16 @@ func TestAPI_DLQ_ReplayWorkerSide(t *testing.T) {
 		t.Fatalf("set extract current_attempt_id: %v", err)
 	}
 
-	// Step 2 "process": DLQ'd — attempt_count already equals retry_limit (2).
+	// Step 2 "process": DLQ'd — attempt_count already equals retry_limit (1).
 	processStepID := runID + ":process"
 	processDecision := fmt.Sprintf(`{"name":"process","worker_url":%q,"mode":"sync","timeout_seconds":5}`, processWorker.URL)
 	if _, err := db.Exec(`
 		INSERT INTO steps (step_id, run_id, step_name, seq, status, attempt_count, decision)
-		VALUES ($1, $2, 'process', 2, 'DLQ', 2, $3::jsonb)
+		VALUES ($1, $2, 'process', 2, 'DLQ', 1, $3::jsonb)
 	`, processStepID, runID, processDecision); err != nil {
 		t.Fatalf("seed process step: %v", err)
 	}
 	const failedAttempt1 = "bbbbbbbb-0000-4000-8000-000000000001"
-	const failedAttempt2 = "bbbbbbbb-0000-4000-8000-000000000002"
 	if _, err := db.Exec(`
 		INSERT INTO attempts (attempt_id, step_id, status, failure_reason, error, resolved_at)
 		VALUES ($1::uuid, $2, 'FAILED', 'worker_reported', 'boom', now())
@@ -576,14 +588,8 @@ func TestAPI_DLQ_ReplayWorkerSide(t *testing.T) {
 		t.Fatalf("seed process attempt 1: %v", err)
 	}
 	if _, err := db.Exec(`
-		INSERT INTO attempts (attempt_id, step_id, status, failure_reason, error, resolved_at)
-		VALUES ($1::uuid, $2, 'FAILED', 'worker_reported', 'boom again', now())
-	`, failedAttempt2, processStepID); err != nil {
-		t.Fatalf("seed process attempt 2: %v", err)
-	}
-	if _, err := db.Exec(`
 		UPDATE steps SET current_attempt_id = $1::uuid WHERE step_id = $2
-	`, failedAttempt2, processStepID); err != nil {
+	`, failedAttempt1, processStepID); err != nil {
 		t.Fatalf("set process current_attempt_id: %v", err)
 	}
 
@@ -591,7 +597,7 @@ func TestAPI_DLQ_ReplayWorkerSide(t *testing.T) {
 	if err := db.QueryRow(`
 		INSERT INTO dead_letter_queue (run_id, step_id, reason, context)
 		VALUES ($1, $2, 'worker_retry_exhausted',
-			'{"attempts":[{"reason":"worker_reported","error":"boom"},{"reason":"worker_reported","error":"boom again"}]}')
+			'{"attempts":[{"reason":"worker_reported","error":"boom"}]}')
 		RETURNING id
 	`, runID, processStepID).Scan(&dlqID); err != nil {
 		t.Fatalf("seed dlq entry: %v", err)
@@ -648,10 +654,17 @@ func TestAPI_DLQ_ReplayWorkerSide(t *testing.T) {
 	} else {
 		t.Log("PASS — extract worker not re-invoked (done step not re-run)")
 	}
-	if calls := atomic.LoadInt32(&processCalls); calls == 0 {
-		t.Error("process worker called 0 times; want >= 1 (replay must dispatch the DLQ'd step)")
+	// Session 6.5 regression assertion: EXACTLY 1 dispatch, not merely ">=1".
+	// Under the old bug (worker-side replay re-entering through Loop.Run()'s
+	// generic orphan-claim check), the process worker would be called ZERO
+	// times — the freshly-reset attempt got claimed as orphaned and the run
+	// re-DLQ'd (at retry_limit=1) before any dispatch. A phantom EXTRA
+	// dispatch would equally indicate the fix double-drives the step.
+	if calls := atomic.LoadInt32(&processCalls); calls != 1 {
+		t.Errorf("process worker called %d times; want exactly 1 (replay must dispatch the DLQ'd step exactly once — "+
+			"0 would mean the fresh attempt was phantom-orphaned before dispatch, the Session 6.5 bug)", calls)
 	} else {
-		t.Logf("PASS — process worker invoked %d time(s) after replay", calls)
+		t.Logf("PASS — process worker invoked exactly %d time after replay", calls)
 	}
 
 	var extractStatus, processStatus string
@@ -668,6 +681,36 @@ func TestAPI_DLQ_ReplayWorkerSide(t *testing.T) {
 		t.Errorf("process step status = %q, want DONE", processStatus)
 	}
 	t.Logf("PASS — extract.status=%s (untouched), process.status=%s (replayed to completion)", extractStatus, processStatus)
+
+	// The direct DB-observable form of the Session 6.5 bug: no attempt for
+	// the replayed step may EVER carry failure_reason='orphaned' — that
+	// would mean the freshly-replayed attempt got misclassified as a
+	// crash-orphan instead of being dispatched for real.
+	var orphanedRows int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM attempts WHERE step_id = $1 AND failure_reason = 'orphaned'
+	`, processStepID).Scan(&orphanedRows); err != nil {
+		t.Fatalf("count orphaned attempts: %v", err)
+	}
+	if orphanedRows != 0 {
+		t.Errorf("orphaned attempt rows for %q = %d, want 0 (the replayed attempt must never be claimed as a crash orphan)",
+			processStepID, orphanedRows)
+	}
+	t.Logf("PASS — 0 attempt rows for %q carry failure_reason=orphaned", processStepID)
+
+	// attempt_count must be back to 0: TX5 reset it, and TX2 (the success
+	// checkpoint that resolved the replayed dispatch) never writes
+	// attempt_count — only TX3 (failure) and TX5 (reset) touch that column.
+	var finalAttemptCount int
+	if err := db.QueryRow(`SELECT attempt_count FROM steps WHERE step_id = $1`, processStepID).
+		Scan(&finalAttemptCount); err != nil {
+		t.Fatalf("query process attempt_count: %v", err)
+	}
+	if finalAttemptCount != 0 {
+		t.Errorf("process step attempt_count = %d, want 0 (TX2 never writes attempt_count; TX5's reset must be the last write to it)",
+			finalAttemptCount)
+	}
+	t.Logf("PASS — process step attempt_count = %d after successful replay", finalAttemptCount)
 }
 
 // ── Test 6: DLQ replay — planner-side (Ledger TX6) ────────────────────────

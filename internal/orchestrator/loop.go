@@ -184,7 +184,29 @@ func (l *Loop) Run(ctx context.Context) error {
 		}
 	}
 
-	// ── Steady-state loop: ask planner → TX1 → dispatch → resolve → repeat ─
+	return l.driveSteadyState(ctx, def, pl, retry, retryLimit)
+}
+
+// driveSteadyState runs the ask-planner → TX1 → dispatch → resolve loop
+// until the run reaches a terminal outcome (DONE, worker-side DLQ inside
+// dispatchAndResolve, or planner-side DLQ via TX8/TX9).
+//
+// This is the shared tail of BOTH entry points into the loop:
+//   - Run(), after its one-time crash-recovery check (§8.3) has either done
+//     nothing (no pending step) or fully resolved the pending step;
+//   - ResumeReplayedStep (Session 6.5), after it has dispatched the single
+//     attempt TX5 just created and that attempt resolved DONE — the run
+//     must keep going exactly as it would after any other step completes.
+//
+// Extracted verbatim from Run()'s prior steady-state loop; behavior is
+// unchanged.
+func (l *Loop) driveSteadyState(
+	ctx context.Context,
+	def core.WorkflowDef,
+	pl core.NextStepPlanner,
+	retry core.RetryPolicy,
+	retryLimit int,
+) error {
 	for {
 		frontier, err := l.Store.LoadFrontier(ctx, l.RunID)
 		if err != nil {
