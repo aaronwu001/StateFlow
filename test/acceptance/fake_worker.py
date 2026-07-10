@@ -4,7 +4,11 @@ Standalone fake WORKER for the acceptance oracles. Stdlib only. No demo deps.
 
 Behaviour is chosen by URL path (the planner points each step at one of these):
   POST /sync/ok      -> 200, body {"result": <echo of input>}
-  POST /sync/fail    -> 500 (worker_reported failure)
+  POST /sync/fail    -> after DELAY_S seconds, 500 (worker_reported failure) —
+                        the delay gives a slow external poller (e.g. a psql
+                        subprocess) a window to observe intermediate DB state
+                        between dispatch and failure; set DELAY_S=0 for the
+                        old instant-500 behaviour.
   POST /async/ok     -> 202, then after DELAY_S seconds POST /tasks/complete to
                         the orchestrator with {step_id, attempt_id, output}
   POST /async/fail   -> 202, then POST /tasks/fail
@@ -91,6 +95,7 @@ class H(BaseHTTPRequestHandler):
             # sync: body is the BARE input (no envelope) — see §13.1
             self._send(200, _execute(step_id, body))
         elif path == "/sync/fail":
+            time.sleep(DELAY_S)
             self._send(500, {"error": "deliberate sync failure"})
         elif path == "/async/ok":
             step_id = body.get("step_id")
