@@ -1,9 +1,14 @@
-// Package store implements StateStore backed by PostgreSQL.
-// Authoritative design: DESIGN.md §4 (schema), §9.1 (Checkpoint paths), §9.2 (seq).
+// Package store implements core.StateStore backed by PostgreSQL.
+//
+// Authoritative: docs/StateFlow_Whitepaper_v1_0.md §19 (the Atomic
+// Transaction Ledger) and §14.1 (schema). Every TXn method below is one
+// BEGIN...COMMIT, matching the ledger entry named in its doc comment on
+// core.StateStore.
 package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -23,226 +28,525 @@ func New(db *sql.DB) *PostgresStore {
 	return &PostgresStore{db: db}
 }
 
-// PutDecision writes the planner's chosen step with status DECIDED.
-// This is Barrier 1: the row is committed before any dispatch occurs.
-//
-// seq is assigned as MAX(seq)+1 within the run. This is safe because the MVP
-// invariant guarantees at most one driver loop goroutine per run (DESIGN.md §9.2).
-//
-// current_attempt_id is NULL at this stage — no dispatch has happened yet.
-// It is populated by RecordAttemptStart, called by the loop just before Dispatch.
-func (s *PostgresStore) PutDecision(run core.RunID, step core.StepSpec) error {
-	stepID := fmt.Sprintf("%s:%s", run, step.Name)
-
-	decisionJSON, err := json.Marshal(step)
-	if err != nil {
-		return fmt.Errorf("PutDecision: marshal decision: %w", err)
+// newUUID generates a random UUID v4 as a lowercase hyphenated string.
+// No external dependency is added for this — crypto/rand plus the two
+// version/variant bit twiddles required by RFC 4122 is the entire algorithm.
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("newUUID: crypto/rand failed: %v", err))
 	}
-
-	_, err = s.db.Exec(`
-		WITH next_seq AS (
-			SELECT COALESCE(MAX(seq), 0) + 1 AS seq
-			FROM steps
-			WHERE run_id = $1
-		)
-		INSERT INTO steps (step_id, run_id, step_name, seq, status, decision, decided_at)
-		SELECT $2, $1, $3, next_seq.seq, 'DECIDED', $4::jsonb, now()
-		FROM next_seq
-	`, string(run), stepID, step.Name, string(decisionJSON))
-	if err != nil {
-		return fmt.Errorf("PutDecision: insert step %q: %w", stepID, err)
-	}
-
-	return nil
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// RecordAttemptStart records the beginning of a worker dispatch.
-// It must be called after PutDecision and before WorkerTransport.Dispatch.
-// It creates an attempts row (status RUNNING) and updates the step to RUNNING.
-//
-// attempt_number increments per step (not per run): the Nth attempt of this step.
-func (s *PostgresStore) RecordAttemptStart(run core.RunID, step core.StepSpec, attemptID core.AttemptID) error {
-	stepID := fmt.Sprintf("%s:%s", run, step.Name)
+// jsonOrNull renders raw as a JSONB literal, substituting the JSON literal
+// "null" for an empty/nil raw so NOT NULL JSONB columns are always satisfied
+// with a well-defined value rather than a Go zero-length string.
+func jsonOrNull(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "null"
+	}
+	return string(raw)
+}
 
-	tx, err := s.db.Begin()
+// plannerConfigExtract pulls the typed convenience fields of core.WorkflowDef
+// out of the opaque PlannerConfig JSON. These are never persisted as their
+// own columns — the JSON is the single source of truth (whitepaper §12.1,
+// Session 2 CONFIRM: retry_limit lives under this key inside planner_config).
+type plannerConfigExtract struct {
+	RetryLimit            *int `json:"retry_limit"`
+	DefaultTimeoutSeconds *int `json:"default_timeout_seconds"`
+}
+
+// ── Setup ──
+
+// CreateWorkflow persists a new workflow definition.
+// Ledger TX-W — a single INSERT is already atomic; no explicit BEGIN needed.
+func (s *PostgresStore) CreateWorkflow(ctx context.Context, def core.WorkflowDef) (core.WorkflowID, error) {
+	id := core.WorkflowID("wf-" + newUUID())
+
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO workflows (workflow_id, name, planner_type, planner_config)
+		VALUES ($1, $2, $3, $4::jsonb)
+	`, string(id), def.Name, def.PlannerType, jsonOrNull(def.PlannerConfig))
 	if err != nil {
-		return fmt.Errorf("RecordAttemptStart: begin tx: %w", err)
+		return "", fmt.Errorf("CreateWorkflow: insert: %w", err)
+	}
+
+	return id, nil
+}
+
+// GetWorkflow returns a workflow definition by id, parsing RetryLimit and
+// DefaultTimeoutSeconds out of the stored planner_config JSON.
+func (s *PostgresStore) GetWorkflow(ctx context.Context, workflow core.WorkflowID) (core.WorkflowDef, error) {
+	var def core.WorkflowDef
+	var plannerConfig []byte
+
+	err := s.db.QueryRowContext(ctx, `
+		SELECT name, planner_type, planner_config
+		FROM workflows
+		WHERE workflow_id = $1
+	`, string(workflow)).Scan(&def.Name, &def.PlannerType, &plannerConfig)
+	if err == sql.ErrNoRows {
+		return core.WorkflowDef{}, fmt.Errorf("GetWorkflow: workflow %q not found", workflow)
+	}
+	if err != nil {
+		return core.WorkflowDef{}, fmt.Errorf("GetWorkflow: query: %w", err)
+	}
+	def.PlannerConfig = json.RawMessage(plannerConfig)
+
+	var extract plannerConfigExtract
+	if err := json.Unmarshal(plannerConfig, &extract); err != nil {
+		return core.WorkflowDef{}, fmt.Errorf("GetWorkflow: parse planner_config: %w", err)
+	}
+	if extract.RetryLimit != nil {
+		def.RetryLimit = *extract.RetryLimit
+	}
+	if extract.DefaultTimeoutSeconds != nil {
+		def.DefaultTimeoutSeconds = *extract.DefaultTimeoutSeconds
+	}
+
+	return def, nil
+}
+
+// CreateRun persists a new run in RUNNING state.
+// Ledger TX0 — a single INSERT is already atomic; no explicit BEGIN needed.
+func (s *PostgresStore) CreateRun(ctx context.Context, workflow core.WorkflowID, input json.RawMessage) (core.RunID, error) {
+	id := core.RunID("run-" + newUUID())
+
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO runs (run_id, workflow_id, status, workflow_input)
+		VALUES ($1, $2, 'RUNNING', $3::jsonb)
+	`, string(id), string(workflow), jsonOrNull(input))
+	if err != nil {
+		return "", fmt.Errorf("CreateRun: insert: %w", err)
+	}
+
+	return id, nil
+}
+
+// ── The two write barriers ──
+
+// CreateStepWithAttempt is Barrier 1 (Ledger TX1): step + first attempt +
+// current_attempt_id, all in one transaction, committed before any dispatch.
+func (s *PostgresStore) CreateStepWithAttempt(ctx context.Context, run core.RunID, spec core.StepSpec) (core.StepID, core.AttemptID, error) {
+	stepID := core.StepID(fmt.Sprintf("%s:%s", run, spec.Name))
+	attemptID := core.AttemptID(newUUID())
+
+	decisionJSON, err := json.Marshal(spec)
+	if err != nil {
+		return "", "", fmt.Errorf("CreateStepWithAttempt: marshal spec: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("CreateStepWithAttempt: begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	var attemptNumber int
-	if err := tx.QueryRow(`
-		SELECT COALESCE(MAX(attempt_number), 0) + 1
+	if _, err := tx.ExecContext(ctx, `
+		WITH next_seq AS (
+			SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM steps WHERE run_id = $1
+		)
+		INSERT INTO steps (step_id, run_id, step_name, seq, status, attempt_count, decision)
+		SELECT $2, $1, $3, next_seq.seq, 'RUNNING', 0, $4::jsonb
+		FROM next_seq
+	`, string(run), string(stepID), spec.Name, string(decisionJSON)); err != nil {
+		return "", "", fmt.Errorf("CreateStepWithAttempt: insert step %q: %w", stepID, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO attempts (attempt_id, step_id, status)
+		VALUES ($1::uuid, $2, 'RUNNING')
+	`, string(attemptID), string(stepID)); err != nil {
+		return "", "", fmt.Errorf("CreateStepWithAttempt: insert attempt: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE steps SET current_attempt_id = $1::uuid WHERE step_id = $2
+	`, string(attemptID), string(stepID)); err != nil {
+		return "", "", fmt.Errorf("CreateStepWithAttempt: set current_attempt_id: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", "", fmt.Errorf("CreateStepWithAttempt: commit: %w", err)
+	}
+
+	return stepID, attemptID, nil
+}
+
+// CheckpointSuccess is Barrier 2 (Ledger TX2). CAS-A: the attempt UPDATE
+// gates on both attempt_id+status='RUNNING' and steps.current_attempt_id
+// matching — a report matching nothing is ReportSuperseded, never an error.
+func (s *PostgresStore) CheckpointSuccess(ctx context.Context, step core.StepID, attempt core.AttemptID, output json.RawMessage) (core.ReportOutcome, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return core.ReportCommitted, fmt.Errorf("CheckpointSuccess: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE attempts
+		SET status = 'DONE', resolved_at = now()
+		WHERE attempt_id = $1::uuid
+		  AND status = 'RUNNING'
+		  AND EXISTS (
+		      SELECT 1 FROM steps
+		      WHERE step_id = $2 AND current_attempt_id = $1::uuid
+		  )
+	`, string(attempt), string(step))
+	if err != nil {
+		return core.ReportCommitted, fmt.Errorf("CheckpointSuccess: CAS update attempt: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return core.ReportSuperseded, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE steps
+		SET output = $1::jsonb, status = 'DONE', completed_at = now()
+		WHERE step_id = $2
+	`, jsonOrNull(output), string(step)); err != nil {
+		return core.ReportCommitted, fmt.Errorf("CheckpointSuccess: update step %q: %w", step, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return core.ReportCommitted, fmt.Errorf("CheckpointSuccess: commit: %w", err)
+	}
+
+	return core.ReportCommitted, nil
+}
+
+// ── Worker-side failure, retry, and budget ──
+
+// attemptFailureDetail is one row of the per-attempt context aggregated into
+// a dead_letter_queue.context blob when RecordFailure's DLQ blade fires.
+type attemptFailureDetail struct {
+	AttemptID     string  `json:"attempt_id"`
+	Status        string  `json:"status"`
+	FailureReason *string `json:"failure_reason,omitempty"`
+	Error         *string `json:"error,omitempty"`
+}
+
+// buildStepFailureContext aggregates every attempt of stepID (within tx) into
+// the JSON blob stored as dead_letter_queue.context for a worker-side entry.
+func (s *PostgresStore) buildStepFailureContext(ctx context.Context, tx *sql.Tx, stepID, detail string) (json.RawMessage, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT attempt_id::text, status, failure_reason, error
 		FROM attempts
 		WHERE step_id = $1
-	`, stepID).Scan(&attemptNumber); err != nil {
-		return fmt.Errorf("RecordAttemptStart: count attempts for %q: %w", stepID, err)
+		ORDER BY created_at ASC
+	`, stepID)
+	if err != nil {
+		return nil, fmt.Errorf("buildStepFailureContext: query attempts: %w", err)
+	}
+	defer rows.Close()
+
+	var attempts []attemptFailureDetail
+	for rows.Next() {
+		var a attemptFailureDetail
+		var reason, errMsg sql.NullString
+		if err := rows.Scan(&a.AttemptID, &a.Status, &reason, &errMsg); err != nil {
+			return nil, fmt.Errorf("buildStepFailureContext: scan: %w", err)
+		}
+		if reason.Valid {
+			a.FailureReason = &reason.String
+		}
+		if errMsg.Valid {
+			a.Error = &errMsg.String
+		}
+		attempts = append(attempts, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("buildStepFailureContext: rows: %w", err)
 	}
 
-	if _, err := tx.Exec(`
-		INSERT INTO attempts (attempt_id, step_id, attempt_number, status, dispatched_at)
-		VALUES ($1, $2, $3, 'RUNNING', now())
-	`, string(attemptID), stepID, attemptNumber); err != nil {
-		return fmt.Errorf("RecordAttemptStart: insert attempt: %w", err)
-	}
+	payload := struct {
+		StepID   string                 `json:"step_id"`
+		Detail   string                 `json:"detail"`
+		Attempts []attemptFailureDetail `json:"attempts"`
+	}{StepID: stepID, Detail: detail, Attempts: attempts}
 
-	if _, err := tx.Exec(`
-		UPDATE steps
-		SET status             = 'RUNNING',
-		    current_attempt_id = $1::uuid
-		WHERE step_id = $2
-	`, string(attemptID), stepID); err != nil {
-		return fmt.Errorf("RecordAttemptStart: update step %q: %w", stepID, err)
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("buildStepFailureContext: marshal: %w", err)
 	}
-
-	return tx.Commit()
+	return out, nil
 }
 
-// Checkpoint writes the worker's result and advances the step status.
-// This is Barrier 2: all writes commit before the next Decide call.
-//
-// Path A (r.Status == "done"): writes steps.output (the Barrier 2 JSONB signal),
-// marks step DONE, resolves the attempts row as DONE.
-//
-// Path B (r.Status == "failed"): steps.output stays NULL (the step is NOT done —
-// writing output here would falsely mark it done for recovery). Writes the error
-// to the attempts row and marks step FAILED. Retry/DLQ decisions are the loop's
-// responsibility (DESIGN.md §9.1) — this method does not consult RetryPolicy.
-//
-// Both paths update the attempts row atomically with the step update in one
-// transaction. If current_attempt_id is NULL (no dispatch recorded), the
-// attempts update is skipped — this only occurs in the barrier invariant test.
-func (s *PostgresStore) Checkpoint(run core.RunID, step core.StepSpec, r core.Result) error {
-	stepID := fmt.Sprintf("%s:%s", run, step.Name)
-
-	// Look up the current attempt. NULL is valid (barrier test doesn't call RecordAttemptStart).
-	var currentAttemptID sql.NullString
-	if err := s.db.QueryRow(`
-		SELECT current_attempt_id::text FROM steps WHERE step_id = $1
-	`, stepID).Scan(&currentAttemptID); err == sql.ErrNoRows {
-		return fmt.Errorf("Checkpoint: step %q not found", stepID)
-	} else if err != nil {
-		return fmt.Errorf("Checkpoint: lookup step %q: %w", stepID, err)
-	}
-
-	tx, err := s.db.Begin()
+// RecordFailure is Ledger TX3. One method for all four FailureReason values
+// (worker_reported/timeout/malformed/orphaned) — the same CAS gate, the same
+// attempt_count++ , and the same same-transaction DLQ blade at count==retryLimit.
+func (s *PostgresStore) RecordFailure(ctx context.Context, step core.StepID, attempt core.AttemptID, reason core.FailureReason, detail string, retryLimit int) (core.FailureOutcome, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("Checkpoint: begin tx: %w", err)
+		return core.FailureOutcome{}, fmt.Errorf("RecordFailure: begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	switch r.Status {
-	case "done":
-		if err := checkpointDone(tx, stepID, currentAttemptID, r); err != nil {
-			return err
+	res, err := tx.ExecContext(ctx, `
+		UPDATE attempts
+		SET status = 'FAILED', failure_reason = $1, error = $2, resolved_at = now()
+		WHERE attempt_id = $3::uuid
+		  AND status = 'RUNNING'
+		  AND EXISTS (
+		      SELECT 1 FROM steps
+		      WHERE step_id = $4 AND current_attempt_id = $3::uuid
+		  )
+	`, string(reason), detail, string(attempt), string(step))
+	if err != nil {
+		return core.FailureOutcome{}, fmt.Errorf("RecordFailure: CAS update attempt: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return core.FailureOutcome{Report: core.ReportSuperseded}, nil
+	}
+
+	var newCount int
+	var runID string
+	if err := tx.QueryRowContext(ctx, `
+		UPDATE steps SET attempt_count = attempt_count + 1
+		WHERE step_id = $1
+		RETURNING attempt_count, run_id
+	`, string(step)).Scan(&newCount, &runID); err != nil {
+		return core.FailureOutcome{}, fmt.Errorf("RecordFailure: increment attempt_count: %w", err)
+	}
+
+	outcome := core.FailureOutcome{Report: core.ReportCommitted}
+
+	if newCount >= retryLimit {
+		if _, err := tx.ExecContext(ctx, `UPDATE steps SET status = 'DLQ' WHERE step_id = $1`, string(step)); err != nil {
+			return core.FailureOutcome{}, fmt.Errorf("RecordFailure: dlq step: %w", err)
 		}
-	case "failed":
-		if err := checkpointFailed(tx, stepID, currentAttemptID, r); err != nil {
-			return err
+		if _, err := tx.ExecContext(ctx, `UPDATE runs SET status = 'DLQ', updated_at = now() WHERE run_id = $1`, runID); err != nil {
+			return core.FailureOutcome{}, fmt.Errorf("RecordFailure: dlq run: %w", err)
 		}
-	default:
-		return fmt.Errorf("Checkpoint: unknown result status %q", r.Status)
+
+		contextJSON, err := s.buildStepFailureContext(ctx, tx, string(step), detail)
+		if err != nil {
+			return core.FailureOutcome{}, fmt.Errorf("RecordFailure: %w", err)
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO dead_letter_queue (run_id, step_id, reason, context)
+			VALUES ($1, $2, 'worker_retry_exhausted', $3::jsonb)
+		`, runID, string(step), string(contextJSON)); err != nil {
+			return core.FailureOutcome{}, fmt.Errorf("RecordFailure: insert dlq row: %w", err)
+		}
+
+		outcome.DLQed = true
+	}
+
+	if err := tx.Commit(); err != nil {
+		return core.FailureOutcome{}, fmt.Errorf("RecordFailure: commit: %w", err)
+	}
+
+	return outcome, nil
+}
+
+// StartNewAttempt is Ledger TX4: a new attempt plus the current_attempt_id
+// pointer move, in one transaction — no instant with two valid attempt ids.
+func (s *PostgresStore) StartNewAttempt(ctx context.Context, step core.StepID) (core.AttemptID, error) {
+	attemptID := core.AttemptID(newUUID())
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("StartNewAttempt: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO attempts (attempt_id, step_id, status)
+		VALUES ($1::uuid, $2, 'RUNNING')
+	`, string(attemptID), string(step)); err != nil {
+		return "", fmt.Errorf("StartNewAttempt: insert attempt: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE steps SET current_attempt_id = $1::uuid WHERE step_id = $2
+	`, string(attemptID), string(step))
+	if err != nil {
+		return "", fmt.Errorf("StartNewAttempt: update current_attempt_id: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", fmt.Errorf("StartNewAttempt: step %q not found", step)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("StartNewAttempt: commit: %w", err)
+	}
+
+	return attemptID, nil
+}
+
+// ── Replay (operator-triggered, from the DLQ) ──
+
+// ReplayWorkerSide is Ledger TX5: resets the run's single worker-side DLQ
+// step for retry — attempt_count→0, step→RUNNING, run→RUNNING, a new attempt,
+// current_attempt_id set — all five writes in one transaction.
+func (s *PostgresStore) ReplayWorkerSide(ctx context.Context, run core.RunID) (core.StepID, core.AttemptID, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("ReplayWorkerSide: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var stepID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT step_id FROM steps WHERE run_id = $1 AND status = 'DLQ'
+	`, string(run)).Scan(&stepID)
+	if err == sql.ErrNoRows {
+		return "", "", fmt.Errorf("ReplayWorkerSide: no DLQ step for run %q", run)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("ReplayWorkerSide: find dlq step: %w", err)
+	}
+
+	attemptID := core.AttemptID(newUUID())
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO attempts (attempt_id, step_id, status)
+		VALUES ($1::uuid, $2, 'RUNNING')
+	`, string(attemptID), stepID); err != nil {
+		return "", "", fmt.Errorf("ReplayWorkerSide: insert attempt: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE steps
+		SET attempt_count = 0, status = 'RUNNING', current_attempt_id = $1::uuid, completed_at = NULL
+		WHERE step_id = $2
+	`, string(attemptID), stepID); err != nil {
+		return "", "", fmt.Errorf("ReplayWorkerSide: reset step: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'RUNNING', updated_at = now() WHERE run_id = $1
+	`, string(run)); err != nil {
+		return "", "", fmt.Errorf("ReplayWorkerSide: reset run: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", "", fmt.Errorf("ReplayWorkerSide: commit: %w", err)
+	}
+
+	return core.StepID(stepID), attemptID, nil
+}
+
+// ReplayPlannerSide is Ledger TX6: run→RUNNING only. A single UPDATE is
+// already atomic; no explicit BEGIN needed.
+func (s *PostgresStore) ReplayPlannerSide(ctx context.Context, run core.RunID) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET status = 'RUNNING', updated_at = now() WHERE run_id = $1
+	`, string(run))
+	if err != nil {
+		return fmt.Errorf("ReplayPlannerSide: update run: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("ReplayPlannerSide: run %q not found", run)
+	}
+	return nil
+}
+
+// ── Run terminal states ──
+
+// MarkRunDone is Ledger TX7. A single UPDATE is already atomic.
+func (s *PostgresStore) MarkRunDone(ctx context.Context, run core.RunID) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET status = 'DONE', updated_at = now() WHERE run_id = $1
+	`, string(run))
+	if err != nil {
+		return fmt.Errorf("MarkRunDone: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("MarkRunDone: run %q not found", run)
+	}
+	return nil
+}
+
+// MarkRunDLQPlannerDeclared is Ledger TX8: run→DLQ + a step_id-NULL DLQ row,
+// reason planner_declared_fail, in one transaction.
+func (s *PostgresStore) MarkRunDLQPlannerDeclared(ctx context.Context, run core.RunID, detail string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("MarkRunDLQPlannerDeclared: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	contextJSON, err := json.Marshal(map[string]string{"detail": detail})
+	if err != nil {
+		return fmt.Errorf("MarkRunDLQPlannerDeclared: marshal context: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO dead_letter_queue (run_id, step_id, reason, context)
+		VALUES ($1, NULL, 'planner_declared_fail', $2::jsonb)
+	`, string(run), string(contextJSON)); err != nil {
+		return fmt.Errorf("MarkRunDLQPlannerDeclared: insert dlq row: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'DLQ', updated_at = now() WHERE run_id = $1
+	`, string(run))
+	if err != nil {
+		return fmt.Errorf("MarkRunDLQPlannerDeclared: update run: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("MarkRunDLQPlannerDeclared: run %q not found", run)
 	}
 
 	return tx.Commit()
 }
 
-// checkpointDone implements Checkpoint Path A inside a transaction.
-// steps.output non-null is the physical Barrier 2 signal for recovery.
-// r.Error and r.HTTPStatus are NOT written to steps.output — they belong
-// in attempts.error on failure (DESIGN.md §9.1).
-func checkpointDone(tx *sql.Tx, stepID string, attemptID sql.NullString, r core.Result) error {
-	outputStr := "null"
-	if len(r.Output) > 0 {
-		outputStr = string(r.Output)
+// MarkRunDLQPlannerExhausted is Ledger TX9: run→DLQ + a step_id-NULL DLQ row
+// with reason planner_unreachable or planner_malformed, in one transaction.
+func (s *PostgresStore) MarkRunDLQPlannerExhausted(ctx context.Context, run core.RunID, reason core.DLQReason, detail string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("MarkRunDLQPlannerExhausted: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	contextJSON, err := json.Marshal(map[string]string{"detail": detail})
+	if err != nil {
+		return fmt.Errorf("MarkRunDLQPlannerExhausted: marshal context: %w", err)
 	}
 
-	res, err := tx.Exec(`
-		UPDATE steps
-		SET output       = $1::jsonb,
-		    status       = 'DONE',
-		    completed_at = now()
-		WHERE step_id = $2
-	`, outputStr, stepID)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO dead_letter_queue (run_id, step_id, reason, context)
+		VALUES ($1, NULL, $2, $3::jsonb)
+	`, string(run), string(reason), string(contextJSON)); err != nil {
+		return fmt.Errorf("MarkRunDLQPlannerExhausted: insert dlq row: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'DLQ', updated_at = now() WHERE run_id = $1
+	`, string(run))
 	if err != nil {
-		return fmt.Errorf("Checkpoint Path A: update step %q: %w", stepID, err)
+		return fmt.Errorf("MarkRunDLQPlannerExhausted: update run: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("Checkpoint Path A: step %q not found", stepID)
+		return fmt.Errorf("MarkRunDLQPlannerExhausted: run %q not found", run)
 	}
 
-	if attemptID.Valid {
-		if _, err := tx.Exec(`
-			UPDATE attempts
-			SET status      = 'DONE',
-			    resolved_at = now()
-			WHERE attempt_id = $1::uuid
-		`, attemptID.String); err != nil {
-			return fmt.Errorf("Checkpoint Path A: update attempt: %w", err)
-		}
-	}
-
-	return nil
+	return tx.Commit()
 }
 
-// checkpointFailed implements Checkpoint Path B inside a transaction.
-//
-// INVARIANT: steps.output stays NULL.
-// A FAILED step has not produced a valid result. Writing output here would
-// cause LoadFrontier to classify it as DONE, feeding a failure payload to the
-// planner as if it were a success. This is the primary correctness bug Path B
-// must avoid — hence the explicit "no output write" and the comment below.
-func checkpointFailed(tx *sql.Tx, stepID string, attemptID sql.NullString, r core.Result) error {
-	// steps.output is intentionally NOT written — the NULL output column is the
-	// "not done" signal that recovery and LoadFrontier rely on.
-	res, err := tx.Exec(`
-		UPDATE steps
-		SET status = 'FAILED'
-		WHERE step_id = $1
-	`, stepID)
-	if err != nil {
-		return fmt.Errorf("Checkpoint Path B: update step %q: %w", stepID, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("Checkpoint Path B: step %q not found", stepID)
-	}
+// ── Reads ──
 
-	if attemptID.Valid {
-		if _, err := tx.Exec(`
-			UPDATE attempts
-			SET status      = 'FAILED',
-			    error       = $1,
-			    resolved_at = now()
-			WHERE attempt_id = $2::uuid
-		`, r.Error, attemptID.String); err != nil {
-			return fmt.Errorf("Checkpoint Path B: update attempt: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// LoadFrontier reads the complete frontier for a run.
-// Returns DONE steps as History (ordered by seq ASC) and the first
-// DECIDED/RUNNING/FAILED step with no output as PendingDecision.
-//
-// FAILED steps with no output are treated the same as DECIDED/RUNNING: the step
-// holds a persisted decision that was never completed (crash between Checkpoint
-// Path B and ResetToDecided), so recovery re-dispatches it rather than re-asking
-// the planner. DLQ steps are terminal and are excluded — they never drive the
-// next decision.
-//
-// This is the primary read for crash recovery and loop re-entry.
-// It is NOT the status endpoint read — see DESIGN.md §9.4.
-func (s *PostgresStore) LoadFrontier(run core.RunID) (core.Frontier, error) {
-	rows, err := s.db.Query(`
-		SELECT step_name, status, decision, output
+// LoadFrontier returns the full frontier for the loop's fast path and for
+// crash recovery in a single read: DONE steps as History (seq ASC), and the
+// single RUNNING step (if any) as PendingStep/PendingAttemptID/AttemptCount.
+// DLQ steps are terminal and never drive the next decision.
+func (s *PostgresStore) LoadFrontier(ctx context.Context, run core.RunID) (core.Frontier, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT step_name, status, decision, output, attempt_count, current_attempt_id::text
 		FROM steps
 		WHERE run_id = $1
 		ORDER BY seq ASC
 	`, string(run))
 	if err != nil {
-		return core.Frontier{}, fmt.Errorf("LoadFrontier: query run %q: %w", run, err)
+		return core.Frontier{}, fmt.Errorf("LoadFrontier: query: %w", err)
 	}
 	defer rows.Close()
 
@@ -250,206 +554,48 @@ func (s *PostgresStore) LoadFrontier(run core.RunID) (core.Frontier, error) {
 
 	for rows.Next() {
 		var stepName, status string
-		var decisionJSON, outputJSON []byte // NULL JSONB columns scan as nil []byte
+		var decisionJSON, outputJSON []byte
+		var attemptCount int
+		var currentAttemptID sql.NullString
 
-		if err := rows.Scan(&stepName, &status, &decisionJSON, &outputJSON); err != nil {
-			return core.Frontier{}, fmt.Errorf("LoadFrontier: scan row: %w", err)
+		if err := rows.Scan(&stepName, &status, &decisionJSON, &outputJSON, &attemptCount, &currentAttemptID); err != nil {
+			return core.Frontier{}, fmt.Errorf("LoadFrontier: scan: %w", err)
 		}
 
-		switch {
-		case status == "DONE" && outputJSON != nil:
-			// Barrier 2 has fired. This step is complete and its output feeds the planner.
+		switch status {
+		case "DONE":
 			frontier.History = append(frontier.History, core.HistoryEntry{
 				Name:   stepName,
-				Status: status,
+				Status: core.StepStatus(status),
 				Output: json.RawMessage(outputJSON),
 			})
-
-		case (status == "DECIDED" || status == "RUNNING" || status == "FAILED") && outputJSON == nil:
-			// Barrier 1 fired but Barrier 2 did not (DECIDED/RUNNING), or the step was
-			// checkpointed as FAILED but never got its retry decision re-persisted as
-			// DECIDED before a crash (FAILED with no output). In all three cases the
-			// step holds a persisted decision that was never completed; recovery
-			// re-dispatches it without re-asking the planner (Barrier 1 already fired).
-			// Attempt counting is per loop entry (in-memory), so a crash mid-retry grants
-			// a fresh retry budget — a documented MVP caveat, not a bug to fix here.
-			// Only the first such step is returned; a linear MVP run has at most one.
-			if frontier.PendingDecision == nil && decisionJSON != nil {
-				var spec core.StepSpec
+		case "RUNNING":
+			var spec core.StepSpec
+			if decisionJSON != nil {
 				if err := json.Unmarshal(decisionJSON, &spec); err != nil {
 					return core.Frontier{}, fmt.Errorf("LoadFrontier: unmarshal decision for %q: %w", stepName, err)
 				}
-				frontier.PendingDecision = &spec
 			}
-
-		// DLQ: terminal, never drives the next decision.
+			frontier.PendingStep = &spec
+			frontier.AttemptCount = attemptCount
+			if currentAttemptID.Valid {
+				frontier.PendingAttemptID = core.AttemptID(currentAttemptID.String)
+			}
+			// DLQ: terminal, never drives the next decision.
 		}
 	}
-
 	if err := rows.Err(); err != nil {
-		return core.Frontier{}, fmt.Errorf("LoadFrontier: rows iteration: %w", err)
+		return core.Frontier{}, fmt.Errorf("LoadFrontier: rows: %w", err)
 	}
 
 	return frontier, nil
 }
 
-// PendingDecision returns the first DECIDED/RUNNING step with no output for a run.
-// Returns nil, nil when no such step exists (the run is ready for a new Decide call).
-// This is the loop's fast path; LoadFrontier subsumes it for recovery.
-func (s *PostgresStore) PendingDecision(run core.RunID) (*core.StepSpec, error) {
-	var decisionJSON []byte
-
-	err := s.db.QueryRow(`
-		SELECT decision
-		FROM steps
-		WHERE run_id = $1
-		  AND output IS NULL
-		  AND status IN ('DECIDED', 'RUNNING', 'FAILED')
-		ORDER BY seq ASC
-		LIMIT 1
-	`, string(run)).Scan(&decisionJSON)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("PendingDecision: query run %q: %w", run, err)
-	}
-	if decisionJSON == nil {
-		return nil, nil
-	}
-
-	var spec core.StepSpec
-	if err := json.Unmarshal(decisionJSON, &spec); err != nil {
-		return nil, fmt.Errorf("PendingDecision: unmarshal decision: %w", err)
-	}
-	return &spec, nil
-}
-
-// ResetToDecided transitions a step from FAILED back to DECIDED, clearing
-// output and current_attempt_id. Called by the loop between retry attempts
-// so that crash recovery can see the step as a pending decision and re-dispatch
-// it rather than leaving it stuck in FAILED (which has no recovery rule).
-func (s *PostgresStore) ResetToDecided(run core.RunID, step core.StepSpec) error {
-	stepID := fmt.Sprintf("%s:%s", run, step.Name)
-
-	res, err := s.db.Exec(`
-		UPDATE steps
-		SET status             = 'DECIDED',
-		    output             = NULL,
-		    current_attempt_id = NULL,
-		    completed_at       = NULL
-		WHERE step_id = $1
-	`, stepID)
-	if err != nil {
-		return fmt.Errorf("ResetToDecided: update step %q: %w", stepID, err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("ResetToDecided: step %q not found", stepID)
-	}
-	return nil
-}
-
-// MarkDLQ moves a step to DLQ status, inserts a dead_letter_queue row with
-// full context, and marks the run FAILED. Called when RetryPolicy returns
-// toDLQ=true (retries exhausted) or on a hard worker failure.
-func (s *PostgresStore) MarkDLQ(run core.RunID, step core.StepSpec, reason string, lastError string) error {
-	stepID := fmt.Sprintf("%s:%s", run, step.Name)
-
-	contextJSON, _ := json.Marshal(map[string]any{
-		"last_error": lastError,
-		"step_name":  step.Name,
-		"worker_url": step.WorkerURL,
-	})
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("MarkDLQ: begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	if _, err := tx.Exec(`UPDATE steps SET status = 'DLQ' WHERE step_id = $1`, stepID); err != nil {
-		return fmt.Errorf("MarkDLQ: update step %q: %w", stepID, err)
-	}
-
-	if _, err := tx.Exec(`
-		INSERT INTO dead_letter_queue (run_id, step_id, reason, context)
-		VALUES ($1, $2, $3, $4::jsonb)
-	`, string(run), stepID, reason, string(contextJSON)); err != nil {
-		return fmt.Errorf("MarkDLQ: insert dlq entry: %w", err)
-	}
-
-	if _, err := tx.Exec(`
-		UPDATE runs SET status = 'FAILED', updated_at = now() WHERE run_id = $1
-	`, string(run)); err != nil {
-		return fmt.Errorf("MarkDLQ: mark run failed: %w", err)
-	}
-
-	return tx.Commit()
-}
-
-// MarkRunDone sets runs.status to DONE. Called by the loop when the planner
-// returns status "done" (all steps completed successfully).
-func (s *PostgresStore) MarkRunDone(run core.RunID) error {
-	if _, err := s.db.Exec(`
-		UPDATE runs SET status = 'DONE', updated_at = now() WHERE run_id = $1
-	`, string(run)); err != nil {
-		return fmt.Errorf("MarkRunDone: %w", err)
-	}
-	return nil
-}
-
-// MarkRunFailed sets runs.status to FAILED without a step DLQ entry.
-// Used when the planner itself declares the run unworkable (status: "fail"),
-// where no specific step is at fault.
-func (s *PostgresStore) MarkRunFailed(run core.RunID, reason string) error {
-	if _, err := s.db.Exec(`
-		UPDATE runs SET status = 'FAILED', updated_at = now() WHERE run_id = $1
-	`, string(run)); err != nil {
-		return fmt.Errorf("MarkRunFailed: %w", err)
-	}
-	return nil
-}
-
-// MarkPlannerFailedDLQ writes a dead_letter_queue entry with reason='planner_failed'
-// (step_id=NULL, because no specific step is at fault), then marks the run FAILED.
-// Called by the loop when the planner returns status:"fail".
-//
-// The dead_letter_queue.step_id column is nullable for exactly this case.
-func (s *PostgresStore) MarkPlannerFailedDLQ(run core.RunID, detail string) error {
-	contextJSON, _ := json.Marshal(map[string]any{
-		"detail": detail,
-	})
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("MarkPlannerFailedDLQ: begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	if _, err := tx.Exec(`
-		INSERT INTO dead_letter_queue (run_id, step_id, reason, context)
-		VALUES ($1, NULL, 'planner_failed', $2::jsonb)
-	`, string(run), string(contextJSON)); err != nil {
-		return fmt.Errorf("MarkPlannerFailedDLQ: insert dlq: %w", err)
-	}
-
-	if _, err := tx.Exec(`
-		UPDATE runs SET status = 'FAILED', updated_at = now() WHERE run_id = $1
-	`, string(run)); err != nil {
-		return fmt.Errorf("MarkPlannerFailedDLQ: mark run failed: %w", err)
-	}
-
-	return tx.Commit()
-}
-
 // ListRunningRuns returns a reference for every run with status RUNNING.
-// Called once at startup by crash recovery to find runs to resume.
+// Used once at startup by crash recovery to find runs to resume.
 func (s *PostgresStore) ListRunningRuns(ctx context.Context) ([]core.RunRef, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT run_id, workflow_input
-		FROM runs
-		WHERE status = 'RUNNING'
+		SELECT run_id, workflow_id, workflow_input FROM runs WHERE status = 'RUNNING'
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("ListRunningRuns: query: %w", err)
@@ -458,16 +604,175 @@ func (s *PostgresStore) ListRunningRuns(ctx context.Context) ([]core.RunRef, err
 
 	var refs []core.RunRef
 	for rows.Next() {
-		var runID string
+		var runID, workflowID string
 		var input json.RawMessage
-		if err := rows.Scan(&runID, &input); err != nil {
+		if err := rows.Scan(&runID, &workflowID, &input); err != nil {
 			return nil, fmt.Errorf("ListRunningRuns: scan row: %w", err)
 		}
-		refs = append(refs, core.RunRef{RunID: core.RunID(runID), WorkflowInput: input})
+		refs = append(refs, core.RunRef{
+			RunID:         core.RunID(runID),
+			WorkflowID:    core.WorkflowID(workflowID),
+			WorkflowInput: input,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("ListRunningRuns: rows iteration: %w", err)
 	}
 
 	return refs, nil
+}
+
+// GetRun returns a run's current status, its steps, and their attempt
+// summaries, for the status API.
+func (s *PostgresStore) GetRun(ctx context.Context, run core.RunID) (core.RunSummary, error) {
+	var status string
+	err := s.db.QueryRowContext(ctx, `SELECT status FROM runs WHERE run_id = $1`, string(run)).Scan(&status)
+	if err == sql.ErrNoRows {
+		return core.RunSummary{}, fmt.Errorf("GetRun: run %q not found", run)
+	}
+	if err != nil {
+		return core.RunSummary{}, fmt.Errorf("GetRun: query run: %w", err)
+	}
+
+	summary := core.RunSummary{RunID: run, Status: core.RunStatus(status)}
+
+	stepRows, err := s.db.QueryContext(ctx, `
+		SELECT step_id, step_name, status FROM steps WHERE run_id = $1 ORDER BY seq ASC
+	`, string(run))
+	if err != nil {
+		return core.RunSummary{}, fmt.Errorf("GetRun: query steps: %w", err)
+	}
+
+	var stepIDs []string
+	for stepRows.Next() {
+		var stepID, stepName, stepStatus string
+		if err := stepRows.Scan(&stepID, &stepName, &stepStatus); err != nil {
+			stepRows.Close()
+			return core.RunSummary{}, fmt.Errorf("GetRun: scan step: %w", err)
+		}
+		summary.Steps = append(summary.Steps, core.StepSummary{
+			StepID: core.StepID(stepID),
+			Name:   stepName,
+			Status: core.StepStatus(stepStatus),
+		})
+		stepIDs = append(stepIDs, stepID)
+	}
+	if err := stepRows.Err(); err != nil {
+		stepRows.Close()
+		return core.RunSummary{}, fmt.Errorf("GetRun: step rows: %w", err)
+	}
+	stepRows.Close()
+
+	for i, stepID := range stepIDs {
+		attemptRows, err := s.db.QueryContext(ctx, `
+			SELECT attempt_id::text, status, failure_reason
+			FROM attempts WHERE step_id = $1 ORDER BY created_at ASC
+		`, stepID)
+		if err != nil {
+			return core.RunSummary{}, fmt.Errorf("GetRun: query attempts for %q: %w", stepID, err)
+		}
+		for attemptRows.Next() {
+			var attemptID, attemptStatus string
+			var reason sql.NullString
+			if err := attemptRows.Scan(&attemptID, &attemptStatus, &reason); err != nil {
+				attemptRows.Close()
+				return core.RunSummary{}, fmt.Errorf("GetRun: scan attempt: %w", err)
+			}
+			as := core.AttemptSummary{AttemptID: core.AttemptID(attemptID), Status: core.AttemptStatus(attemptStatus)}
+			if reason.Valid {
+				r := core.FailureReason(reason.String)
+				as.Reason = &r
+			}
+			summary.Steps[i].Attempts = append(summary.Steps[i].Attempts, as)
+		}
+		if err := attemptRows.Err(); err != nil {
+			attemptRows.Close()
+			return core.RunSummary{}, fmt.Errorf("GetRun: attempt rows: %w", err)
+		}
+		attemptRows.Close()
+	}
+
+	if summary.Status == core.RunStatusDLQ {
+		var reason string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT reason FROM dead_letter_queue WHERE run_id = $1 ORDER BY created_at DESC LIMIT 1
+		`, string(run)).Scan(&reason)
+		if err != nil && err != sql.ErrNoRows {
+			return core.RunSummary{}, fmt.Errorf("GetRun: query dlq reason: %w", err)
+		}
+		if err == nil {
+			r := core.DLQReason(reason)
+			summary.DLQReason = &r
+		}
+	}
+
+	return summary, nil
+}
+
+// ListDLQ returns every dead-letter-queue entry, for the DLQ listing API.
+func (s *PostgresStore) ListDLQ(ctx context.Context) ([]core.DLQEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, step_id, reason, context FROM dead_letter_queue ORDER BY id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListDLQ: query: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []core.DLQEntry
+	for rows.Next() {
+		var id int64
+		var runID, reason string
+		var stepID sql.NullString
+		var contextJSON []byte
+		if err := rows.Scan(&id, &runID, &stepID, &reason, &contextJSON); err != nil {
+			return nil, fmt.Errorf("ListDLQ: scan: %w", err)
+		}
+		e := core.DLQEntry{
+			ID:      core.DLQEntryID(id),
+			RunID:   core.RunID(runID),
+			Reason:  core.DLQReason(reason),
+			Context: json.RawMessage(contextJSON),
+		}
+		if stepID.Valid {
+			sid := core.StepID(stepID.String)
+			e.StepID = &sid
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListDLQ: rows: %w", err)
+	}
+	return entries, nil
+}
+
+// GetDLQEntry returns a single dead-letter-queue entry by id, so the replay
+// handler can tell worker-side (StepID != nil → TX5) from planner-side
+// (StepID == nil → TX6).
+func (s *PostgresStore) GetDLQEntry(ctx context.Context, id core.DLQEntryID) (core.DLQEntry, error) {
+	var runID, reason string
+	var stepID sql.NullString
+	var contextJSON []byte
+
+	err := s.db.QueryRowContext(ctx, `
+		SELECT run_id, step_id, reason, context FROM dead_letter_queue WHERE id = $1
+	`, int64(id)).Scan(&runID, &stepID, &reason, &contextJSON)
+	if err == sql.ErrNoRows {
+		return core.DLQEntry{}, fmt.Errorf("GetDLQEntry: entry %d not found", id)
+	}
+	if err != nil {
+		return core.DLQEntry{}, fmt.Errorf("GetDLQEntry: query: %w", err)
+	}
+
+	e := core.DLQEntry{
+		ID:      id,
+		RunID:   core.RunID(runID),
+		Reason:  core.DLQReason(reason),
+		Context: json.RawMessage(contextJSON),
+	}
+	if stepID.Valid {
+		sid := core.StepID(stepID.String)
+		e.StepID = &sid
+	}
+	return e, nil
 }
