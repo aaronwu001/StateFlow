@@ -99,7 +99,7 @@ func (p *StaticPlanner) Decide(_ context.Context, state core.RunState) (core.Ste
 		Step: &core.StepSpec{
 			Name:           def.Name,
 			WorkerURL:      def.WorkerURL,
-			Mode:           def.Mode,
+			Mode:           core.StepMode(def.Mode),
 			TimeoutSeconds: def.TimeoutSeconds,
 			Input:          input,
 		},

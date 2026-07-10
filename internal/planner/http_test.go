@@ -3,6 +3,7 @@ package planner_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -13,18 +14,10 @@ import (
 	"github.com/aaronwu000/stateflow/internal/planner"
 )
 
-// makeHTTPPlanner creates an HTTPPlanner pointed at srv.URL.
-// timeoutSecs and maxRetries override defaults (0 = use default).
-func makeHTTPPlanner(t *testing.T, url string, timeoutSecs, maxRetries int) *planner.HTTPPlanner {
+// makeHTTPPlanner creates an HTTPPlanner pointed at url.
+func makeHTTPPlanner(t *testing.T, url string) *planner.HTTPPlanner {
 	t.Helper()
-	cfg := map[string]interface{}{"url": url}
-	if timeoutSecs > 0 {
-		cfg["timeout_seconds"] = timeoutSecs
-	}
-	if maxRetries > 0 {
-		cfg["max_retries"] = maxRetries
-	}
-	raw, _ := json.Marshal(cfg)
+	raw, _ := json.Marshal(map[string]string{"url": url})
 	p, err := planner.NewHTTPPlanner(raw)
 	if err != nil {
 		t.Fatalf("NewHTTPPlanner: %v", err)
@@ -67,7 +60,7 @@ func TestHTTPPlanner_HappyPath_Continue(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := makeHTTPPlanner(t, srv.URL, 5, 1)
+	p := makeHTTPPlanner(t, srv.URL)
 	got, err := p.Decide(context.Background(), sampleState)
 	if err != nil {
 		t.Fatalf("Decide returned error: %v", err)
@@ -95,7 +88,7 @@ func TestHTTPPlanner_HappyPath_Done(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := makeHTTPPlanner(t, srv.URL, 5, 1)
+	p := makeHTTPPlanner(t, srv.URL)
 	got, err := p.Decide(context.Background(), sampleState)
 	if err != nil {
 		t.Fatalf("Decide returned error: %v", err)
@@ -105,56 +98,79 @@ func TestHTTPPlanner_HappyPath_Done(t *testing.T) {
 	}
 }
 
-// TestHTTPPlanner_ValidationFailure_BadJSON verifies §5.5: output that is not
-// valid JSON causes all attempts to be exhausted and an error to be returned.
-func TestHTTPPlanner_ValidationFailure_BadJSON(t *testing.T) {
+// TestHTTPPlanner_SingleAttempt_NoInternalRetry verifies the Session 5
+// binding contract: Decide makes exactly ONE HTTP round trip per call. The
+// orchestrator loop, not HTTPPlanner, owns the 30s×3 planner budget (§7.2) —
+// a planner package that retried internally would make the loop's per-attempt
+// classification (unreachable vs malformed) and per-attempt detail
+// impossible to construct.
+func TestHTTPPlanner_SingleAttempt_NoInternalRetry(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	p := makeHTTPPlanner(t, srv.URL)
+	_, err := p.Decide(context.Background(), sampleState)
+	if err == nil {
+		t.Fatal("expected error for 500 response, got nil")
+	}
+	if n := int(calls.Load()); n != 1 {
+		t.Errorf("expected exactly 1 call (no internal retry), got %d", n)
+	}
+}
+
+// TestHTTPPlanner_ValidationFailure_BadJSON_IsMalformed verifies §12.3:
+// output that is not valid JSON is rejected as *planner.MalformedError, the
+// type the loop's budget classifier keys on.
+func TestHTTPPlanner_ValidationFailure_BadJSON_IsMalformed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Return malformed JSON (LLM wrapped output in markdown fences).
 		w.Write([]byte("```json\n{\"status\":\"continue\"}\n```"))
 	}))
 	defer srv.Close()
 
-	// max_retries=2 → 3 total attempts
-	p := makeHTTPPlanner(t, srv.URL, 5, 2)
+	p := makeHTTPPlanner(t, srv.URL)
 	_, err := p.Decide(context.Background(), sampleState)
 	if err == nil {
 		t.Fatal("expected error for bad JSON, got nil")
 	}
-	if n := int(calls.Load()); n != 3 {
-		t.Errorf("expected 3 calls (1 initial + 2 retries), got %d", n)
+	var malformed *planner.MalformedError
+	if !errors.As(err, &malformed) {
+		t.Errorf("error is not *planner.MalformedError: %v (%T)", err, err)
 	}
 }
 
-// TestHTTPPlanner_ValidationFailure_MissingWorkerURL verifies §5.5: a
-// "continue" decision without worker_url is rejected even though it is valid JSON.
-func TestHTTPPlanner_ValidationFailure_MissingWorkerURL(t *testing.T) {
-	var calls atomic.Int32
+// TestHTTPPlanner_ValidationFailure_MissingWorkerURL_IsMalformed verifies
+// §12.3: a "continue" decision without worker_url is rejected even though it
+// is valid JSON, and classified as malformed.
+func TestHTTPPlanner_ValidationFailure_MissingWorkerURL_IsMalformed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		// worker_url is absent — §5.5 requires it for status=continue.
+		// worker_url is absent — §12.3 requires it for status=continue.
 		w.Write([]byte(`{"status":"continue","step":{"name":"s1","mode":"sync"}}`))
 	}))
 	defer srv.Close()
 
-	// max_retries=2 → 3 total attempts
-	p := makeHTTPPlanner(t, srv.URL, 5, 2)
+	p := makeHTTPPlanner(t, srv.URL)
 	_, err := p.Decide(context.Background(), sampleState)
 	if err == nil {
 		t.Fatal("expected error for missing worker_url, got nil")
 	}
-	if n := int(calls.Load()); n != 3 {
-		t.Errorf("expected 3 calls (1 initial + 2 retries), got %d", n)
+	var malformed *planner.MalformedError
+	if !errors.As(err, &malformed) {
+		t.Errorf("error is not *planner.MalformedError: %v (%T)", err, err)
 	}
 }
 
-// TestHTTPPlanner_Timeout verifies §5.6: a slow planner triggers the timeout
-// and the planner retries the specified number of times before returning error.
-// Uses a short timeout (1s) and 2 total attempts to keep the test fast.
-func TestHTTPPlanner_Timeout(t *testing.T) {
+// TestHTTPPlanner_Timeout_IsNotMalformed verifies §6/§7.2: a slow planner
+// causes Decide to honor ctx's deadline and return a NON-MalformedError
+// error (the caller must classify this as unreachable, not malformed).
+// Decide never starts its own clock — the ctx deadline is the only bound.
+func TestHTTPPlanner_Timeout_IsNotMalformed(t *testing.T) {
 	var calls atomic.Int32
 
 	// done is closed in a defer BEFORE srv.Close(), so handlers unblock before
@@ -163,69 +179,91 @@ func TestHTTPPlanner_Timeout(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		// Simulate a hanging planner; unblocked either by client disconnect
-		// or by the done channel when the test tears down.
 		select {
 		case <-r.Context().Done():
 		case <-done:
 		}
 	}))
-	defer srv.Close()   // runs second (LIFO) — handlers already unblocked
-	defer close(done)   // runs first  (LIFO) — unblocks any live handlers
+	defer srv.Close()
+	defer close(done)
 
-	// timeout_seconds=1, max_retries=1 → 2 total attempts × 1s ≈ 2s
-	p := makeHTTPPlanner(t, srv.URL, 1, 1)
+	p := makeHTTPPlanner(t, srv.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
 
 	start := time.Now()
-	_, err := p.Decide(context.Background(), sampleState)
+	_, err := p.Decide(ctx, sampleState)
 	elapsed := time.Since(start)
 
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
-	if n := int(calls.Load()); n != 2 {
-		t.Errorf("expected 2 calls (1 initial + 1 retry), got %d", n)
+	var malformed *planner.MalformedError
+	if errors.As(err, &malformed) {
+		t.Errorf("timeout was classified as *planner.MalformedError; want a plain (unreachable) error: %v", err)
 	}
-	// Sanity check: should have taken ≥1s (at least one timeout fired).
-	if elapsed < 900*time.Millisecond {
-		t.Errorf("elapsed %v is suspiciously short — timeout may not have fired", elapsed)
+	if n := int(calls.Load()); n != 1 {
+		t.Errorf("expected exactly 1 call (Decide never retries internally), got %d", n)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("elapsed %v is suspiciously short — ctx deadline may not have been honored", elapsed)
 	}
 }
 
-// TestHTTPPlanner_TrailingContent verifies §5.5: output that has extra non-JSON
-// content after the JSON object is rejected (e.g. LLM reasoning appended).
-func TestHTTPPlanner_TrailingContent(t *testing.T) {
+// TestHTTPPlanner_TrailingContent_IsMalformed verifies §12.3: output that has
+// extra non-JSON content after the JSON object is rejected (e.g. LLM
+// reasoning appended), classified as malformed.
+func TestHTTPPlanner_TrailingContent_IsMalformed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// Valid JSON followed by prose — must be rejected (§5.5 "nothing but the JSON").
+		// Valid JSON followed by prose — must be rejected (§12.3 "nothing but the JSON").
 		w.Write([]byte(`{"status":"done"} Here is my reasoning for this decision.`))
 	}))
 	defer srv.Close()
 
-	p := makeHTTPPlanner(t, srv.URL, 5, 0)
+	p := makeHTTPPlanner(t, srv.URL)
 	_, err := p.Decide(context.Background(), sampleState)
 	if err == nil {
 		t.Fatal("expected error for trailing non-JSON content, got nil")
 	}
+	var malformed *planner.MalformedError
+	if !errors.As(err, &malformed) {
+		t.Errorf("error is not *planner.MalformedError: %v (%T)", err, err)
+	}
 }
 
-// TestHTTPPlanner_NonOKStatus verifies that a non-2xx HTTP response is treated
-// as a planner failure and retried.
-func TestHTTPPlanner_NonOKStatus(t *testing.T) {
-	var calls atomic.Int32
+// TestHTTPPlanner_NonOKStatus_IsMalformed verifies that a non-2xx HTTP
+// response is classified as malformed (a response WAS obtained, unlike a
+// dial failure or timeout) — see the doc comment on MalformedError.
+func TestHTTPPlanner_NonOKStatus_IsMalformed(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
-	// max_retries=2 → 3 total attempts
-	p := makeHTTPPlanner(t, srv.URL, 5, 2)
+	p := makeHTTPPlanner(t, srv.URL)
 	_, err := p.Decide(context.Background(), sampleState)
 	if err == nil {
 		t.Fatal("expected error for 500 response, got nil")
 	}
-	if n := int(calls.Load()); n != 3 {
-		t.Errorf("expected 3 calls, got %d", n)
+	var malformed *planner.MalformedError
+	if !errors.As(err, &malformed) {
+		t.Errorf("error is not *planner.MalformedError: %v (%T)", err, err)
+	}
+}
+
+// TestHTTPPlanner_DialFailure_IsNotMalformed verifies that a connection
+// failure (no server listening) is NOT classified as malformed — the caller
+// must treat it as unreachable.
+func TestHTTPPlanner_DialFailure_IsNotMalformed(t *testing.T) {
+	p := makeHTTPPlanner(t, "http://127.0.0.1:1") // reserved, nothing listens here
+	_, err := p.Decide(context.Background(), sampleState)
+	if err == nil {
+		t.Fatal("expected dial error, got nil")
+	}
+	var malformed *planner.MalformedError
+	if errors.As(err, &malformed) {
+		t.Errorf("dial failure was classified as *planner.MalformedError; want a plain (unreachable) error: %v", err)
 	}
 }

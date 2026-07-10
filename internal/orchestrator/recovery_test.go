@@ -1,15 +1,16 @@
 package orchestrator_test
 
-// Integration tests for crash recovery (DESIGN.md §9.3, CLAUDE.md recovery rules).
-// Require a real Postgres DB — skipped when TEST_DATABASE_URL is unset.
+// Integration tests for crash recovery (whitepaper §8.3, §8.2 combination
+// table). Require a real Postgres DB — skipped when TEST_DATABASE_URL is
+// unset.
 //
-// Each test manually plants a mid-run DB state, calls RecoverRuns, and verifies
-// that recovery converges to the correct terminal state without re-dispatching
-// steps that were already DONE.
+// Each test plants a mid-run DB state (simulating a crash at a specific
+// point in the TX ledger) and calls RecoverRuns (or drives Loop.Run
+// directly), then verifies the resulting DB state by querying it — not by
+// trusting the loop's return value alone.
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -22,333 +23,60 @@ import (
 
 // ── Stubs ─────────────────────────────────────────────────────────────────
 
-// recoveryDonePlanner returns "done" once History has at least minHistory entries.
-// Returning an error for fewer entries catches the bug where a DONE step was
-// incorrectly re-dispatched (history would then be shorter than expected).
-type recoveryDonePlanner struct{ minHistory int }
+// countingDonePlanner returns "done" once History has at least minHistory
+// entries, and records every call (history length at call time). Returning
+// an error for fewer entries catches the bug where a DONE step was
+// incorrectly re-decided or re-dispatched.
+type countingDonePlanner struct {
+	minHistory int
+	calls      []int
+}
 
-func (p *recoveryDonePlanner) Decide(_ context.Context, s core.RunState) (core.StepDecision, error) {
+func (p *countingDonePlanner) Decide(_ context.Context, s core.RunState) (core.StepDecision, error) {
+	p.calls = append(p.calls, len(s.History))
 	if len(s.History) < p.minHistory {
 		return core.StepDecision{}, fmt.Errorf(
-			"planner called with %d history entries, want >= %d (DONE step may have been re-dispatched)",
+			"planner called with %d history entries, want >= %d (a DONE/pending step may have been re-decided)",
 			len(s.History), p.minHistory)
 	}
-	return core.StepDecision{Status: "done"}, nil
+	return core.StepDecision{Status: core.PlannerVerdictDone}, nil
+}
+
+// panicPlanner fails the test immediately if Decide is ever called — used to
+// assert that a budget-exhausted (DLQ'd) recovery never asks the planner.
+type panicPlanner struct{ t *testing.T }
+
+func (p *panicPlanner) Decide(_ context.Context, s core.RunState) (core.StepDecision, error) {
+	p.t.Fatalf("planner.Decide called (history len=%d) — must not be asked once the run is already DLQ'd", len(s.History))
+	return core.StepDecision{}, nil
 }
 
 // alwaysSucceedTransport returns "done" immediately (no network required).
-type alwaysSucceedTransport struct{}
+type alwaysSucceedTransport struct{ calls int }
 
 func (t *alwaysSucceedTransport) Dispatch(_ context.Context, _ core.StepSpec) (core.Result, error) {
-	return core.Result{Status: "done", Output: json.RawMessage(`{"recovered":true}`)}, nil
+	t.calls++
+	return core.Result{Status: core.ResultStatusDone, Output: json.RawMessage(`{"recovered":true}`)}, nil
 }
 
-// ── DB helpers ────────────────────────────────────────────────────────────
+// panicTransport fails the test immediately if Dispatch is ever called —
+// used to assert that a budget-exhausted (DLQ'd) recovery never dispatches.
+type panicTransport struct{ t *testing.T }
 
-// decisionJSON builds a minimal but valid StepSpec JSON for insertion into
-// steps.decision. The loop reads this back via PendingDecision/LoadFrontier.
-func decisionJSON(name, workerURL string) string {
-	return fmt.Sprintf(`{"name":%q,"worker_url":%q,"mode":"sync","timeout_seconds":5}`, name, workerURL)
+func (t *panicTransport) Dispatch(_ context.Context, step core.StepSpec) (core.Result, error) {
+	t.t.Fatalf("transport.Dispatch called for step %q — must not dispatch once the run is already DLQ'd", step.Name)
+	return core.Result{}, nil
 }
 
-// plantDoneStep inserts a step in DONE status (Barrier 1 + Barrier 2 both fired).
-// Also inserts the corresponding DONE attempt row.
-func plantDoneStep(t *testing.T, db *sql.DB, runID, stepName string, seq int, attemptUUID string) {
-	t.Helper()
-	stepID := runID + ":" + stepName
-	dec := decisionJSON(stepName, "http://stub/"+stepName)
-	out := `{"result":"done_before_crash"}`
-	if _, err := db.Exec(`
-		INSERT INTO steps
-			(step_id, run_id, step_name, seq, status, decision, output,
-			 current_attempt_id, decided_at, completed_at)
-		VALUES ($1, $2, $3, $4, 'DONE', $5::jsonb, $6::jsonb, $7::uuid, now(), now())
-	`, stepID, runID, stepName, seq, dec, out, attemptUUID); err != nil {
-		t.Fatalf("plantDoneStep %s: %v", stepID, err)
-	}
-	if _, err := db.Exec(`
-		INSERT INTO attempts (attempt_id, step_id, attempt_number, status, resolved_at)
-		VALUES ($1::uuid, $2, 1, 'DONE', now())
-	`, attemptUUID, stepID); err != nil {
-		t.Fatalf("plantDoneStep attempt %s: %v", stepID, err)
-	}
+// staticFactory returns a Loop.PlannerFactory that always hands back p,
+// ignoring the workflow row — the "reconstructed every time" property
+// (whitepaper §12.1) is exercised for real by the wire-casing test
+// (loop_integration_test.go), not by these DB-plumbing-focused tests.
+func staticFactory(p core.NextStepPlanner) func(core.WorkflowDef) (core.NextStepPlanner, error) {
+	return func(core.WorkflowDef) (core.NextStepPlanner, error) { return p, nil }
 }
 
-// plantDecidedStep inserts a step where Barrier 1 fired but the process crashed
-// before dispatch (status=DECIDED, no attempt row, no current_attempt_id).
-func plantDecidedStep(t *testing.T, db *sql.DB, runID, stepName string, seq int) {
-	t.Helper()
-	stepID := runID + ":" + stepName
-	dec := decisionJSON(stepName, "http://stub/"+stepName)
-	if _, err := db.Exec(`
-		INSERT INTO steps (step_id, run_id, step_name, seq, status, decision, decided_at)
-		VALUES ($1, $2, $3, $4, 'DECIDED', $5::jsonb, now())
-	`, stepID, runID, stepName, seq, dec); err != nil {
-		t.Fatalf("plantDecidedStep %s: %v", stepID, err)
-	}
-}
-
-// plantRunningStep inserts a step where dispatch started (Barrier 1 fired +
-// RecordAttemptStart called) but the process crashed before Checkpoint fired.
-// The attempt row stays RUNNING — it is the "crashed" attempt.
-func plantRunningStep(t *testing.T, db *sql.DB, runID, stepName string, seq int, attemptUUID string) {
-	t.Helper()
-	stepID := runID + ":" + stepName
-	dec := decisionJSON(stepName, "http://stub/"+stepName)
-	if _, err := db.Exec(`
-		INSERT INTO steps
-			(step_id, run_id, step_name, seq, status, decision, current_attempt_id, decided_at)
-		VALUES ($1, $2, $3, $4, 'RUNNING', $5::jsonb, $6::uuid, now())
-	`, stepID, runID, stepName, seq, dec, attemptUUID); err != nil {
-		t.Fatalf("plantRunningStep %s: %v", stepID, err)
-	}
-	if _, err := db.Exec(`
-		INSERT INTO attempts (attempt_id, step_id, attempt_number, status)
-		VALUES ($1::uuid, $2, 1, 'RUNNING')
-	`, attemptUUID, stepID); err != nil {
-		t.Fatalf("plantRunningStep attempt %s: %v", stepID, err)
-	}
-}
-
-// plantFailedStep inserts a step where Checkpoint Path B fired (status=FAILED,
-// attempt row FAILED) but the process crashed before ResetToDecided could clear
-// it back to DECIDED for the next retry attempt. output stays NULL — this is
-// the gap recovery rule 4 closes: FAILED-with-no-output must be re-dispatched,
-// not left stuck (CLAUDE.md "Four Recovery Rules").
-func plantFailedStep(t *testing.T, db *sql.DB, runID, stepName string, seq int, attemptUUID string) {
-	t.Helper()
-	stepID := runID + ":" + stepName
-	dec := decisionJSON(stepName, "http://stub/"+stepName)
-	if _, err := db.Exec(`
-		INSERT INTO steps
-			(step_id, run_id, step_name, seq, status, decision, current_attempt_id, decided_at)
-		VALUES ($1, $2, $3, $4, 'FAILED', $5::jsonb, $6::uuid, now())
-	`, stepID, runID, stepName, seq, dec, attemptUUID); err != nil {
-		t.Fatalf("plantFailedStep %s: %v", stepID, err)
-	}
-	if _, err := db.Exec(`
-		INSERT INTO attempts (attempt_id, step_id, attempt_number, status, error, resolved_at)
-		VALUES ($1::uuid, $2, 1, 'FAILED', 'worker timeout before crash', now())
-	`, attemptUUID, stepID); err != nil {
-		t.Fatalf("plantFailedStep attempt %s: %v", stepID, err)
-	}
-}
-
-// pollRunStatus polls runs.status every 50 ms until it leaves 'RUNNING'.
-// Fails the test if the run is still RUNNING after timeout.
-func pollRunStatus(t *testing.T, db *sql.DB, runID string, timeout time.Duration) string {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		var status string
-		if err := db.QueryRow(`SELECT status FROM runs WHERE run_id = $1`, runID).Scan(&status); err != nil {
-			t.Fatalf("pollRunStatus: %v", err)
-		}
-		if status != "RUNNING" {
-			return status
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("run %q still RUNNING after %v", runID, timeout)
-	return ""
-}
-
-// ── Test 1: core recovery — DECIDED step ─────────────────────────────────
-
-// TestRecovery_PicksUpDecidedStep is the canonical crash-recovery test.
-//
-// Planted state:
-//
-//	step1 = DONE  (output set, 1 DONE attempt)           — must NOT be re-dispatched
-//	step2 = DECIDED  (Barrier 1 fired, no dispatch yet)  — must be picked up and run
-//
-// The planner returns "done" only after both steps are in history (minHistory=2).
-// If step1 were re-dispatched, the planner would be called mid-recovery with only
-// 1 history entry and would return an error, failing the test.
-func TestRecovery_PicksUpDecidedStep(t *testing.T) {
-	db := openTestDB(t)
-	resetTestSchema(t, db)
-
-	const (
-		wfID     = "wf-rec-decided"
-		runID    = "run-rec-decided"
-		attempt1 = "10000000-0000-4000-8000-000000000001"
-	)
-	seedTestFixtures(t, db, wfID, runID)
-	plantDoneStep(t, db, runID, "step1", 1, attempt1)
-	plantDecidedStep(t, db, runID, "step2", 2)
-
-	s := store.New(db)
-	n, err := orchestrator.RecoverRuns(context.Background(), s,
-		func(id core.RunID, input json.RawMessage) *orchestrator.Loop {
-			return &orchestrator.Loop{
-				RunID:         id,
-				WorkflowInput: input,
-				Store:         s,
-				Planner:       &recoveryDonePlanner{minHistory: 2},
-				Transport:     &alwaysSucceedTransport{},
-				Retry:         &orchestrator.FixedCountPolicy{MaxRetries: 3, Delay: 0},
-			}
-		})
-	if err != nil {
-		t.Fatalf("RecoverRuns: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("RecoverRuns n = %d, want 1", n)
-	}
-
-	finalStatus := pollRunStatus(t, db, runID, 5*time.Second)
-
-	step1ID := runID + ":step1"
-	step2ID := runID + ":step2"
-
-	// ── step1: exactly 1 attempt (not re-dispatched) ───────────────────────
-	var step1Attempts int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE step_id = $1`, step1ID).
-		Scan(&step1Attempts); err != nil {
-		t.Fatalf("count step1 attempts: %v", err)
-	}
-	if step1Attempts != 1 {
-		t.Errorf("step1 attempt count = %d, want 1 (DONE step must not be re-dispatched)", step1Attempts)
-	}
-	t.Logf("PASS — step1 attempt count unchanged at %d (not re-dispatched)", step1Attempts)
-
-	// ── step1: output unchanged ────────────────────────────────────────────
-	var rawOut []byte
-	if err := db.QueryRow(`SELECT output FROM steps WHERE step_id = $1`, step1ID).
-		Scan(&rawOut); err != nil {
-		t.Fatalf("query step1 output: %v", err)
-	}
-	var gotOut map[string]any
-	if err := json.Unmarshal(rawOut, &gotOut); err != nil {
-		t.Fatalf("unmarshal step1 output: %v", err)
-	}
-	if gotOut["result"] != "done_before_crash" {
-		t.Errorf("step1 output changed to %s; want original value", rawOut)
-	}
-	t.Logf("PASS — step1 output unchanged: %s", rawOut)
-
-	// ── step2: exactly 1 attempt (the recovery dispatch) ──────────────────
-	var step2Attempts int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE step_id = $1`, step2ID).
-		Scan(&step2Attempts); err != nil {
-		t.Fatalf("count step2 attempts: %v", err)
-	}
-	if step2Attempts != 1 {
-		t.Errorf("step2 attempt count = %d, want 1", step2Attempts)
-	}
-	t.Logf("PASS — step2 dispatched %d time(s) by recovery", step2Attempts)
-
-	// ── step2: DONE ────────────────────────────────────────────────────────
-	var step2Status string
-	if err := db.QueryRow(`SELECT status FROM steps WHERE step_id = $1`, step2ID).
-		Scan(&step2Status); err != nil {
-		t.Fatalf("query step2 status: %v", err)
-	}
-	if step2Status != "DONE" {
-		t.Errorf("step2.status = %q, want DONE", step2Status)
-	}
-	t.Logf("PASS — step2.status = DONE")
-
-	// ── run: DONE ─────────────────────────────────────────────────────────
-	if finalStatus != "DONE" {
-		t.Errorf("run.status = %q, want DONE", finalStatus)
-	}
-	t.Logf("PASS — run.status = DONE")
-}
-
-// ── Test 2: RUNNING-uncertain → re-dispatch, never FAILED ────────────────
-
-// TestRecovery_RunningUncertainReDispatched verifies the most critical rule in
-// CLAUDE.md: a RUNNING step with no output is UNCERTAIN, not FAILED.
-//
-// Planted state:
-//
-//	step1 = RUNNING  (dispatch happened; crash occurred before Checkpoint)
-//	         1 attempt row, status=RUNNING (the crashed dispatch)
-//
-// Expectations:
-//   - step1 is re-dispatched with a NEW attempt_id → total attempts = 2
-//   - step1 ends DONE (not FAILED, not DLQ)
-//   - The crashed attempt row stays RUNNING (never retroactively marked FAILED)
-//   - run ends DONE
-func TestRecovery_RunningUncertainReDispatched(t *testing.T) {
-	db := openTestDB(t)
-	resetTestSchema(t, db)
-
-	const (
-		wfID           = "wf-rec-running"
-		runID          = "run-rec-running"
-		crashedAttempt = "20000000-0000-4000-8000-000000000002"
-	)
-	seedTestFixtures(t, db, wfID, runID)
-	plantRunningStep(t, db, runID, "step1", 1, crashedAttempt)
-
-	s := store.New(db)
-	n, err := orchestrator.RecoverRuns(context.Background(), s,
-		func(id core.RunID, input json.RawMessage) *orchestrator.Loop {
-			return &orchestrator.Loop{
-				RunID:         id,
-				WorkflowInput: input,
-				Store:         s,
-				Planner:       &recoveryDonePlanner{minHistory: 1},
-				Transport:     &alwaysSucceedTransport{},
-				Retry:         &orchestrator.FixedCountPolicy{MaxRetries: 3, Delay: 0},
-			}
-		})
-	if err != nil {
-		t.Fatalf("RecoverRuns: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("RecoverRuns n = %d, want 1", n)
-	}
-
-	finalStatus := pollRunStatus(t, db, runID, 5*time.Second)
-
-	step1ID := runID + ":step1"
-
-	// ── 2 attempts total (crashed + recovery) ─────────────────────────────
-	var attemptCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE step_id = $1`, step1ID).
-		Scan(&attemptCount); err != nil {
-		t.Fatalf("count attempts: %v", err)
-	}
-	if attemptCount != 2 {
-		t.Errorf("step1 attempt count = %d, want 2 (1 crashed + 1 recovery dispatch)", attemptCount)
-	}
-	t.Logf("PASS — step1 has %d attempts (crashed attempt preserved, recovery added one)", attemptCount)
-
-	// ── step1: DONE (not FAILED) ───────────────────────────────────────────
-	var step1Status string
-	if err := db.QueryRow(`SELECT status FROM steps WHERE step_id = $1`, step1ID).
-		Scan(&step1Status); err != nil {
-		t.Fatalf("query step1 status: %v", err)
-	}
-	if step1Status != "DONE" {
-		t.Errorf("step1.status = %q, want DONE — RUNNING-uncertain must never be treated as FAILED", step1Status)
-	}
-	t.Logf("PASS — step1.status = DONE (not FAILED; RUNNING-uncertain was re-dispatched)")
-
-	// ── no FAILED attempt rows — the crashed attempt stays RUNNING ─────────
-	var failedAttempts int
-	if err := db.QueryRow(`
-		SELECT COUNT(*) FROM attempts WHERE step_id = $1 AND status = 'FAILED'
-	`, step1ID).Scan(&failedAttempts); err != nil {
-		t.Fatalf("count failed attempts: %v", err)
-	}
-	if failedAttempts != 0 {
-		t.Errorf("step1 has %d FAILED attempt rows, want 0", failedAttempts)
-	}
-	t.Logf("PASS — no FAILED attempt rows (crashed attempt stays RUNNING; recovery attempt is DONE)")
-
-	// ── run: DONE ─────────────────────────────────────────────────────────
-	if finalStatus != "DONE" {
-		t.Errorf("run.status = %q, want DONE", finalStatus)
-	}
-	t.Logf("PASS — run.status = DONE")
-}
-
-// ── Test 3: terminal runs are not touched ────────────────────────────────
+// ── Test: terminal runs are not touched ──────────────────────────────────
 
 // TestRecovery_SkipsTerminalRuns verifies that only status='RUNNING' runs are
 // resumed. A DONE run is terminal and must be completely ignored.
@@ -376,7 +104,7 @@ func TestRecovery_SkipsTerminalRuns(t *testing.T) {
 	s := store.New(db)
 	factoryCalls := 0
 	n, err := orchestrator.RecoverRuns(context.Background(), s,
-		func(id core.RunID, _ json.RawMessage) *orchestrator.Loop {
+		func(id core.RunID, _ core.WorkflowID, _ json.RawMessage) *orchestrator.Loop {
 			factoryCalls++
 			t.Errorf("makeLoop called for run %q — terminal DONE run must not be resumed", id)
 			return nil
@@ -393,66 +121,40 @@ func TestRecovery_SkipsTerminalRuns(t *testing.T) {
 	t.Logf("PASS — RecoverRuns returned n=0, factory called 0 times (DONE run skipped)")
 }
 
-// ── Test 4: FAILED-with-no-output → re-dispatch, not re-decide ──────────
+// ── Mandatory test (a): budget-boundary crash ────────────────────────────
 
-// prematureDecidePlanner returns the SAME step name if asked with empty
-// history. This simulates the bug recovery rule 4 guards against: if
-// PendingDecision failed to surface a FAILED-no-output step, the loop would
-// fall through to LoadFrontier/Decide, the planner would re-decide a step
-// that already has a persisted decision, and the resulting PutDecision would
-// attempt a duplicate INSERT — a primary-key conflict on steps.step_id.
-type prematureDecidePlanner struct {
-	step  *core.StepSpec
-	calls []int // history length recorded at each Decide call
-}
-
-func (p *prematureDecidePlanner) Decide(_ context.Context, s core.RunState) (core.StepDecision, error) {
-	p.calls = append(p.calls, len(s.History))
-	if len(s.History) == 0 {
-		return core.StepDecision{Status: "continue", Step: p.step}, nil
-	}
-	return core.StepDecision{Status: "done"}, nil
-}
-
-// TestRecovery_FailedNoOutputReDispatched verifies recovery rule 4: a step
-// checkpointed as FAILED with no output (crash between Checkpoint Path B and
-// ResetToDecided) is re-dispatched using the persisted decision — the planner
-// is never re-asked for it.
-//
-// Planted state:
-//
-//	step1 = FAILED  (decision non-null, output NULL, 1 FAILED attempt)
-//
-// Expectations:
-//   - the planner is never called with empty history (i.e. never asked before
-//     the pending FAILED step resolves)
-//   - step1 is re-dispatched with a new attempt_id and completes DONE
-//   - exactly one steps row exists for step1 (no primary-key conflict)
-func TestRecovery_FailedNoOutputReDispatched(t *testing.T) {
+// TestRecovery_BudgetBoundaryCrash_ClaimDLQsImmediately seeds a step with
+// attempt_count = X-1 (retryLimit-1) and a single RUNNING attempt (a
+// live-dispatch crash). Recovery's orphan claim is the retryLimit-th
+// failure, so it must land the step and run in the DLQ inside the SAME
+// transaction as the claim (TX3's one-blade guarantee) — nothing may be
+// dispatched, and the planner must never be asked (run=DLQ, last_step=DLQ is
+// a terminal, untouched combination — whitepaper §8.2).
+func TestRecovery_BudgetBoundaryCrash_ClaimDLQsImmediately(t *testing.T) {
 	db := openTestDB(t)
 	resetTestSchema(t, db)
 
 	const (
-		wfID           = "wf-rec-failed"
-		runID          = "run-rec-failed"
-		crashedAttempt = "30000000-0000-4000-8000-000000000003"
+		retryLimit     = 3
+		wfID           = "wf-rec-budget"
+		runID          = "run-rec-budget"
+		crashedAttempt = "10000000-0000-4000-8000-000000000001"
 	)
-	seedTestFixtures(t, db, wfID, runID)
-	plantFailedStep(t, db, runID, "step1", 1, crashedAttempt)
+	seedWorkflowAndRun(t, db, wfID, runID, "static", staticPlannerConfigWithRetryLimit(retryLimit))
+	// attempt_count = retryLimit-1 = 2; one RUNNING attempt (never resolved
+	// before the simulated crash).
+	plantRunningStep(t, db, runID, "step1", 1, retryLimit-1, crashedAttempt, "RUNNING", "")
 
 	s := store.New(db)
-	planner := &prematureDecidePlanner{
-		step: &core.StepSpec{Name: "step1", WorkerURL: "http://stub/step1", Mode: "sync", TimeoutSeconds: 5},
-	}
 	n, err := orchestrator.RecoverRuns(context.Background(), s,
-		func(id core.RunID, input json.RawMessage) *orchestrator.Loop {
+		func(id core.RunID, wfID core.WorkflowID, input json.RawMessage) *orchestrator.Loop {
 			return &orchestrator.Loop{
-				RunID:         id,
-				WorkflowInput: input,
-				Store:         s,
-				Planner:       planner,
-				Transport:     &alwaysSucceedTransport{},
-				Retry:         &orchestrator.FixedCountPolicy{MaxRetries: 3, Delay: 0},
+				RunID:          id,
+				WorkflowID:     wfID,
+				WorkflowInput:  input,
+				Store:          s,
+				Transport:      &panicTransport{t: t},
+				PlannerFactory: staticFactory(&panicPlanner{t: t}),
 			}
 		})
 	if err != nil {
@@ -463,55 +165,307 @@ func TestRecovery_FailedNoOutputReDispatched(t *testing.T) {
 	}
 
 	finalStatus := pollRunStatus(t, db, runID, 5*time.Second)
-
-	step1ID := runID + ":step1"
-
-	// ── (a) planner never asked before the pending FAILED step resolves ────
-	for _, histLen := range planner.calls {
-		if histLen == 0 {
-			t.Fatalf("planner.Decide called with empty history — PendingDecision failed to surface the FAILED-no-output step (recovery rule 4)")
-		}
+	if finalStatus != "DLQ" {
+		t.Errorf("run.status = %q, want DLQ", finalStatus)
 	}
-	if len(planner.calls) == 0 {
-		t.Fatalf("planner.Decide was never called")
-	}
-	t.Logf("PASS — planner.Decide call history lengths: %v (never called before the FAILED step resolved)", planner.calls)
+	t.Logf("PASS — run.status = DLQ")
 
-	// ── (b) step1 re-dispatched (new attempt) and completes DONE ───────────
+	stepID := runID + ":step1"
+	var stepStatus string
 	var attemptCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE step_id = $1`, step1ID).
-		Scan(&attemptCount); err != nil {
+	if err := db.QueryRow(`SELECT status, attempt_count FROM steps WHERE step_id = $1`, stepID).
+		Scan(&stepStatus, &attemptCount); err != nil {
+		t.Fatalf("query step: %v", err)
+	}
+	if stepStatus != "DLQ" {
+		t.Errorf("step.status = %q, want DLQ", stepStatus)
+	}
+	if attemptCount != retryLimit {
+		t.Errorf("step.attempt_count = %d, want %d", attemptCount, retryLimit)
+	}
+	t.Logf("PASS — step.status=DLQ, attempt_count=%d", attemptCount)
+
+	// Exactly one attempt row (the seeded one), now FAILED(orphaned) — no
+	// new attempt was ever created (TX4/dispatch never fired).
+	var attemptRows int
+	var attemptStatus, failureReason string
+	if err := db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE step_id = $1`, stepID).Scan(&attemptRows); err != nil {
 		t.Fatalf("count attempts: %v", err)
 	}
-	if attemptCount != 2 {
-		t.Errorf("step1 attempt count = %d, want 2 (1 crashed FAILED + 1 recovery dispatch)", attemptCount)
+	if attemptRows != 1 {
+		t.Errorf("attempt row count = %d, want 1 (no redispatch past the budget)", attemptRows)
 	}
-	t.Logf("PASS — step1 has %d attempts (crashed FAILED attempt preserved, recovery added one)", attemptCount)
+	if err := db.QueryRow(`SELECT status, failure_reason FROM attempts WHERE attempt_id = $1::uuid`, crashedAttempt).
+		Scan(&attemptStatus, &failureReason); err != nil {
+		t.Fatalf("query attempt: %v", err)
+	}
+	if attemptStatus != "FAILED" || failureReason != "orphaned" {
+		t.Errorf("attempt status/reason = %s/%s, want FAILED/orphaned", attemptStatus, failureReason)
+	}
+	t.Logf("PASS — exactly 1 attempt row, claimed as FAILED(orphaned); nothing dispatched")
 
-	var step1Status string
-	if err := db.QueryRow(`SELECT status FROM steps WHERE step_id = $1`, step1ID).
-		Scan(&step1Status); err != nil {
-		t.Fatalf("query step1 status: %v", err)
+	var dlqReason string
+	var dlqContext []byte
+	if err := db.QueryRow(`SELECT reason, context FROM dead_letter_queue WHERE run_id = $1`, runID).
+		Scan(&dlqReason, &dlqContext); err != nil {
+		t.Fatalf("query dlq: %v", err)
 	}
-	if step1Status != "DONE" {
-		t.Errorf("step1.status = %q, want DONE", step1Status)
+	if dlqReason != "worker_retry_exhausted" {
+		t.Errorf("dlq.reason = %q, want worker_retry_exhausted", dlqReason)
 	}
-	t.Logf("PASS — step1.status = DONE (re-dispatched successfully from FAILED)")
+	var ctxBlob map[string]any
+	if err := json.Unmarshal(dlqContext, &ctxBlob); err != nil {
+		t.Fatalf("unmarshal dlq context: %v", err)
+	}
+	t.Logf("PASS — DLQ entry: reason=%q, context=%s", dlqReason, dlqContext)
+}
 
-	// ── (c) no primary-key conflict: exactly one steps row for step1 ───────
-	var stepRowCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM steps WHERE step_id = $1`, step1ID).
-		Scan(&stepRowCount); err != nil {
-		t.Fatalf("count step1 rows: %v", err)
-	}
-	if stepRowCount != 1 {
-		t.Errorf("steps table has %d rows for step_id %q, want 1", stepRowCount, step1ID)
-	}
-	t.Logf("PASS — exactly 1 steps row for %q (no PK conflict)", step1ID)
+// ── Mandatory test (b): recovery re-entrancy ─────────────────────────────
 
-	// ── run: DONE ────────────────────────────────────────────────────────
+// TestRecovery_ReEntrancy_CountIncrementedExactlyOnce runs recovery TWICE
+// over the same seeded state (well below the retry budget so the first pass
+// fully resolves the run). The second pass's ListRunningRuns scan finds
+// nothing (the run is now DONE) — proving an already-claimed orphan cannot
+// be claimed or counted twice (whitepaper §8.3's re-entrancy property).
+func TestRecovery_ReEntrancy_CountIncrementedExactlyOnce(t *testing.T) {
+	db := openTestDB(t)
+	resetTestSchema(t, db)
+
+	const (
+		retryLimit     = 3
+		wfID           = "wf-rec-reentrant"
+		runID          = "run-rec-reentrant"
+		crashedAttempt = "20000000-0000-4000-8000-000000000002"
+	)
+	seedWorkflowAndRun(t, db, wfID, runID, "static", staticPlannerConfigWithRetryLimit(retryLimit))
+	plantRunningStep(t, db, runID, "step1", 1, 0, crashedAttempt, "RUNNING", "")
+
+	s := store.New(db)
+	planner := &countingDonePlanner{minHistory: 1}
+	transport := &alwaysSucceedTransport{}
+
+	makeLoop := func(id core.RunID, wf core.WorkflowID, input json.RawMessage) *orchestrator.Loop {
+		return &orchestrator.Loop{
+			RunID:          id,
+			WorkflowID:     wf,
+			WorkflowInput:  input,
+			Store:          s,
+			Transport:      transport,
+			PlannerFactory: staticFactory(planner),
+		}
+	}
+
+	// First recovery pass: claims the orphan (count 0→1), redispatches,
+	// succeeds, then the planner says done.
+	n1, err := orchestrator.RecoverRuns(context.Background(), s, makeLoop)
+	if err != nil {
+		t.Fatalf("RecoverRuns (pass 1): %v", err)
+	}
+	if n1 != 1 {
+		t.Fatalf("pass 1: RecoverRuns n = %d, want 1", n1)
+	}
+	finalStatus := pollRunStatus(t, db, runID, 5*time.Second)
+	if finalStatus != "DONE" {
+		t.Fatalf("pass 1: run.status = %q, want DONE", finalStatus)
+	}
+
+	// Second recovery pass over the SAME database: ListRunningRuns must find
+	// nothing (the run is DONE now) — the factory must not even be called.
+	n2, err := orchestrator.RecoverRuns(context.Background(), s,
+		func(id core.RunID, _ core.WorkflowID, _ json.RawMessage) *orchestrator.Loop {
+			t.Errorf("pass 2: makeLoop called for run %q — a DONE run must never be re-entered", id)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("RecoverRuns (pass 2): %v", err)
+	}
+	if n2 != 0 {
+		t.Errorf("pass 2: RecoverRuns n = %d, want 0", n2)
+	}
+
+	stepID := runID + ":step1"
+	var attemptCount int
+	if err := db.QueryRow(`SELECT attempt_count FROM steps WHERE step_id = $1`, stepID).Scan(&attemptCount); err != nil {
+		t.Fatalf("query attempt_count: %v", err)
+	}
+	if attemptCount != 1 {
+		t.Errorf("step.attempt_count = %d, want 1 (incremented exactly once, by the single orphan claim)", attemptCount)
+	}
+	t.Logf("PASS — attempt_count = %d after two recovery passes (claimed exactly once)", attemptCount)
+
+	var orphanedRows int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM attempts WHERE step_id = $1 AND failure_reason = 'orphaned'
+	`, stepID).Scan(&orphanedRows); err != nil {
+		t.Fatalf("count orphaned attempts: %v", err)
+	}
+	if orphanedRows != 1 {
+		t.Errorf("orphaned attempt rows = %d, want 1 (never double-claimed)", orphanedRows)
+	}
+	t.Logf("PASS — exactly 1 attempt row carries failure_reason=orphaned")
+}
+
+// ── Mandatory test (c): crash between TX3 and TX4 ────────────────────────
+
+// TestRecovery_CrashBetweenTX3AndTX4_DispatchesWithoutClaiming seeds a step
+// whose sole attempt already reached a terminal FAILED state (simulating
+// TX3 having already fired) with attempt_count below the retry limit, but no
+// TX4 ever ran before the crash (current_attempt_id still points at the
+// FAILED attempt — TX3 never moves that pointer). Recovery's unconditional
+// orphan-claim call must be a CAS no-op (the attempt is not RUNNING), and
+// recovery must proceed straight to TX4 + dispatch WITHOUT adding any new
+// failure/orphaned record (whitepaper §7.1: "recovery's budget check picks
+// this up; the window is claimed").
+func TestRecovery_CrashBetweenTX3AndTX4_DispatchesWithoutClaiming(t *testing.T) {
+	db := openTestDB(t)
+	resetTestSchema(t, db)
+
+	const (
+		retryLimit      = 3
+		wfID            = "wf-rec-tx3tx4"
+		runID           = "run-rec-tx3tx4"
+		preCrashAttempt = "30000000-0000-4000-8000-000000000003"
+	)
+	seedWorkflowAndRun(t, db, wfID, runID, "static", staticPlannerConfigWithRetryLimit(retryLimit))
+	// attempt_count = 1 (as if one real TX3 already ran), the one attempt
+	// already FAILED(timeout) — but no TX4 followed before the crash.
+	plantRunningStep(t, db, runID, "step1", 1, 1, preCrashAttempt, "FAILED", "timeout")
+
+	s := store.New(db)
+	planner := &countingDonePlanner{minHistory: 1}
+	transport := &alwaysSucceedTransport{}
+
+	n, err := orchestrator.RecoverRuns(context.Background(), s,
+		func(id core.RunID, wf core.WorkflowID, input json.RawMessage) *orchestrator.Loop {
+			return &orchestrator.Loop{
+				RunID:          id,
+				WorkflowID:     wf,
+				WorkflowInput:  input,
+				Store:          s,
+				Transport:      transport,
+				PlannerFactory: staticFactory(planner),
+			}
+		})
+	if err != nil {
+		t.Fatalf("RecoverRuns: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("RecoverRuns n = %d, want 1", n)
+	}
+
+	finalStatus := pollRunStatus(t, db, runID, 5*time.Second)
 	if finalStatus != "DONE" {
 		t.Errorf("run.status = %q, want DONE", finalStatus)
 	}
-	t.Logf("PASS — run.status = DONE")
+
+	stepID := runID + ":step1"
+
+	// attempt_count must be UNCHANGED by the claim attempt (still 1 from the
+	// pre-crash TX3) — the claim was a CAS no-op, not a fresh count++.
+	var attemptCount int
+	if err := db.QueryRow(`SELECT attempt_count FROM steps WHERE step_id = $1`, stepID).Scan(&attemptCount); err != nil {
+		t.Fatalf("query attempt_count: %v", err)
+	}
+	if attemptCount != 1 {
+		t.Errorf("step.attempt_count = %d, want 1 (claim must be a no-op; only the pre-seeded TX3 count remains)", attemptCount)
+	}
+	t.Logf("PASS — attempt_count = %d (unchanged by the no-op claim)", attemptCount)
+
+	// No attempt carries failure_reason='orphaned' — recovery claimed
+	// nothing.
+	var orphanedRows int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM attempts WHERE step_id = $1 AND failure_reason = 'orphaned'
+	`, stepID).Scan(&orphanedRows); err != nil {
+		t.Fatalf("count orphaned attempts: %v", err)
+	}
+	if orphanedRows != 0 {
+		t.Errorf("orphaned attempt rows = %d, want 0 (recovery must not claim an already-FAILED attempt)", orphanedRows)
+	}
+	t.Logf("PASS — 0 attempt rows carry failure_reason=orphaned (nothing claimed)")
+
+	// Exactly 2 attempts total: the pre-crash FAILED one + the new DONE
+	// redispatch (TX4 fired, dispatched successfully).
+	var totalAttempts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM attempts WHERE step_id = $1`, stepID).Scan(&totalAttempts); err != nil {
+		t.Fatalf("count attempts: %v", err)
+	}
+	if totalAttempts != 2 {
+		t.Errorf("total attempts = %d, want 2 (1 pre-crash FAILED + 1 new redispatch)", totalAttempts)
+	}
+	t.Logf("PASS — %d total attempts (pre-crash FAILED preserved + new redispatch)", totalAttempts)
+
+	if transport.calls != 1 {
+		t.Errorf("transport.Dispatch called %d times, want 1", transport.calls)
+	}
+	t.Logf("PASS — run.status = DONE; transport dispatched exactly once")
+}
+
+// ── Mandatory test (d): planner asked exactly once per step, across a
+//    simulated crash ────────────────────────────────────────────────────
+
+// TestRecovery_PlannerAskedExactlyOncePerStep seeds a 2-step run: step1 is
+// DONE (pre-crash), step2 is RUNNING with a single RUNNING attempt (a
+// live-dispatch crash for step2 — its decision (Barrier 1) is already
+// persisted). Recovery must NOT re-ask the planner for either step1 (already
+// resolved) or step2 (already decided, just re-dispatch it) — the planner is
+// asked exactly ONCE total: after step2 resolves, to learn what comes next.
+func TestRecovery_PlannerAskedExactlyOncePerStep(t *testing.T) {
+	db := openTestDB(t)
+	resetTestSchema(t, db)
+
+	const (
+		retryLimit     = 3
+		wfID           = "wf-rec-once"
+		runID          = "run-rec-once"
+		doneAttempt    = "40000000-0000-4000-8000-000000000004"
+		crashedAttempt = "40000000-0000-4000-8000-000000000005"
+	)
+	seedWorkflowAndRun(t, db, wfID, runID, "static", staticPlannerConfigWithRetryLimit(retryLimit))
+	plantDoneStep(t, db, runID, "step1", 1, doneAttempt)
+	plantRunningStep(t, db, runID, "step2", 2, 0, crashedAttempt, "RUNNING", "")
+
+	s := store.New(db)
+	// minHistory=2: once step2 also resolves, history has 2 entries — the
+	// planner may legitimately be asked ("what's next?") exactly then.
+	planner := &countingDonePlanner{minHistory: 2}
+	transport := &alwaysSucceedTransport{}
+
+	n, err := orchestrator.RecoverRuns(context.Background(), s,
+		func(id core.RunID, wf core.WorkflowID, input json.RawMessage) *orchestrator.Loop {
+			return &orchestrator.Loop{
+				RunID:          id,
+				WorkflowID:     wf,
+				WorkflowInput:  input,
+				Store:          s,
+				Transport:      transport,
+				PlannerFactory: staticFactory(planner),
+			}
+		})
+	if err != nil {
+		t.Fatalf("RecoverRuns: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("RecoverRuns n = %d, want 1", n)
+	}
+
+	finalStatus := pollRunStatus(t, db, runID, 5*time.Second)
+	if finalStatus != "DONE" {
+		t.Fatalf("run.status = %q, want DONE", finalStatus)
+	}
+
+	if len(planner.calls) != 1 {
+		t.Fatalf("planner.Decide called %d times, want exactly 1; call history (history-len per call): %v",
+			len(planner.calls), planner.calls)
+	}
+	if planner.calls[0] != 2 {
+		t.Errorf("the single Decide call had history len %d, want 2 (both steps already resolved)", planner.calls[0])
+	}
+	t.Logf("PASS — planner.Decide called exactly once (history len=%d): step1 (pre-DONE) and step2 "+
+		"(pre-decided, only re-dispatched) were never re-asked", planner.calls[0])
+
+	if transport.calls != 1 {
+		t.Errorf("transport.Dispatch called %d times, want 1 (only step2's recovery redispatch)", transport.calls)
+	}
+	t.Logf("PASS — transport dispatched exactly once (step2's recovery redispatch)")
 }

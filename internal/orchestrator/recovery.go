@@ -1,5 +1,6 @@
 // Package orchestrator — crash recovery on startup.
-// Authoritative: DESIGN.md §9.3, CLAUDE.md "Four Recovery Rules".
+// Authoritative: docs/StateFlow_Whitepaper_v1_0.md §8.3 (recovery), §8.2
+// (the run × last_step combination table).
 package orchestrator
 
 import (
@@ -15,37 +16,37 @@ import (
 // loop for each in a separate goroutine. This function is called ONCE from
 // main.go, before the HTTP server begins accepting new requests.
 //
-// Design (DESIGN.md §9.3):
+// Design (whitepaper §8.3):
 //
 //	store.ListRunningRuns(ctx)
 //	for each run → call makeLoop → go loop.Run(ctx)
 //
-// The four CLAUDE.md recovery rules are handled transparently by Loop.Run:
-//   - Loop.Run calls PendingDecision first; if non-nil (DECIDED, RUNNING, or
-//     FAILED step with no output), it re-dispatches without re-asking the
-//     planner (Barrier 1 already fired — rules 1, 2, and 4).
-//   - If PendingDecision returns nil, the loop asks the planner against the
-//     persisted frontier of DONE steps (rule 3).
-//
 // Recovery is NOT a special mode; it is the same loop entered from a
-// DB-persisted mid-run state. Recovery and normal operation converge on
-// identical code paths.
+// DB-persisted mid-run state (whitepaper §2). The entire run×last_step
+// combination table (§8.2) is handled transparently by Loop.Run:
+//   - run=running, last_step=done (or no steps) → Run's steady-state loop
+//     asks the planner directly (LoadFrontier's PendingStep is nil).
+//   - run=running, last_step=running → Run's one-time recovery check finds
+//     LoadFrontier's PendingStep non-nil and performs the three-step
+//     recovery action (§8.3): claim the orphan (TX3, possibly DLQ'ing),
+//     budget check, then TX4 + dispatch.
+//   - run=done / run=DLQ: ListRunningRuns never returns them (it queries
+//     status='RUNNING' only) — they are never touched, exactly as required.
 //
-// RUNNING-uncertain (CLAUDE.md): a RUNNING step with no output is uncertain —
-// the worker may have finished but the checkpoint was lost to the crash. It is
-// NOT failed. The loop re-dispatches it (generates a new attempt_id) and relies
-// on worker idempotency.
+// makeLoop constructs a fully configured Loop for the given run. In
+// production, main.go provides this factory (wiring Store/Transport/Retry;
+// the planner is NOT part of the factory's job — Loop.Run reconstructs it
+// from the workflow row itself, whitepaper §12.1). In tests, stubs are
+// injected via the returned Loop's fields (including PlannerFactory).
 //
-// makeLoop constructs a fully configured Loop for the given run. In production,
-// main.go provides this factory (using the workflow's planner_type/planner_config).
-// In tests, stubs are injected.
-//
-// Returns the count of goroutines started and any startup error. Individual run
-// errors are logged but do not surface to the caller — runs are independent.
+// Returns the count of goroutines started and any startup error. Individual
+// run errors are logged but do not surface to the caller — runs are
+// independent (whitepaper §8.3: "crash loops converge" per run, not
+// globally).
 func RecoverRuns(
 	ctx context.Context,
 	store core.StateStore,
-	makeLoop func(runID core.RunID, workflowInput json.RawMessage) *Loop,
+	makeLoop func(runID core.RunID, workflowID core.WorkflowID, workflowInput json.RawMessage) *Loop,
 ) (int, error) {
 	runs, err := store.ListRunningRuns(ctx)
 	if err != nil {
@@ -55,22 +56,25 @@ func RecoverRuns(
 	slog.Info("[RECOVERY] found in-progress runs", "count", len(runs))
 
 	for _, r := range runs {
-		frontier, err := store.LoadFrontier(r.RunID)
+		frontier, err := store.LoadFrontier(ctx, r.RunID)
 		if err != nil {
 			slog.Error("[RECOVERY] load frontier", "run_id", string(r.RunID), "err", err)
 			continue
 		}
 
 		step := "-"
-		if frontier.PendingDecision != nil {
-			step = frontier.PendingDecision.Name
+		attemptCount := 0
+		if frontier.PendingStep != nil {
+			step = frontier.PendingStep.Name
+			attemptCount = frontier.AttemptCount
 		}
 		slog.Info("[RECOVERY] resuming run",
 			"run_id", string(r.RunID),
 			"steps_done", len(frontier.History),
-			"pending_step", step)
+			"pending_step", step,
+			"attempt_count", attemptCount)
 
-		l := makeLoop(r.RunID, r.WorkflowInput)
+		l := makeLoop(r.RunID, r.WorkflowID, r.WorkflowInput)
 		if l == nil {
 			slog.Warn("[RECOVERY] skipping run: makeLoop returned nil", "run_id", string(r.RunID))
 			continue
