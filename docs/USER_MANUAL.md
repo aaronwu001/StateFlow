@@ -477,12 +477,11 @@ When StateFlow re-dispatches a step with a new `attempt_id`, it updates
 async callback — is accepted only if it passes a single atomic check
 (**CAS-A**): `attempt_id` must equal the step's current `current_attempt_id`
 **and** that attempt must still be `RUNNING`. If either condition fails, the
-report is ACKed with HTTP 200 but has **zero effect on stored state**. You
-will see this in the logs:
-
-```
-INFO callback: superseded attempt_id, ignoring  step_id=...  attempt_id=...
-```
+report is ACKed with HTTP 200 but has **zero effect on stored state**. This
+path is currently silent — no log line is emitted for it — so do not grep
+logs for a "superseded"/"ignoring" message to detect it; instead confirm the
+response is 200 with no corresponding change in attempt/step state (e.g. via
+`GET /runs/{id}`), or query attempt history directly.
 
 This is the expected, correct behaviour — not an error. Two situations both
 land here:
