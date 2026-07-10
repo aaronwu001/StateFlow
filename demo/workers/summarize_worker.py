@@ -3,9 +3,12 @@ Summarize Worker — sync, port 5003.
 
 Receives POST /run from StateFlow (sync transport).
 Body: {"workflow_input": {...}, "history": [...]}  (includes OCR and NER outputs)
+Headers: X-StateFlow-Step-ID, X-StateFlow-Attempt-ID
 Returns: summary JSON.
 
-Idempotency: same as OCR — caches on full input JSON.
+Idempotency: same as OCR (see ocr_worker.py) — keys primarily on the
+X-StateFlow-Step-ID header (whitepaper §13.1, User Manual §2.3), falling back
+to an input-content hash only if the header is absent.
 """
 
 import json
@@ -24,10 +27,14 @@ _cache: dict = {}
 @app.route("/run", methods=["POST"])
 def run():
     body = request.get_json(force=True)
-    cache_key = json.dumps(body, sort_keys=True)
+    step_id = request.headers.get("X-StateFlow-Step-ID")
+    if step_id:
+        cache_key = f"step_id:{step_id}"
+    else:
+        cache_key = f"input_hash:{json.dumps(body, sort_keys=True)}"
 
     if cache_key in _cache:
-        print("[SUMMARIZE] ⚡ Already processed — returning cached result (idempotent re-dispatch)")
+        print(f"[SUMMARIZE] ⚡ Already processed {cache_key} — returning cached result (idempotent re-dispatch)")
         sys.stdout.flush()
         return jsonify(_cache[cache_key])
 

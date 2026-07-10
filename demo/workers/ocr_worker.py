@@ -2,12 +2,18 @@
 OCR Worker — sync, port 5001.
 
 Receives POST /run from StateFlow (sync transport).
-Body: {"workflow_input": {...}, "history": [...]}
+Body: {"workflow_input": {...}, "history": [...]}  (the bare `input` the
+planner decided — sync's zero-modification promise, whitepaper §13.1)
+Headers: X-StateFlow-Step-ID, X-StateFlow-Attempt-ID
 Returns: full JSON response body (stored as step output).
 
-Idempotency: caches the result keyed on the full input JSON.
-If StateFlow re-dispatches this step (e.g., crash during sync-hold),
-the worker returns the cached result without re-running the 2s sleep.
+Idempotency (whitepaper §13.1, §15, User Manual §2.3): keys primarily on the
+X-StateFlow-Step-ID header — constant across every retry/re-dispatch of this
+step, so it is a precise idempotency key with none of the "input must be
+byte-identical / no non-deterministic fields" caveats a content hash carries.
+Falls back to hashing the input body only if the header is absent (e.g. a
+caller that isn't StateFlow, or an older client) — demonstrating the manual's
+documented fallback path, not the primary recommendation.
 """
 
 import json
@@ -19,20 +25,24 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 app.logger.disabled = True
 
-# In-memory idempotency cache: input_hash -> result
-# The static planner sends (workflow_input + history) as the step input.
-# For a given step position, the input is always identical on re-dispatch,
-# so the JSON hash is a reliable idempotency key.
+# In-memory idempotency cache: cache_key -> result.
+# Primary key: the X-StateFlow-Step-ID header (constant across retries).
+# Fallback key: a hash of the full input JSON, used only when the header is
+# absent — reliable only as long as the input has no non-deterministic fields.
 _cache: dict = {}
 
 
 @app.route("/run", methods=["POST"])
 def run():
     body = request.get_json(force=True)
-    cache_key = json.dumps(body, sort_keys=True)
+    step_id = request.headers.get("X-StateFlow-Step-ID")
+    if step_id:
+        cache_key = f"step_id:{step_id}"
+    else:
+        cache_key = f"input_hash:{json.dumps(body, sort_keys=True)}"
 
     if cache_key in _cache:
-        print("[OCR] ⚡ Already processed this input — returning cached result (idempotent re-dispatch)")
+        print(f"[OCR] ⚡ Already processed {cache_key} — returning cached result (idempotent re-dispatch)")
         sys.stdout.flush()
         return jsonify(_cache[cache_key])
 

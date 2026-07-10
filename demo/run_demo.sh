@@ -222,7 +222,7 @@ poll_status() {
         local resp status
         resp=$(curl -sf "$SF_URL/runs/$run_id" 2>/dev/null) || { sleep 1; continue; }
         status=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" 2>/dev/null) || { sleep 1; continue; }
-        if [[ "$status" == "DONE" || "$status" == "FAILED" ]]; then
+        if [[ "$status" == "DONE" || "$status" == "DLQ" ]]; then
             echo "$resp"
             return 0
         fi
@@ -266,8 +266,8 @@ nc = '\033[0m'
 bold = '\033[1m'
 print(f'   Status: {color}{bold}{status}{nc}')
 for s in d.get('steps', []):
-    icon = '✓' if s['status'] == 'DONE' else ('✗' if s['status'] in ('FAILED','DLQ') else '●')
-    c = '\033[0;32m' if s['status'] == 'DONE' else ('\033[0;31m' if s['status'] in ('FAILED','DLQ') else '\033[1;33m')
+    icon = '✓' if s['status'] == 'DONE' else ('✗' if s['status'] == 'DLQ' else '●')
+    c = '\033[0;32m' if s['status'] == 'DONE' else ('\033[0;31m' if s['status'] == 'DLQ' else '\033[1;33m')
     print(f'   {c}[{s[\"status\"]:8}] {icon} {s[\"step_name\"]}{nc}')
 "
     echo
@@ -295,6 +295,41 @@ else:
 get_dlq_entry_id() {
     curl -sf "$SF_URL/dlq" 2>/dev/null | \
         python3 -c "import json,sys; d=json.load(sys.stdin); e=d.get('entries',[]); print(e[0]['id'] if e else '')"
+}
+
+# check_dlq_worker_retry_exhausted <run_id> — asserts the DLQ entry for
+# run_id has reason=worker_retry_exhausted (whitepaper §7.1/§11) and that its
+# context carries the per-attempt failure reasons (worker_reported / timeout /
+# malformed / orphaned) that led to exhausting the retry budget. Exits 1 on
+# any check failure.
+check_dlq_worker_retry_exhausted() {
+    local run_id=$1
+    local resp
+    resp=$(curl -sf "$SF_URL/dlq" 2>/dev/null) || { error "FAIL — could not fetch DLQ"; return 1; }
+    echo "$resp" | python3 -c "
+import json, sys
+run_id = '$run_id'
+d = json.load(sys.stdin)
+entries = [e for e in d.get('entries', []) if e.get('run_id') == run_id]
+if not entries:
+    print('FAIL — no DLQ entry found for run_id=' + run_id)
+    sys.exit(1)
+e = entries[0]
+if e.get('reason') != 'worker_retry_exhausted':
+    print(f\"FAIL — DLQ reason = {e.get('reason')!r}, want 'worker_retry_exhausted'\")
+    sys.exit(1)
+ctx = e.get('context')
+if isinstance(ctx, str):
+    ctx = json.loads(ctx) if ctx else {}
+ctx_str = json.dumps(ctx)
+known_reasons = ('worker_reported', 'timeout', 'malformed', 'orphaned')
+if not any(r in ctx_str for r in known_reasons):
+    print(f'FAIL — DLQ context has no per-attempt failure reason (context={ctx_str})')
+    sys.exit(1)
+found = [r for r in known_reasons if r in ctx_str]
+print(f'OK — DLQ reason=worker_retry_exhausted, context carries per-attempt reason(s): {found}')
+" || return 1
+    return 0
 }
 
 replay_dlq() {
@@ -395,6 +430,16 @@ scenario_worker_crash_llm() {
         return 1
     fi
     success "DLQ entry found: id=${dlq_id}"
+
+    info "Checking DLQ reason and per-attempt context..."
+    local dlq_check_output dlq_check_status
+    dlq_check_output=$(check_dlq_worker_retry_exhausted "$run_id"); dlq_check_status=$?
+    if [[ $dlq_check_status -ne 0 ]]; then
+        error "$dlq_check_output"
+        stop_orchestrator; stop_worker step1; stop_llm_adapter; reset_db
+        return 1
+    fi
+    success "$dlq_check_output"
 
     local step1_calls
     step1_calls=$(count_worker_calls step1)

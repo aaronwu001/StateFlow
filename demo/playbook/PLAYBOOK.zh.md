@@ -146,12 +146,14 @@ echo "run_id: $RUN_ID"
 
 ## 查看進度
 
-**Step2 retry 歷史：**
+**Step2 retry 歷史**（沒有 `attempt_number` 這個欄位——attempt 依 `created_at`
+排序，這是 attempt 列在 TX1/TX4 insert 時、**dispatch 之前**就寫入的時間戳；
+`failure_reason` 是 `worker_reported`/`timeout`/`malformed`/`orphaned` 四者之一）：
 ```bash
 dc exec -T postgres psql -U stateflow -d stateflow \
-  -c "SELECT s.step_name, a.attempt_number, a.status
+  -c "SELECT s.step_name, a.status, a.failure_reason, a.created_at
       FROM attempts a JOIN steps s ON a.step_id = s.step_id
-      ORDER BY a.dispatched_at;"
+      ORDER BY a.created_at;"
 ```
 
 **確認進 DLQ：**
@@ -222,7 +224,8 @@ RUN_ID=$(curl -s -X POST "http://localhost:8080/workflows/$WORKFLOW_ID/runs" \
 echo "run_id: $RUN_ID"
 ```
 
-等 **LOGS tab** 看到第一次 Planner called（step1 已被 DECIDED 並 dispatch），然後：
+等 **LOGS tab** 看到第一次 Planner called（step1 的決策已寫入資料庫——TX1，
+Barrier 1——並且已 dispatch），然後：
 
 **CMD tab：kill orchestrator container**
 ```bash

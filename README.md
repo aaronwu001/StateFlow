@@ -160,9 +160,8 @@ Total runtime: ~20 seconds.
 
 ## Docs
 
-- [User Manual](docs/USER_MANUAL.md) — LLM prompt template, idempotency contract
-- [Design](DESIGN.md) — schema, API contract, component interfaces
-- [Whitepaper](docs/StateFlow_Whitepaper_v0.8.md) — architectural rationale
+- [User Manual](docs/USER_MANUAL.md) — LLM prompt template, idempotency contract, DLQ triage
+- [Whitepaper](docs/StateFlow_Whitepaper_v1_0.md) — architecture, schema, API contract, and design rationale
 
 ---
 
@@ -173,11 +172,11 @@ MVP (Phase 1) — all core invariants implemented and tested:
 - [x] Postgres-backed frontier store (5 tables)
 - [x] Sync and async dispatch
 - [x] Two write barriers enforced
-- [x] Three recovery rules on restart
+- [x] Combination-table recovery with orphan-claim + budget check on restart
 - [x] Static planner
 - [x] HTTP/LLM planner (with retry + validation)
 - [x] Attempt dedup guard
 - [x] Crash-recovery demo
 
-Phase 2 (planned): async timeout sweeper, Ghost Mode retry, full `response_mapping`,
+Phase 2 (planned): in-process orphan sweeper, LLM-aware rate limiting, full `response_mapping`,
 DAG fan-in, replicated orchestrator.

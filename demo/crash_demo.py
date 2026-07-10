@@ -268,6 +268,37 @@ def step_running(data: dict, name: str) -> bool:
         for s in data.get("steps", [])
     )
 
+# ── Postgres verification helpers (whitepaper §8.3 orphan-claim proof) ─────────
+# crash_demo.py proves recovery not just by watching the run reach DONE, but by
+# reading the DB directly for the invariants the whitepaper actually promises:
+# exactly one orphaned attempt on the mid-flight step, and the step's Barrier-1
+# decision (created_at + decision JSONB) unchanged across the crash — which is
+# the direct proof the planner was asked exactly once for that step (recovery's
+# "last_step=running" branch never re-asks the planner; it orphan-claims and
+# re-dispatches the persisted decision, whitepaper §8.3).
+
+def psql(sql: str) -> list:
+    """Run a SQL query via `docker compose exec postgres psql`, return non-empty
+    tab-separated rows (no header, no footer)."""
+    r = compose("exec", "-T", "postgres", "psql", "-U", DB_USER, "-d", DB_NAME,
+                "-t", "-A", "-F", "\t", "-c", sql)
+    return [ln for ln in r.stdout.strip().splitlines() if ln.strip() != ""]
+
+def psql_row(sql: str):
+    rows = psql(sql)
+    return rows[0].split("\t") if rows else None
+
+def psql_scalar(sql: str):
+    rows = psql(sql)
+    return rows[0].strip() if rows else None
+
+def count_log_lines(service: str, needle: str) -> int:
+    """Count occurrences of an ASCII-only `needle` across `service`'s full
+    compose logs (a fresh, non-streaming call — independent of the live
+    `--tail 0` log_stream Popen, which only writes to this terminal)."""
+    r = compose("logs", "--no-log-prefix", service, check=False)
+    return r.stdout.count(needle)
+
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
 def cleanup():
@@ -311,6 +342,20 @@ def main():
     poll_until(run_id, lambda d: step_running(d, "ner"), timeout=15)
     info("NER dispatched — it is sleeping 5s before sending its callback")
 
+    # Capture NER's Barrier-1 record (created_at + decision) BEFORE the kill.
+    # Recovery's "last_step=running" path (whitepaper §8.3) must never touch
+    # this row's created_at/decision — only orphan-claim the attempt and
+    # dispatch a NEW attempt. If either field differs after recovery, the step
+    # row was re-created, which would mean the planner was re-asked for "ner".
+    pre_ner = psql_row(
+        f"SELECT created_at, decision FROM steps "
+        f"WHERE run_id='{run_id}' AND step_name='ner'"
+    )
+    if not pre_ner:
+        _p("ERROR: could not read pre-crash NER step row from Postgres")
+        sys.exit(1)
+    pre_ner_created_at, pre_ner_decision = pre_ner[0], pre_ner[1]
+
     # 6. Kill orchestrator while NER is mid-flight
     time.sleep(1.0)   # brief pause to let the dispatch POST reach the NER worker
     cid = kill_stateflow()
@@ -339,7 +384,50 @@ def main():
     info("Polling until run completes...")
     data = poll_until(run_id, lambda d: d.get("status") != "RUNNING", timeout=30)
 
-    # 10. Results
+    # 10. Verify the orphan-claim path (whitepaper §8.3), the idempotency-cache
+    #     absorption of the re-dispatch, and the planner-asked-at-most-once
+    #     guarantee (Barrier 1) — DB/log assertions, not just a visual proof.
+    section("VERIFY", "Orphan claim, idempotency-cache absorption, planner-asked-once")
+
+    orphaned_count = psql_scalar(
+        f"SELECT count(*) FROM attempts a JOIN steps s ON a.step_id = s.step_id "
+        f"WHERE s.run_id='{run_id}' AND s.step_name='ner' "
+        f"AND a.status='FAILED' AND a.failure_reason='orphaned'"
+    )
+    if orphaned_count != "1":
+        _p(f"  ❌ FAIL — expected exactly 1 orphaned attempt for step 'ner', got {orphaned_count!r}")
+        sys.exit(1)
+    ok("NER step's attempt history shows exactly ONE attempt with failure_reason='orphaned' "
+       "(recovery claimed the crash-killed attempt, per the combination table's "
+       "run=RUNNING/last_step=RUNNING row)")
+
+    post_ner = psql_row(
+        f"SELECT created_at, decision FROM steps "
+        f"WHERE run_id='{run_id}' AND step_name='ner'"
+    )
+    if post_ner is None:
+        _p("  ❌ FAIL — NER step row vanished after restart")
+        sys.exit(1)
+    if post_ner[0] != pre_ner_created_at or post_ner[1] != pre_ner_decision:
+        _p("  ❌ FAIL — NER step's created_at/decision changed across the crash — "
+           "the step row was re-created, meaning the planner was asked again for 'ner'")
+        _p(f"       before: created_at={pre_ner_created_at!r} decision={pre_ner_decision!r}")
+        _p(f"       after:  created_at={post_ner[0]!r} decision={post_ner[1]!r}")
+        sys.exit(1)
+    ok("NER step's Barrier-1 record (created_at + decision) is byte-identical before and "
+       "after the crash — the planner was asked for 'ner' exactly once, never re-asked on recovery")
+
+    extraction_starts = count_log_lines("ner-worker", "Starting entity extraction")
+    if extraction_starts != 1:
+        _p(f"  ❌ FAIL — expected NER's actual extraction work to run exactly once, "
+           f"saw {extraction_starts} 'Starting entity extraction' log lines "
+           f"(idempotency cache did not absorb the crash re-dispatch)")
+        sys.exit(1)
+    ok("NER worker's actual extraction work ran exactly ONCE — the post-recovery re-dispatch "
+       "hit the worker's step_id-keyed idempotency cache instead of re-processing "
+       "(no duplicate side effect)")
+
+    # 11. Results
     banner("DEMO COMPLETE")
     status = data.get("status")
     steps  = data.get("steps", [])

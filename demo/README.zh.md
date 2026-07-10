@@ -95,6 +95,11 @@ python demo/crash_demo.py
 - NER 使用 **async** 模式（202 + callback），展示更複雜的 recovery 情境
 - Worker 有 **idempotency cache**——re-dispatch 時直接回傳 cache 結果
 - 印出 `PROOF MARKERS` log，清楚標示哪些 worker log 在 crash 前後各出現幾次
+- Recovery 完成後，腳本直接查詢 Postgres 並斷言：NER step 的 attempt 歷史中
+  恰好有一筆 `failure_reason='orphaned'`（recovery 的 orphan-claim，見
+  whitepaper §8.3）；NER step 的 `created_at`/`decision` 在 crash 前後完全一致
+  （代表 planner 對這個 step 只被詢問過一次）；NER worker 的 log 顯示它的實際
+  抽取工作只執行了一次（idempotency cache 吸收了 re-dispatch）
 
 **輸出範例：**
 ```

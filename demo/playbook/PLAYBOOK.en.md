@@ -148,12 +148,15 @@ echo "run_id: $RUN_ID"
 
 ## Observe Retries
 
-**Check retry history:**
+**Check retry history** (no `attempt_number` column — attempts are ordered by
+`created_at`, the timestamp assigned when the attempt row is inserted at TX1/TX4,
+*before* dispatch; `failure_reason` is one of `worker_reported`/`timeout`/
+`malformed`/`orphaned`):
 ```bash
 dc exec -T postgres psql -U stateflow -d stateflow \
-  -c "SELECT s.step_name, a.attempt_number, a.status
+  -c "SELECT s.step_name, a.status, a.failure_reason, a.created_at
       FROM attempts a JOIN steps s ON a.step_id = s.step_id
-      ORDER BY a.dispatched_at;"
+      ORDER BY a.created_at;"
 ```
 
 **Confirm DLQ entry:**
@@ -224,7 +227,7 @@ RUN_ID=$(curl -s -X POST "http://localhost:8080/workflows/$WORKFLOW_ID/runs" \
 echo "run_id: $RUN_ID"
 ```
 
-Wait for the **LOGS tab** to show the first `Planner called` log (step1 has been DECIDED and dispatched). Then:
+Wait for the **LOGS tab** to show the first `Planner called` log (step1's decision has been persisted — TX1, Barrier 1 — and dispatched). Then:
 
 **CMD tab: kill the orchestrator container**
 ```bash

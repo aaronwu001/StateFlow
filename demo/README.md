@@ -96,6 +96,12 @@ python demo/crash_demo.py
 - NER uses **async** mode (202 + callback), demonstrating more complex recovery
 - Workers have **idempotency caches** — on re-dispatch, the cached result is returned immediately
 - Prints a `PROOF MARKERS` log showing exactly which worker logs appeared before vs. after the crash
+- After recovery, the script queries Postgres directly and asserts: the NER step
+  has exactly one attempt with `failure_reason='orphaned'` (recovery's orphan-claim,
+  whitepaper §8.3); the NER step's `created_at`/`decision` are byte-identical
+  before and after the crash (the planner was asked for that step exactly once);
+  and NER's worker logs show its actual extraction ran exactly once (the
+  idempotency cache absorbed the re-dispatch)
 
 **Sample output:**
 ```
