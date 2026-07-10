@@ -1,7 +1,7 @@
 // Command stateflow is the StateFlow server entry point.
 // It wires all components, runs crash recovery, then starts the HTTP server.
 //
-// Startup order (DESIGN.md §9.3):
+// Startup order (whitepaper §5, §8.3):
 //  1. Open Postgres connection.
 //  2. Run RecoverRuns — resumes any RUNNING runs from before a crash.
 //  3. Start HTTP server — begins accepting new runs.
@@ -11,7 +11,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,7 +20,6 @@ import (
 	"github.com/aaronwu000/stateflow/internal/api"
 	"github.com/aaronwu000/stateflow/internal/core"
 	"github.com/aaronwu000/stateflow/internal/orchestrator"
-	"github.com/aaronwu000/stateflow/internal/planner"
 	"github.com/aaronwu000/stateflow/internal/store"
 	"github.com/aaronwu000/stateflow/internal/transport"
 )
@@ -47,35 +45,32 @@ func main() {
 
 	s := store.New(db)
 	syncT := transport.NewSyncTransport()
-	asyncT := transport.NewAsyncTransport()
+	asyncT := transport.NewAsyncTransport(s)
 	routedT := &transport.MultiTransport{Sync: syncT, Async: asyncT}
 	retry := orchestrator.DefaultRetryPolicy()
 
-	// buildLoop constructs a fully configured Loop for the given run.
-	buildLoop := func(runID core.RunID, workflowInput json.RawMessage, plannerType string, plannerConfig json.RawMessage) (*orchestrator.Loop, error) {
-		p, err := buildPlanner(plannerType, plannerConfig)
-		if err != nil {
-			return nil, err
-		}
+	// buildLoop constructs a Loop for the given run. It cannot fail: unlike
+	// the pre-Session-5 shape, the planner is NOT built here — Loop.Run
+	// reconstructs it lazily from the workflow row on every call (whitepaper
+	// §12.1), so buildLoop itself is pure wiring. Its signature matches
+	// orchestrator.RecoverRuns's makeLoop parameter exactly, so it is passed
+	// to RecoverRuns directly below.
+	buildLoop := func(runID core.RunID, workflowID core.WorkflowID, workflowInput json.RawMessage) *orchestrator.Loop {
 		return &orchestrator.Loop{
 			RunID:         runID,
+			WorkflowID:    workflowID,
 			WorkflowInput: workflowInput,
 			Store:         s,
-			Planner:       p,
 			Transport:     routedT,
 			Retry:         retry,
-		}, nil
+		}
 	}
 
-	// startLoop is injected into the API server. It builds the loop and starts
-	// a goroutine. Errors (e.g., unknown planner_type) are logged but not fatal
-	// to the server; the run will stay RUNNING until recovery or operator action.
-	startLoop := func(loopCtx context.Context, runID core.RunID, workflowInput json.RawMessage, plannerType string, plannerConfig json.RawMessage) {
-		l, err := buildLoop(runID, workflowInput, plannerType, plannerConfig)
-		if err != nil {
-			slog.Error("startLoop: build loop", "run_id", string(runID), "err", err)
-			return
-		}
+	// startLoop is injected into the API server. It builds the loop and
+	// starts a goroutine for it. The server calls this both for a
+	// newly-started run and for a DLQ replay (Session 6).
+	startLoop := func(loopCtx context.Context, runID core.RunID, workflowID core.WorkflowID, workflowInput json.RawMessage) {
+		l := buildLoop(runID, workflowID, workflowInput)
 		go func() {
 			slog.Info("loop: starting", "run_id", string(runID))
 			if err := l.Run(loopCtx); err != nil {
@@ -87,25 +82,7 @@ func main() {
 	}
 
 	// Step 1: Crash recovery — resume RUNNING runs before accepting new requests.
-	n, err := orchestrator.RecoverRuns(ctx, s, func(runID core.RunID, workflowInput json.RawMessage) *orchestrator.Loop {
-		// Look up the workflow config for this run.
-		var plannerType string
-		var plannerConfig json.RawMessage
-		if err := db.QueryRowContext(ctx, `
-			SELECT w.planner_type, w.planner_config
-			FROM runs r JOIN workflows w ON r.workflow_id = w.workflow_id
-			WHERE r.run_id = $1
-		`, string(runID)).Scan(&plannerType, &plannerConfig); err != nil {
-			slog.Error("recovery: get workflow", "run_id", string(runID), "err", err)
-			return nil
-		}
-		l, err := buildLoop(runID, workflowInput, plannerType, plannerConfig)
-		if err != nil {
-			slog.Error("recovery: build loop", "run_id", string(runID), "err", err)
-			return nil
-		}
-		return l
-	})
+	n, err := orchestrator.RecoverRuns(ctx, s, buildLoop)
 	if err != nil {
 		slog.Error("recovery failed", "err", err)
 		os.Exit(1)
@@ -113,7 +90,7 @@ func main() {
 	slog.Info("recovery complete", "resumed", n)
 
 	// Step 2: Start HTTP server.
-	srv := api.New(db, asyncT, ctx, startLoop)
+	srv := api.New(db, s, asyncT, ctx, startLoop)
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
@@ -123,19 +100,5 @@ func main() {
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		slog.Error("HTTP server", "err", err)
 		os.Exit(1)
-	}
-}
-
-// buildPlanner instantiates the correct NextStepPlanner implementation.
-func buildPlanner(plannerType string, plannerConfig json.RawMessage) (core.NextStepPlanner, error) {
-	switch plannerType {
-	case "static":
-		// NewStaticPlanner accepts YAML; yaml.v3 also parses JSON, so the JSONB
-		// bytes from Postgres work directly.
-		return planner.NewStaticPlanner(plannerConfig)
-	case "http":
-		return planner.NewHTTPPlanner(plannerConfig)
-	default:
-		return nil, fmt.Errorf("unsupported planner_type %q", plannerType)
 	}
 }

@@ -1,18 +1,16 @@
 // Package api implements the StateFlow HTTP API server.
-// Authoritative: whitepaper §6.6 (endpoint list + callback bodies),
-// DESIGN.md §6 (MVP HTTP API table), §5 (Async Transport ↔ API Server Wiring),
-// CLAUDE.md "Async Dispatch — Barrier 2 Lives in the Loop, Not the Handler".
+// Authoritative: docs/StateFlow_Whitepaper_v1_0.md §11 (DLQ and replay), §13
+// (worker contract, dispatch/reporting formats), §19 (Atomic Transaction
+// Ledger — TX-W, TX0, TX5, TX6 are driven from this package).
 package api
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"encoding/json"
-	"fmt"
-	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aaronwu000/stateflow/internal/core"
@@ -21,29 +19,44 @@ import (
 
 // Server is the StateFlow HTTP API server.
 //
-// It holds a reference to the async transport so it can route async worker
-// callbacks to the waiting Dispatch goroutine (DESIGN.md §5). It never writes
-// step state itself — that is always the loop's responsibility (CLAUDE.md:
-// "Barrier 2 lives in the loop, not the handler").
+// It holds both a raw *sql.DB (for read-only projections whose shape is
+// specific to this API — GET /runs needs seq/attempt_count/created_at/
+// per-attempt error detail that core.RunSummary/StepSummary/AttemptSummary
+// do not carry; see the Session 6 report §5/§6 for why those types were not
+// extended) and a core.StateStore (for every write that maps onto an Atomic
+// Transaction Ledger entry: TX-W, TX0, TX5, TX6). Every TX-ledger write goes
+// through the store interface — which is what actually enforces
+// single-transaction atomicity (whitepaper §19/§20) — never through raw SQL.
 //
-// startLoop is a factory provided by main.go. It builds the planner, creates
-// the Loop, and starts go loop.Run(ctx). The server calls it when a new run
-// is created and when a DLQ entry is replayed.
+// It also never writes step/run state from a callback handler: the handler
+// validates the report is well-formed, hands it to the async transport, and
+// returns 200 — nothing more (whitepaper §10.4, the single-writer
+// principle). All step/run state writes happen inside the loop goroutine.
+//
+// startLoop is a factory provided by main.go (and, in tests, by the test's
+// own wiring). It builds the Loop for a run — from RunID/WorkflowID/
+// WorkflowInput alone, since Loop.Run reconstructs the planner from the
+// workflow row itself (whitepaper §12.1) — and starts `go loop.Run(ctx)`.
+// The server calls it when a new run is created and when a DLQ entry is
+// replayed (both TX5 and TX6 branches re-enter the SAME generic loop entry
+// point; see handleDLQReplay's doc comment for the worker-side nuance).
 type Server struct {
 	db        *sql.DB
+	store     core.StateStore
 	async     *transport.AsyncTransport
 	ctx       context.Context // parent context for all loop goroutines
-	startLoop func(ctx context.Context, runID core.RunID, workflowInput json.RawMessage, plannerType string, plannerConfig json.RawMessage)
+	startLoop func(ctx context.Context, runID core.RunID, workflowID core.WorkflowID, workflowInput json.RawMessage)
 }
 
 // New returns a Server ready to serve HTTP.
 func New(
 	db *sql.DB,
+	store core.StateStore,
 	async *transport.AsyncTransport,
 	ctx context.Context,
-	startLoop func(context.Context, core.RunID, json.RawMessage, string, json.RawMessage),
+	startLoop func(context.Context, core.RunID, core.WorkflowID, json.RawMessage),
 ) *Server {
-	return &Server{db: db, async: async, ctx: ctx, startLoop: startLoop}
+	return &Server{db: db, store: store, async: async, ctx: ctx, startLoop: startLoop}
 }
 
 // Handler returns the HTTP mux with all routes registered.
@@ -60,14 +73,13 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// ── POST /workflows ───────────────────────────────────────────────────────
+// ── POST /workflows (Ledger TX-W) ─────────────────────────────────────────
 
 func (s *Server) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		WorkflowID    string          `json:"workflow_id"`    // optional; auto-generated if absent
 		Name          string          `json:"name"`
 		PlannerType   string          `json:"planner_type"`
-		PlannerConfig json.RawMessage `json:"planner_config"` // JSON stored as JSONB
+		PlannerConfig json.RawMessage `json:"planner_config"` // JSON stored as JSONB; retry_limit/default_timeout_seconds live inside this object (core.WorkflowDef doc comment)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -84,25 +96,24 @@ func (s *Server) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	if len(req.PlannerConfig) == 0 || string(req.PlannerConfig) == "null" {
 		req.PlannerConfig = json.RawMessage(`{}`)
 	}
-	if req.WorkflowID == "" {
-		req.WorkflowID = "wf-" + newUUID()
-	}
 
-	if _, err := s.db.ExecContext(r.Context(), `
-		INSERT INTO workflows (workflow_id, name, planner_type, planner_config)
-		VALUES ($1, $2, $3, $4::jsonb)
-	`, req.WorkflowID, req.Name, req.PlannerType, string(req.PlannerConfig)); err != nil {
+	workflowID, err := s.store.CreateWorkflow(r.Context(), core.WorkflowDef{
+		Name:          req.Name,
+		PlannerType:   req.PlannerType,
+		PlannerConfig: req.PlannerConfig,
+	})
+	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, "store workflow: "+err.Error())
 		return
 	}
 
-	jsonResp(w, http.StatusCreated, map[string]string{"workflow_id": req.WorkflowID})
+	jsonResp(w, http.StatusCreated, map[string]string{"workflow_id": string(workflowID)})
 }
 
-// ── POST /workflows/:workflow_id/runs ────────────────────────────────────
+// ── POST /workflows/:workflow_id/runs (Ledger TX0) ────────────────────────
 
 func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
-	workflowID := r.PathValue("workflow_id")
+	workflowID := core.WorkflowID(r.PathValue("workflow_id"))
 
 	var req struct {
 		WorkflowInput json.RawMessage `json:"workflow_input"`
@@ -115,39 +126,44 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 		req.WorkflowInput = json.RawMessage(`{}`)
 	}
 
-	// Look up workflow to get planner config.
-	var plannerType string
-	var plannerConfig json.RawMessage
-	err := s.db.QueryRowContext(r.Context(), `
-		SELECT planner_type, planner_config FROM workflows WHERE workflow_id = $1
-	`, workflowID).Scan(&plannerType, &plannerConfig)
-	if err == sql.ErrNoRows {
-		jsonErr(w, http.StatusNotFound, "workflow not found")
-		return
-	} else if err != nil {
-		jsonErr(w, http.StatusInternalServerError, "get workflow: "+err.Error())
+	if _, err := s.store.GetWorkflow(r.Context(), workflowID); err != nil {
+		if isNotFoundErr(err) {
+			jsonErr(w, http.StatusNotFound, "workflow not found")
+		} else {
+			jsonErr(w, http.StatusInternalServerError, "get workflow: "+err.Error())
+		}
 		return
 	}
 
-	runID := "run-" + newUUID()
-	if _, err := s.db.ExecContext(r.Context(), `
-		INSERT INTO runs (run_id, workflow_id, status, workflow_input)
-		VALUES ($1, $2, 'RUNNING', $3::jsonb)
-	`, runID, workflowID, string(req.WorkflowInput)); err != nil {
+	runID, err := s.store.CreateRun(r.Context(), workflowID, req.WorkflowInput)
+	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, "create run: "+err.Error())
 		return
 	}
 
-	s.startLoop(s.ctx, core.RunID(runID), req.WorkflowInput, plannerType, plannerConfig)
+	s.startLoop(s.ctx, runID, workflowID, req.WorkflowInput)
 
-	jsonResp(w, http.StatusAccepted, map[string]string{"run_id": runID})
+	jsonResp(w, http.StatusAccepted, map[string]string{"run_id": string(runID)})
 }
 
-// ── GET /runs/:run_id ────────────────────────────────────────────────────
+// ── GET /runs/:run_id ──────────────────────────────────────────────────────
 //
-// This is the "presentation read" (DESIGN.md §9.4). It returns ALL steps with
-// their current statuses — NOT LoadFrontier, which is the execution read.
-
+// The presentation read. Session 6 redesign (whitepaper §14.1 column names):
+// run status/created_at/updated_at; per-step status/seq/attempt_count/
+// created_at/completed_at plus a "current_attempt" summary (the step's most
+// recent attempt — reason/error populated only when that attempt is
+// FAILED); dlq_reason (most recent dead_letter_queue row for the run) when
+// and only when run.status == DLQ. The renamed `created_at` column
+// (whitepaper §14.1: "renamed from decided_at") is surfaced under its new
+// name; `decided_at` never appears on the wire.
+//
+// This bypasses core.StateStore.GetRun/RunSummary: RunSummary/StepSummary/
+// AttemptSummary (internal/core/interfaces.go, frozen — out of this
+// session's scope) do not carry seq, attempt_count, or any timestamp, all of
+// which this endpoint's redesigned shape requires. See the Session 6 report
+// §5/§6 for the full inconsistency note and the recommended fix (extend
+// those types in a future session so this handler can use the store
+// abstraction instead of raw SQL).
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
 
@@ -166,70 +182,132 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := s.db.QueryContext(r.Context(), `
-		SELECT step_name, seq, status, output, decided_at, completed_at
+		SELECT step_id, step_name, seq, status, attempt_count, output, created_at, completed_at
 		FROM steps WHERE run_id = $1 ORDER BY seq
 	`, runID)
 	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, "get steps: "+err.Error())
 		return
 	}
-	defer rows.Close()
 
+	type currentAttemptView struct {
+		AttemptID string  `json:"attempt_id"`
+		Status    string  `json:"status"`
+		Reason    *string `json:"reason,omitempty"`
+		Error     *string `json:"error,omitempty"`
+	}
 	type stepView struct {
-		StepName    string          `json:"step_name"`
-		Seq         int             `json:"seq"`
-		Status      string          `json:"status"`
-		Output      json.RawMessage `json:"output,omitempty"`
-		DecidedAt   *time.Time      `json:"decided_at,omitempty"`
-		CompletedAt *time.Time      `json:"completed_at,omitempty"`
+		StepID         string              `json:"step_id"`
+		StepName       string              `json:"step_name"`
+		Seq            int                 `json:"seq"`
+		Status         string              `json:"status"`
+		AttemptCount   int                 `json:"attempt_count"`
+		Output         json.RawMessage     `json:"output,omitempty"`
+		CreatedAt      time.Time           `json:"created_at"`
+		CompletedAt    *time.Time          `json:"completed_at,omitempty"`
+		CurrentAttempt *currentAttemptView `json:"current_attempt,omitempty"`
 	}
 
 	steps := make([]stepView, 0)
+	var stepIDs []string
 	for rows.Next() {
 		var sv stepView
 		var output []byte
-		var decidedAt, completedAt sql.NullTime
-		if err := rows.Scan(&sv.StepName, &sv.Seq, &sv.Status, &output, &decidedAt, &completedAt); err != nil {
+		var completedAt sql.NullTime
+		if err := rows.Scan(&sv.StepID, &sv.StepName, &sv.Seq, &sv.Status, &sv.AttemptCount, &output, &sv.CreatedAt, &completedAt); err != nil {
+			rows.Close()
 			jsonErr(w, http.StatusInternalServerError, "scan step: "+err.Error())
 			return
 		}
 		if output != nil {
 			sv.Output = json.RawMessage(output)
 		}
-		if decidedAt.Valid {
-			sv.DecidedAt = &decidedAt.Time
-		}
 		if completedAt.Valid {
 			sv.CompletedAt = &completedAt.Time
 		}
 		steps = append(steps, sv)
+		stepIDs = append(stepIDs, sv.StepID)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		jsonErr(w, http.StatusInternalServerError, "steps iteration: "+err.Error())
 		return
 	}
+	rows.Close()
 
-	jsonResp(w, http.StatusOK, map[string]any{
+	// One extra query per step for its most recent attempt. N+1, acceptable
+	// at MVP scale (a run's step count is small); not worth a JOIN/LATERAL
+	// rewrite for this session's scope.
+	for i, stepID := range stepIDs {
+		var av currentAttemptView
+		var reason, attErr sql.NullString
+		err := s.db.QueryRowContext(r.Context(), `
+			SELECT attempt_id::text, status, failure_reason, error
+			FROM attempts WHERE step_id = $1
+			ORDER BY created_at DESC LIMIT 1
+		`, stepID).Scan(&av.AttemptID, &av.Status, &reason, &attErr)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			jsonErr(w, http.StatusInternalServerError, "get current attempt: "+err.Error())
+			return
+		}
+		if reason.Valid {
+			av.Reason = &reason.String
+		}
+		if attErr.Valid {
+			av.Error = &attErr.String
+		}
+		steps[i].CurrentAttempt = &av
+	}
+
+	resp := map[string]any{
 		"run_id":         runID,
 		"status":         status,
 		"workflow_input": workflowInput,
 		"created_at":     createdAt,
 		"updated_at":     updatedAt,
 		"steps":          steps,
-	})
+	}
+
+	if status == string(core.RunStatusDLQ) {
+		var dlqReason string
+		err := s.db.QueryRowContext(r.Context(), `
+			SELECT reason FROM dead_letter_queue WHERE run_id = $1 ORDER BY created_at DESC LIMIT 1
+		`, runID).Scan(&dlqReason)
+		if err != nil && err != sql.ErrNoRows {
+			jsonErr(w, http.StatusInternalServerError, "get dlq reason: "+err.Error())
+			return
+		}
+		if err == nil {
+			resp["dlq_reason"] = dlqReason
+		}
+	}
+
+	jsonResp(w, http.StatusOK, resp)
 }
 
 // ── POST /tasks/complete ─────────────────────────────────────────────────
 //
-// Async worker reports success. Handler discipline (CLAUDE.md):
-//  1. Validate attempt_id == current_attempt_id (reads DB).
-//  2. Push result into the in-process channel (DeliverCallback).
-//  3. Return 200.
+// Async worker reports success. Handler discipline (whitepaper §10.4):
+//  1. Validate the report is well-formed (ids present).
+//  2. Hand it to the async transport's DeliverCallback, which itself
+//     validates against the live current_attempt_id (a store read) before
+//     routing it to the waiting Dispatch goroutine — see
+//     internal/transport/async.go's DeliverCallback doc comment for the two
+//     independent no-op paths it already covers (unregistered step,
+//     superseded attempt_id).
+//  3. Return 200 unconditionally.
 //
-// This handler NEVER writes step state. Barrier 2 is the loop's responsibility.
-// A superseded (stale) attempt_id → 200 but no action (dedup guard for
-// at-least-once delivery).
-
+// This handler NEVER writes step state — Barrier 2 is always the loop's
+// responsibility. step_id/attempt_id absent from the body ⇒ 400, zero
+// effect (whitepaper §7.1: "an async callback missing valid step_id/
+// attempt_id gets a 400 and has zero effect"). A syntactically valid but
+// stale/unknown pair is NOT rejected here — the transport's own read-time
+// check silently absorbs it as a no-op, so the response is 200 either way,
+// matching "late, duplicate, or superseded reports are ACKed with 200 and
+// have zero state effect" (whitepaper §10).
 func (s *Server) handleTaskComplete(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		StepID    string          `json:"step_id"`
@@ -240,79 +318,47 @@ func (s *Server) handleTaskComplete(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-
-	if !s.validateAttempt(w, r, req.StepID, req.AttemptID) {
-		return // response already written
+	if req.StepID == "" || req.AttemptID == "" {
+		jsonErr(w, http.StatusBadRequest, "step_id and attempt_id are required")
+		return
 	}
 
-	s.async.DeliverCallback(
-		core.StepID(req.StepID),
-		core.AttemptID(req.AttemptID),
-		core.Result{Status: "done", Output: req.Output},
-	)
+	s.async.DeliverCallback(r.Context(), core.StepID(req.StepID), core.AttemptID(req.AttemptID),
+		core.Result{Status: core.ResultStatusDone, Output: req.Output})
 	jsonResp(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // ── POST /tasks/fail ─────────────────────────────────────────────────────
 //
-// Same three-step discipline as /tasks/complete.
-// retry_after_seconds is accepted in the body but ignored (deferred §9.2).
-
+// Same three-step discipline as /tasks/complete. retry_after_seconds is
+// optional, accepted, and ignored — reserved for future LLM-aware rate
+// limiting (whitepaper §13.2, Temporary Design Registry #5) so the
+// worker-facing contract stays stable when that lands.
 func (s *Server) handleTaskFail(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		StepID             string `json:"step_id"`
-		AttemptID          string `json:"attempt_id"`
-		Error              string `json:"error"`
-		RetryAfterSeconds  int    `json:"retry_after_seconds"` // accepted, ignored — deferred §9.2
+		StepID            string `json:"step_id"`
+		AttemptID         string `json:"attempt_id"`
+		Error             string `json:"error"`
+		RetryAfterSeconds *int   `json:"retry_after_seconds"` // optional; accepted, ignored (reserved, whitepaper §13.2)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-
-	if !s.validateAttempt(w, r, req.StepID, req.AttemptID) {
+	if req.StepID == "" || req.AttemptID == "" {
+		jsonErr(w, http.StatusBadRequest, "step_id and attempt_id are required")
 		return
 	}
 
-	s.async.DeliverCallback(
-		core.StepID(req.StepID),
-		core.AttemptID(req.AttemptID),
-		core.Result{Status: "failed", Error: req.Error},
-	)
+	s.async.DeliverCallback(r.Context(), core.StepID(req.StepID), core.AttemptID(req.AttemptID),
+		core.Result{
+			Status: core.ResultStatusFailed,
+			Failure: &core.ResultFailure{
+				Reason: core.FailureReasonWorkerReported,
+				Error:  req.Error,
+			},
+		})
 	jsonResp(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// validateAttempt checks attempt_id == current_attempt_id.
-// Returns true if the attempt is current and the handler should proceed.
-// Returns false if the attempt is superseded or the step is not found;
-// in that case the handler writes 200 and the caller should return immediately.
-func (s *Server) validateAttempt(w http.ResponseWriter, r *http.Request, stepID, attemptID string) bool {
-	var current sql.NullString
-	err := s.db.QueryRowContext(r.Context(), `
-		SELECT current_attempt_id::text FROM steps WHERE step_id = $1
-	`, stepID).Scan(&current)
-
-	if err == sql.ErrNoRows {
-		// Step not found — safe to acknowledge (at-least-once delivery).
-		slog.Info("callback: step not found, acknowledging safely", "step_id", stepID)
-		jsonResp(w, http.StatusOK, map[string]bool{"ok": true})
-		return false
-	}
-	if err != nil {
-		jsonErr(w, http.StatusInternalServerError, "validate attempt: "+err.Error())
-		return false
-	}
-
-	if !current.Valid || current.String != attemptID {
-		// Superseded: the channel for this attempt no longer exists.
-		// Acknowledge with 200 so the worker stops retrying.
-		slog.Info("callback: superseded attempt_id, ignoring",
-			"step_id", stepID, "attempt_id", attemptID)
-		jsonResp(w, http.StatusOK, map[string]bool{"ok": true})
-		return false
-	}
-
-	return true
 }
 
 // ── GET /dlq ─────────────────────────────────────────────────────────────
@@ -342,16 +388,16 @@ func (s *Server) handleGetDLQ(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var e entry
 		var stepID sql.NullString
-		var ctx []byte
-		if err := rows.Scan(&e.ID, &e.RunID, &stepID, &e.Reason, &ctx, &e.CreatedAt); err != nil {
+		var ctxJSON []byte
+		if err := rows.Scan(&e.ID, &e.RunID, &stepID, &e.Reason, &ctxJSON, &e.CreatedAt); err != nil {
 			jsonErr(w, http.StatusInternalServerError, "scan dlq: "+err.Error())
 			return
 		}
 		if stepID.Valid {
 			e.StepID = &stepID.String
 		}
-		if ctx != nil {
-			e.Context = json.RawMessage(ctx)
+		if ctxJSON != nil {
+			e.Context = json.RawMessage(ctxJSON)
 		}
 		entries = append(entries, e)
 	}
@@ -365,89 +411,107 @@ func (s *Server) handleGetDLQ(w http.ResponseWriter, r *http.Request) {
 
 // ── POST /dlq/:id/replay ─────────────────────────────────────────────────
 //
-// Re-queues a DLQ entry. For retry_exhausted: resets the step to DECIDED and
-// the run to RUNNING, then re-enters the driver loop (which will re-dispatch
-// the DECIDED step without re-asking the planner).
-// For planner_failed (step_id IS NULL): resets the run to RUNNING only.
-// The DLQ entry is preserved as an audit record.
-
+// Branches on the DLQ entry (whitepaper §11):
+//   - worker-side (StepID != nil, run=DLQ/last_step=DLQ) → ReplayWorkerSide
+//     (Ledger TX5: attempt_count→0, step→RUNNING, run→RUNNING, a fresh
+//     attempt, current_attempt_id set) → re-enter the loop.
+//   - planner-side (StepID == nil, run=DLQ/last_step=done) → ReplayPlannerSide
+//     (Ledger TX6: run→RUNNING) → re-enter the loop.
+//
+// Both branches re-enter through the SAME generic startLoop/Loop.Run entry
+// point used for a brand-new run and for crash recovery — "recovery is not
+// a special mode; it is the same loop entered from a DB-persisted mid-run
+// state" (whitepaper §2) applies equally to an operator-triggered replay.
+//
+// For the planner-side branch this is exact: after TX6, LoadFrontier's
+// PendingStep is nil (the last step is still DONE), so Loop.Run's
+// steady-state loop asks the planner directly — precisely TX6's prescribed
+// "re-ask the planner".
+//
+// For the worker-side branch this is a deliberate, flagged approximation.
+// The whitepaper describes TX5 as being followed directly by "dispatch the
+// worker" — but Loop.Run has no entry point that dispatches an existing
+// PendingStep without first performing the one-time recovery check (claim
+// the pending attempt as failed(orphaned), whitepaper §8.3), and adding one
+// would mean touching internal/orchestrator/loop.go, which is out of this
+// session's scope (internal/api/ + cmd/stateflow/main.go only). Re-entering
+// generically means the fresh attempt TX5 just created — which was never
+// actually dispatched to a worker — gets claimed as `orphaned` (this is
+// actually the correct bucket for it under the timeout taxonomy's "stuck
+// before dispatch" rule, whitepaper §6: no worker was ever contacted for
+// that attempt id, so no duplicate invocation occurs) before a SECOND new
+// attempt is created via TX4 and actually dispatched. Net effect: replay is
+// safe (no double dispatch, no data loss, still bounded and convergent) but
+// costs one extra unit of the just-reset retry budget — the operator
+// effectively gets X-1, not X, fresh attempts after a replay. For a
+// workflow configured with retry_limit=1 this means a worker-side replay
+// never dispatches at all before re-DLQing. Flagged as a 🔴 open question in
+// the Session 6 report; the clean fix (an exported Loop method that resumes
+// a PendingStep by dispatching directly, skipping the orphan-claim) belongs
+// to a session that owns internal/orchestrator/.
 func (s *Server) handleDLQReplay(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
-	dlqID, err := strconv.ParseInt(idStr, 10, 64)
+	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		jsonErr(w, http.StatusBadRequest, "invalid DLQ id")
 		return
 	}
 
-	// Get DLQ entry.
-	var runID string
-	var stepID sql.NullString
-	err = s.db.QueryRowContext(r.Context(), `
-		SELECT run_id, step_id FROM dead_letter_queue WHERE id = $1
-	`, dlqID).Scan(&runID, &stepID)
-	if err == sql.ErrNoRows {
-		jsonErr(w, http.StatusNotFound, "DLQ entry not found")
-		return
-	} else if err != nil {
-		jsonErr(w, http.StatusInternalServerError, "get dlq entry: "+err.Error())
+	entry, err := s.store.GetDLQEntry(r.Context(), core.DLQEntryID(id))
+	if err != nil {
+		if isNotFoundErr(err) {
+			jsonErr(w, http.StatusNotFound, "DLQ entry not found")
+		} else {
+			jsonErr(w, http.StatusInternalServerError, "get dlq entry: "+err.Error())
+		}
 		return
 	}
 
-	// Get run + workflow info for restarting the loop.
+	// The run row is never deleted, so workflow_id/workflow_input are always
+	// available to reconstruct the Loop — reading them is not itself part of
+	// any TX ledger entry (it's a plain read), so a direct query is fine.
+	var workflowID string
 	var workflowInput json.RawMessage
-	var plannerType string
-	var plannerConfig json.RawMessage
 	err = s.db.QueryRowContext(r.Context(), `
-		SELECT r.workflow_input, w.planner_type, w.planner_config
-		FROM runs r JOIN workflows w ON r.workflow_id = w.workflow_id
-		WHERE r.run_id = $1
-	`, runID).Scan(&workflowInput, &plannerType, &plannerConfig)
+		SELECT workflow_id, workflow_input FROM runs WHERE run_id = $1
+	`, string(entry.RunID)).Scan(&workflowID, &workflowInput)
 	if err != nil {
 		jsonErr(w, http.StatusInternalServerError, "get run info: "+err.Error())
 		return
 	}
 
-	tx, err := s.db.BeginTx(r.Context(), nil)
-	if err != nil {
-		jsonErr(w, http.StatusInternalServerError, "begin tx: "+err.Error())
-		return
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	// If there's a step (retry_exhausted), reset it to DECIDED so the loop
-	// can re-dispatch it on recovery without re-asking the planner.
-	if stepID.Valid {
-		if _, err := tx.ExecContext(r.Context(), `
-			UPDATE steps
-			SET status = 'DECIDED', current_attempt_id = NULL, output = NULL, completed_at = NULL
-			WHERE step_id = $1
-		`, stepID.String); err != nil {
-			jsonErr(w, http.StatusInternalServerError, "reset step: "+err.Error())
+	if entry.StepID != nil {
+		// Worker-side: TX5.
+		if _, _, err := s.store.ReplayWorkerSide(r.Context(), entry.RunID); err != nil {
+			jsonErr(w, http.StatusInternalServerError, "replay worker-side: "+err.Error())
+			return
+		}
+	} else {
+		// Planner-side: TX6.
+		if err := s.store.ReplayPlannerSide(r.Context(), entry.RunID); err != nil {
+			jsonErr(w, http.StatusInternalServerError, "replay planner-side: "+err.Error())
 			return
 		}
 	}
 
-	// Reset run to RUNNING.
-	if _, err := tx.ExecContext(r.Context(), `
-		UPDATE runs SET status = 'RUNNING', updated_at = now() WHERE run_id = $1
-	`, runID); err != nil {
-		jsonErr(w, http.StatusInternalServerError, "reset run: "+err.Error())
-		return
-	}
+	s.startLoop(s.ctx, entry.RunID, core.WorkflowID(workflowID), workflowInput)
 
-	if err := tx.Commit(); err != nil {
-		jsonErr(w, http.StatusInternalServerError, "commit replay: "+err.Error())
-		return
-	}
-
-	// Re-enter the driver loop. The loop's first action (PendingDecision) will
-	// find the DECIDED step (if any) and re-dispatch it without re-asking the planner.
-	s.startLoop(s.ctx, core.RunID(runID), workflowInput, plannerType, plannerConfig)
-
-	jsonResp(w, http.StatusAccepted, map[string]string{"run_id": runID})
+	jsonResp(w, http.StatusAccepted, map[string]string{"run_id": string(entry.RunID)})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+// isNotFoundErr reports whether err is a core.StateStore "not found" read
+// error. core.StateStore (frozen, out of this session's scope) defines no
+// sentinel error type for this — every Get*/not-found case is a plain
+// fmt.Errorf("...: %q not found", id) (see GetWorkflow/GetDLQEntry in
+// internal/store/postgres.go) — so this is a deliberate, flagged
+// string-match workaround rather than a typed check. Flagged in the Session
+// 6 report; the clean fix is a core.ErrNotFound sentinel, added in whichever
+// session next touches internal/core/.
+func isNotFoundErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "not found")
+}
 
 func jsonResp(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -457,16 +521,4 @@ func jsonResp(w http.ResponseWriter, code int, v any) {
 
 func jsonErr(w http.ResponseWriter, code int, msg string) {
 	jsonResp(w, code, map[string]string{"error": msg})
-}
-
-// newUUID generates a random UUID v4 string.
-func newUUID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("newUUID: crypto/rand failed: %v", err))
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	h := fmt.Sprintf("%x", b)
-	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
