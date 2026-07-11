@@ -2,7 +2,7 @@
 
 **Purpose:** The authoritative pre-implementation specification for Whitepaper v1.0 and the codebase refactor. No whitepaper statement or code change may contradict this document.
 **Notation:** 【TXn】marks an atomic-transaction requirement inline; the ledger at the end is the acceptance table — the two must agree. Every non-obvious rule carries a "**Why**".
-**Language note:** This is the English edition of `StateFlow_Rules_Consolidation_v3.md` (Chinese). The two are maintained in lockstep; on any divergence, **this English edition governs** for implementation purposes.
+**Language note:** This is the only edition of this document — no Chinese version exists (an earlier draft of this note referred to one, but it was never actually added to the repo).
 
 ---
 

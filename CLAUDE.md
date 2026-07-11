@@ -1,9 +1,9 @@
 # StateFlow — Development Discipline
 
 **Authoritative design:** `docs/StateFlow_Whitepaper_v1_0.md`
-**Rule-by-rule spec:** `docs/StateFlow_Rules_Consolidation_v3_EN.md` (a Chinese mirror,
-`StateFlow_Rules_Consolidation_v3.md`, exists for convenience; English governs on any
-divergence).
+**Rule-by-rule spec:** `docs/StateFlow_Rules_Consolidation_v3_EN.md` (the only version — no
+Chinese mirror exists; earlier drafts of this doc referred to one, but it was never actually
+added to the repo).
 
 **VOID — do not read as authority, do not imitate:** `docs/archive/DESIGN.md`,
 `docs/archive/StateFlow_Whitepaper_v0.8.md` (and any other pre-v1.0 whitepaper), and any
