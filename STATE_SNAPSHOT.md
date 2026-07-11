@@ -1,188 +1,90 @@
 # STATE_SNAPSHOT
 
 ## 1. 進度指針
-- 剛完成 Session：`8 —— Final audit & conformance report (TX ledger conformance table, global sweeps, doc-vs-code diff, full verification) — REFACTOR COMPLETE, no further sessions planned`
-- 下一個 Session：`None planned — Session 8 was the final session in the v1.0 refactor plan. One genuine defect was found (§6/§7 below) and is left for the owner to triage (fix now vs. accept as known-limitation).`
-- 本次 commit SHA：`ab2c4f4274be566b23174efc1150f6a92addf447` (Session 8 is audit-only; no code was changed, so HEAD is unchanged from the follow-up commit this session started from. This snapshot commit adds only STATE_SNAPSHOT.md on top.)
+- 剛完成 Session：`8.5 —— Async malformed-output detection for /tasks/complete (inserted after Session 8 audit; owner decided to fix now rather than defer)`
+- 下一個 Session：`None currently planned. Session 8.5 was owner-inserted specifically to close the one open item from Session 8's final audit. The refactor's numbered plan (0–8) was already complete; 8.5 is a targeted fix, not a new phase. No Session 9 exists in StateFlow_v1_ClaudeCode_Prompts.md as of this snapshot.`
+- 本次 commit SHA：`30a2d34c4793be8f3af8ab1b9d5e105dd29f1742` (code commit — this snapshot commit lands on top of it as a second, snapshot-only commit, matching the Session 8 precedent of `956dc6c` code + `ab2c4f4` snapshot)
 - 分支：`main`
 
 ## 2. 驗證證據（verbatim）
 
-Environment: Windows host, WSL2 Ubuntu distro has Docker/Go/Python. All commands
-ran via `wsl.exe -d Ubuntu -- bash -lc '...'` against a live
-`docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build`
-stack started from a `docker compose down -v` state (fresh Postgres volume),
-per this session's own prompt's documented environment quirks.
+Environment: Windows host; the Bash tool itself is Git Bash (MSYS), NOT WSL — `go`/`docker` are not on its PATH. All Go/Docker/Python commands were run via `wsl.exe -d Ubuntu -- bash ...` against a live `docker compose up -d --build` stack started from a `docker compose down -v` state (fresh Postgres volume), per this session's documented environment quirks. **New environment finding this session** (see §4): command substitution (`$(...)`) silently evaluates to empty when embedded directly in a `wsl.exe -d Ubuntu -- bash -lc '...'` one-liner invoked from this Bash tool — worked around by writing the command to a `.sh` file (via the Write tool, so no shell-quoting layer touches it) and executing that file with `MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- bash /absolute/path/script.sh`.
 
 ### 2a. 完成條件指令與輸出
 
-**1. Global sweeps**
-
-```text
-$ grep -rn "decided_at\|dispatched_at\|attempt_number\|replay_round\|ResetToDecided" --include="*.go" --include="*.sql" --include="*.py" .
-./internal/api/server.go:181:// (whitepaper §14.1: "renamed from decided_at") is surfaced under its new
-./internal/api/server.go:182:// name; `decided_at` never appears on the wire.
-./internal/api/server_test.go:228:			t.Error("step missing created_at (renamed from decided_at — must be present)")
-./internal/api/server_test.go:230:		if _, ok := s0["decided_at"]; ok {
-./internal/api/server_test.go:231:			t.Error("step has decided_at — retired name must never appear on the wire")
-./migrations/001_initial.sql:34:    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),  -- renamed from decided_at (name retired with the DECIDED state)
-./migrations/001_initial.sql:57:    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),  -- renamed from dispatched_at: inserted at TX1/TX4, before dispatch — the timeout anchor. No attempt_number; order by created_at
+**1. Build / vet / gofmt**
 ```
-Every hit is a doc-comment/test-assertion referencing the *retired* name to
-prove it is gone or to guard against its reappearance — zero hits are actual
-usage. **Sweep verdict: clean**, matching the prompt's "must return nothing
-[of substance]" bar (the only matches are the explicit anti-regression
-guards this exact grep is designed to allow).
-
-```text
-$ grep -rn "DECIDED\|'FAILED'" --include="*.go" --include="*.sql" --include="*.py" .
-./internal/orchestrator/helpers_test.go:149:   VALUES ($1::uuid, $2, 'FAILED', $3, 'seed: simulated pre-crash failure', now())
-./internal/store/postgres.go:291:      SET status = 'FAILED', failure_reason = $1, error = $2, resolved_at = now()
-./internal/api/server_test.go:586:     VALUES ($1::uuid, $2, 'FAILED', 'worker_reported', 'boom', now())
-./internal/core/interfaces.go:45:// StepStatus is one of the step's three states (whitepaper §4.2). DECIDED
-./demo/crash_demo.py:395:        f"AND a.status='FAILED' AND a.failure_reason='orphaned'"
-./migrations/001_initial.sql:34:    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),  -- renamed from decided_at (name retired with the DECIDED state)
-./migrations/001_initial.sql:54:    status          TEXT        NOT NULL CHECK (status IN ('RUNNING', 'DONE', 'FAILED')),
-./migrations/001_initial.sql:60:        CHECK (status <> 'FAILED' OR failure_reason IS NOT NULL),
-./migrations/001_initial.sql:62:        CHECK (status = 'FAILED' OR failure_reason IS NULL)
-./test/acceptance/dlq_replay_test.py:63:        nf = H.scalar(f"SELECT count(*) FROM attempts WHERE step_id='{step_id}' AND status='FAILED'")
-./test/acceptance/crash_recovery_test.py:106:                    f"AND a.status='FAILED' AND a.failure_reason='orphaned'")
-./test/acceptance/crash_recovery_test.py:121:                   f"WHERE s.run_id='{run_id}' AND a.status='FAILED' AND a.failure_reason IS NULL")
-./migrations/001_initial.sql:34: (dup of above)
+$ docker run --rm -v "$(pwd):/src" -w /src -e GOFLAGS=-buildvcs=false \
+    golang:1.25 sh -c "go build ./... && echo BUILD_OK && go vet ./... && echo VET_OK && gofmt -l ."
+BUILD_OK
+VET_OK
+internal/planner/static_test.go
 ```
-Every hit is `attempts.status='FAILED'` — a real, current state for
-**attempts** in the 3×3×3 model (never run/step) — or a doc comment
-mentioning the retired step-state name `DECIDED` for historical
-context. **Sweep verdict: clean**, matching the prompt's stated allowance
-exactly ("the only legitimate hits are the attempts table's FAILED status").
+(`gofmt -l` flags exactly the one pre-existing file already flagged and left untouched since Session 6.5 — unrelated to this session; `git status --porcelain internal/` before this session's edits confirmed it was already the sole pre-existing gofmt offender.)
 
-```text
-$ grep -rn 'attempt_count' --include='*.go' --include='*.sql' internal/ migrations/
+**2. Clean-clone compose build** (`docker compose down -v` on both the base and demo overlay, then `docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build`): all 8 containers reached `Up ... (healthy)` (or `Up` for `stateflow` itself, which has no built-in healthcheck — Temporary Design Registry item #8), confirmed via `docker compose ... ps`.
+
+**3. `TEST_DATABASE_URL=... go test -p 1 -count=1 ./...`** (run against the live compose stack, container network `stateflow_default`):
 ```
-(59 hits — full list retained in this session's own working notes, not
-pasted verbatim here for length). Verified by direct read of
-`internal/store/postgres.go`: the ONLY two non-initialization writers are
-`RecordFailure` (TX3, `UPDATE steps SET attempt_count = attempt_count + 1 ...`,
-line 309) and `ReplayWorkerSide` (TX5, `SET attempt_count = 0, ...`, line
-417). `CreateStepWithAttempt` (TX1) sets the *initial* value to 0 as part of
-row creation (matching the ledger's own TX1 content "count=0"), which is not
-a second writer of an existing row. **Invariant verdict: holds** — "written
-only by TX3 (++) and TX5 (=0)".
-
-```text
-$ grep -rn 'time\.Now()' --include='*.go' internal/ cmd/
-internal/transport/async_test.go:175:	start := time.Now()
-internal/orchestrator/helpers_test.go:161:	deadline := time.Now().Add(timeout)
-internal/orchestrator/helpers_test.go:162:	for time.Now().Before(deadline) {
-internal/orchestrator/loop.go:178:	dlqed, err := l.dispatchAndResolve(ctx, retry, def, retryLimit, stepID, spec, newAttemptID, time.Now())
-internal/orchestrator/loop.go:262:	createdAt := time.Now() // see the package doc note on the timestamp approximation
-internal/orchestrator/loop.go:399:	createdAt = time.Now()
-internal/orchestrator/replay.go:105:	dlqed, err := l.dispatchAndResolve(ctx, retry, def, retryLimit, stepID, spec, frontier.PendingAttemptID, time.Now())
-internal/planner/http_test.go:195:	start := time.Now()
-internal/api/server_test.go:137:	deadline := time.Now().Add(timeout)
-internal/api/server_test.go:138:	for time.Now().Before(deadline) {
+$ docker run --rm --network stateflow_default -v "$(pwd):/src" -w /src \
+    -e GOFLAGS=-buildvcs=false \
+    -e TEST_DATABASE_URL="postgres://stateflow:stateflow@postgres:5432/stateflow?sslmode=disable" \
+    golang:1.25 go test -p 1 -count=1 ./...
+?   	github.com/aaronwu000/stateflow/cmd/stateflow	[no test files]
+ok  	github.com/aaronwu000/stateflow/internal/api	2.274s
+?   	github.com/aaronwu000/stateflow/internal/core	[no test files]
+ok  	github.com/aaronwu000/stateflow/internal/orchestrator	1.573s
+ok  	github.com/aaronwu000/stateflow/internal/planner	0.221s
+ok  	github.com/aaronwu000/stateflow/internal/store	1.465s
+ok  	github.com/aaronwu000/stateflow/internal/transport	0.988s
 ```
-Every production (non-`_test.go`) hit is in `internal/orchestrator/loop.go`
-/`replay.go`, used ONLY to compute an in-memory `context.WithDeadline` input
-(`createdAt`), immediately after a TX1/TX4/TX5 call returns — never passed
-to any `StateStore` method, never persisted (confirmed: no `StateStore`
-method in `internal/core/interfaces.go` accepts a `time.Time` parameter).
-Test-file hits are polling-loop deadlines, not persisted state. **Invariant
-verdict: holds** — no `time.Now()` is ever persisted for ordering; all
-persisted timestamps are DB `now()` (verified directly in every
-`postgres.go` TXn method: `now()` appears in every `created_at`/
-`resolved_at`/`completed_at`/`updated_at` write, never a Go-side value).
-
-**2. Clean-clone compose build** (`docker compose down -v` then
-`docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build`):
-```text
- Image stateflow-step1 Built
- Image stateflow-step2 Built
- Image stateflow-summarize-worker Built
- Image stateflow-llm-adapter Built
- Image stateflow-ner-worker Built
- Image stateflow-ocr-worker Built
- Image stateflow-stateflow Built
- Network stateflow_default Created
- Volume stateflow_pgdata Created
- Container stateflow-postgres-1 Created
- Container stateflow-ocr-worker-1 Created
- Container stateflow-ner-worker-1 Created
- Container stateflow-summarize-worker-1 Created
- Container stateflow-step1-1 Created
- Container stateflow-step2-1 Created
- Container stateflow-llm-adapter-1 Created
- Container stateflow-stateflow-1 Created
- Container stateflow-postgres-1 Healthy
- Container stateflow-stateflow-1 Started
+6/6 packages `ok` (2 with no test files). The three new tests are inside `internal/api`; verbose run of that package alone:
 ```
-`docker compose ... ps` afterward: all 8 containers `Up ... (healthy)` (or,
-for `stateflow` itself, `Up` — it has no built-in healthcheck, Temporary
-Design Registry item #8).
+=== RUN   TestAPI_TaskComplete_AsyncMalformedOutput_Absent
+    server_test.go:921: PASS — POST /tasks/complete with output absent → HTTP 200
+    server_test.go:927: PASS — attempt 72f4ca53-115c-4a64-be49-0b033743126a failure_reason = malformed
+    server_test.go:943: PASS — step.status=RUNNING attempt_count=1 after one malformed(absent-output) failure
+--- PASS: TestAPI_TaskComplete_AsyncMalformedOutput_Absent (0.23s)
+=== RUN   TestAPI_TaskComplete_AsyncMalformedOutput_Null
+    server_test.go:968: PASS — POST /tasks/complete with output=null → HTTP 200
+    server_test.go:974: PASS — run run-ab8b3061-ccef-48bc-b4da-7c996c4f7c94 → DLQ after one malformed(null-output) failure at retry_limit=1
+    server_test.go:980: PASS — attempt 0d84761b-482e-4fea-9a95-81b70e79563f failure_reason = malformed
+    server_test.go:992: PASS — dlq entry reason = worker_retry_exhausted
+    server_test.go:1000: PASS — no extra dispatch envelope after the budget-exhausting malformed failure
+--- PASS: TestAPI_TaskComplete_AsyncMalformedOutput_Null (0.44s)
+=== RUN   TestAPI_TaskComplete_AsyncRealOutput_Regression
+    server_test.go:1029: PASS — run run-95513eca-16a5-49b3-9818-6935c9ae4dca → DONE with real async output (no regression)
+    server_test.go:1048: PASS — step output = map[count:7 processed:true] (real output preserved verbatim)
+--- PASS: TestAPI_TaskComplete_AsyncRealOutput_Regression (0.26s)
+PASS
+ok  	github.com/aaronwu000/stateflow/internal/api	2.399s
+```
+All pre-existing `internal/api` tests (`TestAPI_EndToEnd_Sync`, `TestAPI_Callback_Dedup`, `TestAPI_GetRun_NotFound`, `TestAPI_EndToEnd_HTTPPlanner` incl. its `planner_verdict_wrong_case_is_rejected` subtest, `TestAPI_DLQ_ReplayWorkerSide`, `TestAPI_DLQ_ReplayPlannerSide`) also PASS unchanged in the same run — no regression.
 
-**3. `python3 demo/crash_demo.py`**
-```text
-════════════════════════════════════════════════════════════════
-   StateFlow  —  Crash-Recovery Demo
-════════════════════════════════════════════════════════════════
-  Proves: kill orchestrator mid-run → restart → completed steps NOT re-run
-
-  ✅ Images built
-  ✅ Schema clean — 'stateflow' ready
-  ✅ Workers ready  OCR:5001  NER:5002  Summarize:5003
-  ✅ StateFlow (boot 1) ready on :8080  container=981ae4e1f948
-
-     workflow_id : wf-b7186ab8-257c-4fda-aa0c-bb03cfc7ccc7
-     run_id      : run-e640bd33-6e36-4e3e-b9ba-bb9ad892d6b7
-
-[OCR] ✅ Extraction complete — 3 pages, confidence 0.98
-[NER]  🏷️  Starting entity extraction
-  ✅ Step 1 (OCR, sync) DONE  ✓
-     NER dispatched — it is sleeping 5s before sending its callback
-
-  💥 KILLING ORCHESTRATOR  —  container 981ae4e1f948
-  💥 NER's async callback channel dies with the process
-  💥 DB still shows step 2 RUNNING (no output); step 3 never started
+**4. `python3 demo/crash_demo.py`** (trimmed to load-bearing lines):
+```
 [NER]  ✅ Extraction done — 3 entities found
-
   🔄 RESTARTING ORCHESTRATOR  —  RecoverRuns fires at startup
-[NER]  ⚡ Already processed step_id=run-e640bd33-6e36-4e3e-b9ba-bb9ad892d6b7:ner
-[NER]     Re-sending callback with NEW attempt_id=19f34611... (no re-processing)
-[NER]  📤 Callback delivered — attempt_id=19f34611...  HTTP 200
-[SUMMARIZE] ✍️  Generating summary from history: ['ocr', 'ner']
-  ✅ StateFlow (boot 2 — recovery) ready on :8080  container=981ae4e1f948
+[NER]  ⚡ Already processed step_id=run-466484e5-...:ner
+[NER]     Re-sending callback with NEW attempt_id=ffa8ff59... (no re-processing)
+[NER]  📤 Callback delivered — attempt_id=ffa8ff59...  HTTP 200
 [SUMMARIZE] ✅ Summary ready — 17 words
-2026/07/10 14:12:18 INFO [RECOVERY] run completed run_id=run-e640bd33-6e36-4e3e-b9ba-bb9ad892d6b7
-
+2026/07/11 01:51:09 INFO [RECOVERY] run completed run_id=run-466484e5-...
   ✅ NER step's attempt history shows exactly ONE attempt with failure_reason='orphaned'
   ✅ NER step's Barrier-1 record (created_at + decision) is byte-identical before and after the crash
-  ✅ NER worker's actual extraction work ran exactly ONCE (idempotency cache absorbed the re-dispatch)
-
-════════════════════════════════════════════════════════════════
-   DEMO COMPLETE
-════════════════════════════════════════════════════════════════
+  ✅ NER worker's actual extraction work ran exactly ONCE
   Run status : DONE
-  Steps:
     [DONE  ] ocr
     [DONE  ] ner
     [DONE  ] summarize
   ✅ Crash-recovery demo successful — the run completed without re-running done steps.
 ```
-(Trimmed to the load-bearing lines; nothing truncated that affects
-success/failure — full raw output was reviewed in full.)
 
-**4. `./demo/run_demo.sh` scenarios 1–3** (same non-interactive technique as
-Session 7: a throwaway in-place copy of `demo/run_demo.sh` with the trailing
-`main "$@"` call stripped, functions invoked directly, blank-line stdin via
-`yes ''` satisfying `pause()`'s `read -rp`; the copy was deleted immediately
-after and `git status --porcelain demo/` confirmed clean — an incidental
-`644→755` mode bit that `cp`/`sed` left on the **tracked** `run_demo.sh`
-was caught and reverted with `chmod 644` before confirming clean, see §4
-below).
+**5. `./demo/run_demo.sh` scenarios 1–3** (in-place throwaway copy technique — see §4 for the exact mechanics used this session; `git status --porcelain demo/` confirmed clean immediately after, zero mode-bit or content residue):
 
 Scenario 1 — Happy Path:
-```text
-   Run: run-087559fa-66e7-40dd-8e50-938c9213d024
+```
+   Run: run-b8046872-6253-4def-b8b6-ff0982d892c9
    Status: DONE
    [DONE    ] ✓ step1
    [DONE    ] ✓ step2
@@ -191,17 +93,16 @@ Scenario 1 — Happy Path:
 ```
 
 Scenario 2 — Worker Crash & DLQ Replay:
-```text
-   Run: run-d1780927-1383-4494-85cb-33f38467bf57
+```
+   Run: run-e6a70ab7-42fa-413f-a56a-e6bfc63e680b
    Status: DLQ
    [DONE    ] ✓ step1
    [DLQ     ] ✗ step2
    DLQ Entries:
-   ID=1  run_id=run-d1780927-1383-4494-85cb-33f38467bf57  reason=worker_retry_exhausted  step=run-d1780927-1383-4494-85cb-33f38467bf57:step2
+   ID=1  ... reason=worker_retry_exhausted  step=...:step2
    ✓  OK — DLQ reason=worker_retry_exhausted, context carries per-attempt reason(s): ['timeout']
    ℹ  step1 invocation count before replay: 1
-   ℹ  Replaying DLQ entry 1...
-   Run: run-d1780927-1383-4494-85cb-33f38467bf57
+   Run: run-e6a70ab7-42fa-413f-a56a-e6bfc63e680b
    Status: DONE
    [DONE    ] ✓ step1
    [DONE    ] ✓ step2
@@ -210,18 +111,15 @@ Scenario 2 — Worker Crash & DLQ Replay:
 ```
 
 Scenario 3 — Orchestrator Crash & Recovery:
-```text
+```
    ⚠  KILLING orchestrator with 'docker compose kill' (SIGKILL)
    ⚠  Orchestrator dead. step1 is RUNNING in DB (Barrier 1 fired; Barrier 2 not yet).
    step_name | status  | dispatched
    -----------+---------+------------
    step1     | RUNNING | t
-   (1 row)
    Recovery log:
-   2026/07/10 16:08:02 INFO [RECOVERY] found in-progress runs count=1
-   2026/07/10 16:08:02 INFO [RECOVERY] resuming run run_id=run-b4839b61-5da8-4f10-acba-ec2cea31595d steps_done=0 pending_step=step1 attempt_count=0
-   2026/07/10 16:08:02 INFO [RECOVERY] complete resumed=1
-   Run: run-b4839b61-5da8-4f10-acba-ec2cea31595d
+   ... INFO [RECOVERY] found in-progress runs count=1
+   Run: run-b2c136ea-5dc8-400e-b1c8-b9839f2715fc
    Status: DONE
    [DONE    ] ✓ step1
    [DONE    ] ✓ step2
@@ -229,48 +127,17 @@ Scenario 3 — Orchestrator Crash & Recovery:
    ✓  PASS — Recovery complete; adapter called 3× (≤3 — no extra re-decision)
 ```
 
-**5. `TEST_DATABASE_URL=... go test -p 1 ./...`**
-```text
-$ docker run --rm -v "$(pwd):/src" -w /src -e GOFLAGS=-buildvcs=false \
-    golang:1.25 sh -c "go build ./... && echo BUILD_OK && go vet ./... && echo VET_OK && gofmt -l ."
-BUILD_OK
-VET_OK
-internal/planner/static_test.go
-```
-(`gofmt -l` flags exactly the one pre-existing file already flagged and
-explicitly left untouched since Session 6.5; this session's own
-`git status --porcelain internal/` is empty — see §3.)
-
-```text
-$ docker run --rm --network stateflow_default -v "$(pwd):/src" -w /src \
-    -e GOFLAGS=-buildvcs=false \
-    -e TEST_DATABASE_URL="postgres://stateflow:stateflow@postgres:5432/stateflow?sslmode=disable" \
-    golang:1.25 go test -p 1 -count=1 ./...
-?   	github.com/aaronwu000/stateflow/cmd/stateflow	[no test files]
-ok  	github.com/aaronwu000/stateflow/internal/api	1.518s
-?   	github.com/aaronwu000/stateflow/internal/core	[no test files]
-ok  	github.com/aaronwu000/stateflow/internal/orchestrator	1.846s
-ok  	github.com/aaronwu000/stateflow/internal/planner	0.218s
-ok  	github.com/aaronwu000/stateflow/internal/store	1.376s
-ok  	github.com/aaronwu000/stateflow/internal/transport	0.991s
-```
-6/6 packages `ok` (2 with no test files); 53 `func Test...` functions across
-the DB-backed packages (`internal/api`, `internal/orchestrator`,
-`internal/store`, `internal/transport`) per `grep -c 'func Test'`.
-
 ### 2b. 測試計數（照實填，來源即上面輸出）
-- 套件測試：`6/6` packages `ok` (2 with no test files); 失敗：無
-- 舊模型測試依計畫刪除/預期失敗者：無 — this session touched zero `.go`
-  files (audit only; see §3), so no test was added, deleted, or modified.
-- Demo/acceptance: `crash_demo.py` — PASS; `run_demo.sh` scenarios 1/2/3 —
-  all PASS.
+- 套件測試：`6/6` packages `ok` (2 with no test files); 失敗：無。`internal/api` package test count went from 6 top-level `func Test...` to 9 (3 new: `TestAPI_TaskComplete_AsyncMalformedOutput_Absent`, `TestAPI_TaskComplete_AsyncMalformedOutput_Null`, `TestAPI_TaskComplete_AsyncRealOutput_Regression`), all passing; zero pre-existing tests modified or deleted.
+- 舊模型測試依計畫刪除/預期失敗者：無 — this session added tests, it did not delete or weaken any existing test.
+- Demo/acceptance: `crash_demo.py` — PASS; `run_demo.sh` scenarios 1/2/3 — all PASS; `crash_recovery_test.py` — PASS; `EXPECT_X=2 dlq_replay_test.py` — PASS.
 
-### 2c. Owner oracle（independently re-run, not trusted from prior self-reports）
-```text
-$ ADVERTISE_HOST=$(hostname -I | awk '{print $1}') ORCH_CONTAINER=stateflow-stateflow-1 \
+### 2c. Owner oracle（independently re-run against a live stack this session itself rebuilt）
+```
+$ ADVERTISE_HOST=172.31.72.20 ORCH_CONTAINER=stateflow-stateflow-1 \
   TEST_DATABASE_URL="postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable" \
   API_BASE=http://localhost:8080 python3 test/acceptance/crash_recovery_test.py
-[setup] run_id=run-0d7c33eb-222d-4e28-ae85-3301594cf5db
+[setup] run_id=run-2744fff6-f861-4c5b-bbd9-d9ab0413261e
 [catch] done=s1 running=s2 -> kill stateflow-stateflow-1
 [restart] waiting for terminal state
 [final] run status=DONE
@@ -282,10 +149,10 @@ $ ADVERTISE_HOST=$(hostname -I | awk '{print $1}') ORCH_CONTAINER=stateflow-stat
   ok: every FAILED attempt carries a reason
 PASS: crash_recovery_test
 
-$ ADVERTISE_HOST=$(hostname -I | awk '{print $1}') ORCH_CONTAINER=stateflow-stateflow-1 EXPECT_X=2 \
+$ ADVERTISE_HOST=172.31.72.20 ORCH_CONTAINER=stateflow-stateflow-1 EXPECT_X=2 \
   TEST_DATABASE_URL="postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable" \
   API_BASE=http://localhost:8080 python3 test/acceptance/dlq_replay_test.py
-[setup] run_id=run-4e7a3180-b448-4cfb-960c-d51d09c94e5e expecting X=2
+[setup] run_id=run-5c7937ed-8b05-407e-908c-9666e9e849b3 expecting X=2
   ok: run reached DLQ
   ok: step in DLQ with attempt_count=2
   ok: exactly 2 FAILED attempts
@@ -293,275 +160,60 @@ $ ADVERTISE_HOST=$(hostname -I | awk '{print $1}') ORCH_CONTAINER=stateflow-stat
   ok: replay reset attempt_count to 0 and returned step to RUNNING (TX5)
 PASS: dlq_replay_test
 ```
-Both oracles PASS end-to-end, independently re-run against a live stack
-this session itself built from `docker compose down -v` — not taken on
-faith from the `98f113d` self-report.
+Both oracles PASS end-to-end. Note: the first attempt at running these (with `ADVERTISE_HOST=$(hostname -I | awk '{print $1}')` embedded directly in a `wsl.exe ... bash -lc '...'` one-liner) silently resolved `ADVERTISE_HOST` to an EMPTY string (not an error — `os.environ.get` returns the empty string, not the default, when a var is set-but-empty), which sent the fake HTTP planner's URL to the orchestrator as `http://:7102/` and DLQ'd the run instantly with `planner_unreachable` — a pure environment/tooling artifact, not a code defect. Diagnosed via direct DB inspection (`dead_letter_queue.context` showed the literal `http://:7102/` URL) and fixed by moving the substitution into a real script file (see §4). Recorded here so a future session does not waste time re-diagnosing the same nested-shell quirk.
 
 ## 3. 動過的檔 / 故意沒碰的檔
 
-```text
-$ git status --porcelain
-?? StateFlow_v1_ClaudeCode_Prompts.md   (owner's own untracked planning doc — not committed)
 ```
-Zero `.go`, `.sql`, or demo/doc files were changed this session — this is an
-audit session and the audit found no defect small enough / pre-approved
-enough to fix without owner sign-off (see §6/§7: one real defect WAS found,
-but per the Session 8 mandate it is reported, not fixed).
-
-One incidental, non-content change was caught and reverted before it could
-land in `git status`: copying `demo/run_demo.sh` to a throwaway in-place
-copy (`cp` + `sed`) to drive scenarios 1–3 non-interactively left the
-**original tracked file's** permission bits changed `100644→100755` (a
-`cp`-then-`chmod`-inheritance quirk of the WSL9P filesystem layer, not a
-content change — `git diff` showed only `old mode 100644` / `new mode
-100755`, zero line diff). Caught via `git status --porcelain demo/` showing
-`M demo/run_demo.sh` immediately after cleanup; fixed with `chmod 644
-demo/run_demo.sh`; confirmed empty diff afterward. Flagged here in the
-spirit of "verify before reporting" — an unnoticed mode-only diff would
-have been an inaccurate "files changed: none" claim.
-
-**`test/acceptance/` 的 git 狀態（必填，應為無變動）：**
-```text
-$ git status --porcelain test/acceptance/
-(empty — no changes; a __pycache__/ directory left by running the oracles
- was removed before the final status check, not committed)
+$ git status --porcelain internal/ cmd/ migrations/ docs/ test/acceptance/ demo/
+ M internal/api/server.go
+ M internal/api/server_test.go
+ M internal/core/interfaces.go
 ```
+(post-commit `30a2d34`; this is the diff that commit contains, shown here pre-commit for the record — after the commit `git status --porcelain` for these paths is empty.)
 
-**`internal/`, `cmd/`, `migrations/` 的 git 狀態（本 session 不應碰到任何 .go 檔）：**
-```text
-$ git status --porcelain internal/ cmd/ migrations/
-(empty — no changes)
-```
+Files changed (all in this session's declared scope):
+- `internal/api/server.go` — `handleTaskComplete` now classifies an async callback's `output` (absent from the JSON body, or present as the JSON literal `null`) as `failed(malformed)` before handing the `core.Result` to `DeliverCallback`; added `isAsyncOutputMalformed` helper; expanded the handler's doc comment to describe the new classification step; added `"bytes"` import.
+- `internal/api/server_test.go` — added `asyncEnvelope` type, `startAsyncStepRun`/`pollAttemptFailed` helpers, and three new tests (`TestAPI_TaskComplete_AsyncMalformedOutput_Absent`, `_Null`, `TestAPI_TaskComplete_AsyncRealOutput_Regression`). Zero existing tests modified.
+- `internal/core/interfaces.go` — `StepSpec.OutputField`'s doc comment rewritten to describe both mechanisms (sync `OutputField` subtree-presence; async absent/null) instead of asserting malformed-via-`OutputField` is sync only. No field added, removed, renamed, or retyped — `StepSpec`'s shape is byte-identical to before this session.
+
+Files deliberately NOT touched (checked, not contradicted):
+- `docs/USER_MANUAL.md` — read in full for "malformed"/"unparseable"/"async" mentions (via a research subagent); found no sentence asserting async lacks malformed detection or that async always succeeds given valid ids. The one `output_field` mention (line 100, "For sync workers: extract one field...") remains accurate — `output_field` genuinely is sync-only; only the OLD, now-corrected `OutputField` Go doc comment overclaimed that malformed-detection-in-general was sync-only. No edit made, per the session's own "check first, edit only if genuinely contradicted" instruction.
+- `docs/StateFlow_Whitepaper_v1_0.md`, `docs/StateFlow_Rules_Consolidation_v3_EN.md`, `CLAUDE.md` — none contradicted by this session's fix; not touched, as instructed.
+- `internal/transport/sync.go` — sync's `extractOutput`/`OutputField` logic is untouched, exactly as instructed.
+- `internal/transport/async.go` — `DeliverCallback` is untouched; it still performs zero classification, exactly as before. The classification decision is made entirely in `internal/api/server.go`, upstream of the transport layer, per this session's scope.
+
+One incidental artifact, caught and cleaned up before finishing: the throwaway in-place copy of `demo/run_demo.sh` (used to drive scenarios 1–3 non-interactively) was deleted immediately after use; `git status --porcelain demo/` confirmed clean (no mode-bit residue this time, unlike the Session 8 incident).
 
 ## 4. 與 session 指示的偏離點
 
-1. **Ran the two acceptance oracles under `ADVERTISE_HOST`/`ORCH_CONTAINER`
-   env vars** exactly as the prompt's environment-quirks section anticipated
-   — not itself a deviation, but noted because the prompt listed this as
-   conditional ("if reaching the container ... needs ...") and it did in
-   fact need it in this topology, consistent with every prior session that
-   ran these oracles.
-2. **Removed `test/acceptance/__pycache__/`** (Python bytecode cache
-   generated by running the two oracle scripts) before the final
-   `git status --porcelain` check. Not itself part of the repo (untracked,
-   would never be committed) but removed as basic housekeeping so this
-   session's "did you touch `test/acceptance/`" check reads unambiguously
-   clean rather than merely "no tracked changes".
-3. **Caught and reverted an incidental file-mode change** on
-   `demo/run_demo.sh` (100644→100755, zero content diff) produced as a side
-   effect of the `cp`/`sed` throwaway-copy technique — see §3. Not a content
-   edit and not part of this session's audit findings; recorded here purely
-   for completeness ("verify before reporting" applies to the audit's own
-   footprint, not only to the target code).
-4. **Did not attempt to fix the one genuine defect found** (§7 below: no
-   `FailureReasonMalformed` path exists for async worker callbacks, despite
-   whitepaper §4.2/§7.1 explicitly describing one). This is not a deviation
-   from the prompt — it is the prompt's explicit instruction ("Code changes
-   only if the audit uncovers a genuine defect, and only after you report it
-   and get owner approval... this is the one session where 'fix it' is
-   explicitly NOT your default action") — flagged here only so the
-   zero-code-change claim in §1/§3 is not misread as "nothing was found".
+1. **New environment-tooling finding, not a code deviation**: command substitution (`$(...)`) embedded directly inside a `wsl.exe -d Ubuntu -- bash -lc '...'` one-liner invoked from this session's Bash tool silently evaluates to an empty string instead of erroring — reproduced deterministically with even a trivial case (`Y=$(echo hi); echo "[$Y]"` → `[]`), while the same command run as a `> file` redirection, or as a standalone (non-substitution) statement, works correctly. This is almost certainly an artifact of how this specific Bash tool's underlying process (Git Bash / MSYS) pipes stdin/stdout to the nested `wsl.exe` process, not a WSL or bash bug per se. Workaround used: write the full command (including the `ADVERTISE_HOST=$(hostname -I | awk '{print $1}')` substitution) to a `.sh` file via the Write tool — which bypasses all shell-quoting layers entirely — then execute that file directly with `MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- bash /absolute/posix/path/script.sh` (the `MSYS_NO_PATHCONV=1` prefix was also required — without it, Git Bash rewrites the leading `/home/...` POSIX path into a bogus `C:/Program Files/Git/home/...` path before `wsl.exe` ever sees it, since `wsl.exe` is a native Windows executable and MSYS auto-converts POSIX-looking arguments passed to native executables). Both `.sh` files were deleted after use; `git status --porcelain` confirms no residue. Flagged here per "verify before reporting" so a future session doesn't lose time rediscovering this.
+2. Wrote three new tests rather than extending an existing one, because no existing test in `internal/api/server_test.go` actually exercises a REAL async success/failure round-trip through a live `Loop.Run()` goroutine — the closest existing test, `TestAPI_Callback_Dedup`, plants DB rows directly without ever calling `POST /workflows/:id/runs`, so `AsyncTransport`'s registry never has a channel registered for that step, and `DeliverCallback` always hits its `unregistered step` no-op path regardless of correctness. This session's tests therefore had to drive a real dispatch (worker captures the loop's own envelope, test replies as the worker) to actually exercise the new classification logic — see `startAsyncStepRun` in `server_test.go`. This is not a deviation from the prompt's instructions (which asked for exactly this behavior to be tested) but is flagged because the prompt's phrasing ("confirm the existing happy-path async test... still passes unchanged") presupposed such a test already existed; none did, so `TestAPI_TaskComplete_AsyncRealOutput_Regression` was written fresh rather than merely re-run.
+3. **The exact "malformed" classification rule chosen** (asked for in both the Build section and Question 4 below, stated once here for visibility): `isAsyncOutputMalformed(output json.RawMessage) bool { return len(output) == 0 || string(bytes.TrimSpace(output)) == "null" }`. I.e., `output` key absent from the JSON body, OR present but equal to the JSON literal `null` (after trimming incidental whitespace) → `failed(malformed)`. A present, syntactically valid `{}` or `[]` is deliberately left classified as `done` (NOT malformed) — see Question 4 for the full justification. This was a judgment call under genuine ambiguity in the whitepaper text, not a mechanical instruction from the prompt.
 
 ## 5. 本次定案的真實介面 / Schema
-No Go interfaces or schema were touched this session (confirmed empty
-`git status --porcelain internal/ cmd/ migrations/` in §3). Session 8 is
-audit-only per its own scope ("read everything; run everything").
 
-### 5a. TX Ledger Conformance Table (this session's primary deliverable)
+No schema change (none was in scope; none was needed). `core.StepSpec`'s shape is unchanged — only its `OutputField` doc comment was reworded. `core.Result`/`core.ResultFailure`/`core.FailureReason` are all unchanged — this session's fix works entirely by choosing WHICH pre-existing `core.Result` value to construct in `handleTaskComplete`, never by adding a new field, type, or Ledger transaction.
 
-| ID | file:function | Transaction boundary (verbatim span) | Contents match ledger? |
-|---|---|---|---|
-| TX-W | `internal/store/postgres.go:67 CreateWorkflow` | Single `s.db.ExecContext(ctx, INSERT INTO workflows ...)` (no explicit `BeginTx` — a lone `ExecContext` is already atomic; doc comment: "a single INSERT is already atomic; no explicit BEGIN needed") | Yes — single write, workflow def incl. planner type+config |
-| TX0 | `internal/store/postgres.go:116 CreateRun` | Single `s.db.ExecContext(ctx, INSERT INTO runs ... VALUES (..., 'RUNNING', ...))` | Yes — single write, run created RUNNING |
-| TX1 | `internal/store/postgres.go:134 CreateStepWithAttempt` | `tx, err := s.db.BeginTx(ctx, nil)` (143) ... 3 `tx.ExecContext` calls (step INSERT w/ seq, attempt INSERT, `current_attempt_id` UPDATE) ... `tx.Commit()` (173) | Yes — step(decision,seq,count=0)+first attempt+current_attempt_id, one blade, dispatch happens only after the caller (loop.go:258-264) receives this call's return |
-| TX2 | `internal/store/postgres.go:183 CheckpointSuccess` | `tx, err := s.db.BeginTx(ctx, nil)` (184) ... CAS `UPDATE attempts ... WHERE attempt_id=$1 AND status='RUNNING' AND EXISTS(...current_attempt_id...)` (190-199) ... `UPDATE steps SET output=..., status='DONE', completed_at=now()` (207-211) ... `tx.Commit()` (215) | Yes — attempt→done + step→done + output, one blade; CAS-gated |
-| TX3 | `internal/store/postgres.go:282 RecordFailure` | `tx, err := s.db.BeginTx(ctx, nil)` (283) ... CAS `UPDATE attempts SET status='FAILED', failure_reason=$1,...` (289-298) ... `UPDATE steps SET attempt_count=attempt_count+1 RETURNING attempt_count,run_id` (308-312) ... **same tx**, `if newCount >= retryLimit`: `UPDATE steps SET status='DLQ'` (319) + `UPDATE runs SET status='DLQ'` (322) + `INSERT INTO dead_letter_queue (...,'worker_retry_exhausted',...)` (331-334) ... `tx.Commit()` (341) | Yes — attempt→failed(reason)+count++, DLQ blade fires inside the SAME transaction at count==retryLimit, exactly as the ledger requires ("Verdict and DLQ fall in one blade") |
-| TX4 | `internal/store/postgres.go:350 StartNewAttempt` | `tx, err := s.db.BeginTx(ctx, nil)` (353) ... `INSERT INTO attempts (...) VALUES (...,'RUNNING')` (359-362) ... `UPDATE steps SET current_attempt_id=$1` (366-368) ... `tx.Commit()` (376) | Yes — new attempt + CAS-move of current_attempt_id, one blade, no dual-validity instant |
-| TX5 | `internal/store/postgres.go:388 ReplayWorkerSide` | `tx, err := s.db.BeginTx(ctx, nil)` (389) ... find the DLQ step (396-404) ... `INSERT INTO attempts (...) VALUES (...,'RUNNING')` (408-413) ... `UPDATE steps SET attempt_count=0, status='RUNNING', current_attempt_id=$1, completed_at=NULL` (415-421) ... `UPDATE runs SET status='RUNNING'` (423-427) ... `tx.Commit()` (429) | Yes — count→0 + step→running + run→running + new attempt + current_attempt_id, all 5 writes in one blade. Actual worker dispatch correctly happens OUTSIDE this transaction, in `orchestrator/replay.go:59 ResumeReplayedStep` (a DB tx cannot contain an HTTP call) — matches the ledger's own convention (TX1/TX2 also describe "dispatch after commit" as a separate step from the tx's listed Contents) |
-| TX6 | `internal/store/postgres.go:438 ReplayPlannerSide` | Single `s.db.ExecContext(ctx, UPDATE runs SET status='RUNNING' ...)` (no explicit `BeginTx` — doc comment: "a single UPDATE is already atomic") | Yes — run→running only |
-| TX7 | `internal/store/postgres.go:454 MarkRunDone` | Single `s.db.ExecContext(ctx, UPDATE runs SET status='DONE' ...)` | Yes — run→done |
-| TX8 | `internal/store/postgres.go:469 MarkRunDLQPlannerDeclared` | `tx, err := s.db.BeginTx(ctx, nil)` (470) ... `INSERT INTO dead_letter_queue (...,NULL,'planner_declared_fail',...)` (481-484) ... `UPDATE runs SET status='DLQ'` (488-490) ... `tx.Commit()` (via `return tx.Commit()`, 498) | Yes — run→DLQ + DLQ record (planner_declared_fail), one blade, called from `orchestrator/loop.go:244` on `PlannerVerdictFail` — no budget consumed (no retry loop precedes it) |
-| TX9 | `internal/store/postgres.go:503 MarkRunDLQPlannerExhausted` | `tx, err := s.db.BeginTx(ctx, nil)` (504) ... `INSERT INTO dead_letter_queue (...,NULL,$2,...)` (515-518) ... `UPDATE runs SET status='DLQ'` (522-524) ... `tx.Commit()` (via `return tx.Commit()`, 532) | Yes — run→DLQ + DLQ record (reason=final attempt's class, full detail in context via `orchestrator/loop.go:458 decideWithBudget`'s 30s×3 loop), one blade |
-| CAS-A | Embedded in `internal/store/postgres.go` `CheckpointSuccess` (190-199) and `RecordFailure` (289-298) | `UPDATE ... WHERE attempt_id = $1::uuid AND status = 'RUNNING' AND EXISTS (SELECT 1 FROM steps WHERE step_id=$2 AND current_attempt_id=$1::uuid)`; `RowsAffected()==0` → `ReportSuperseded`/`FailureOutcome{Report: ReportSuperseded}`, never an error | Yes — single conditional UPDATE, inherently atomic; realized as the WHERE-clause of TX2's/TX3's first statement rather than a standalone TX (correct: CAS-A is not itself a numbered ledger transaction, it's the mechanism inside TX2/TX3) |
-
-All ten TXn methods were read in full (`internal/store/postgres.go`, 778
-lines, entire file) and every `BeginTx`...`Commit` span was traced
-statement-by-statement against its ledger row. No TX is split across two
-Go functions, none merges two ledger entries, none reorders "commit → act"
-into "act → commit". `defer tx.Rollback()` (no-op after a successful
-`Commit()`, standard Go `database/sql` idiom) appears immediately after
-every `BeginTx` in all seven multi-statement TXns — confirmed no code path
-between `BeginTx` and `Commit` can return without either committing or
-rolling back.
-
-### 5b. Doc-vs-code diff, whitepaper §4–§11
-
-- **§4 (The State Model):** Code matches exactly — `internal/core/interfaces.go`'s
-  three closed enums (`RunStatus`/`StepStatus`/`AttemptStatus`) are
-  byte-identical to `migrations/001_initial.sql`'s CHECK constraints and to
-  the whitepaper's 3×3×3 table; `FailureReason`'s four values match §4.2's
-  table. **One divergence found** (also affects §7, listed once here):
-  whitepaper §4.2 states the `malformed` attempt-failure reason applies to
-  "an async callback with valid ids but unparseable output", implying a code
-  path that classifies some async `/tasks/complete` callback as
-  `failed/malformed`. **No such path exists.** `grep -rn
-  "FailureReasonMalformed" internal/` shows it is produced ONLY by
-  `internal/transport/sync.go:97` (`SyncTransport.Dispatch`'s
-  `extractOutput` gate). `internal/api/server.go:335 handleTaskComplete`
-  decodes `req.Output` as an unvalidated `json.RawMessage` and unconditionally
-  constructs `core.Result{Status: core.ResultStatusDone, Output: req.Output}`
-  — there is no output-shape check, no `output_field` concept for async (per
-  `core.StepSpec.OutputField`'s own doc comment: "sync only"), and therefore
-  no way for an async callback with well-formed JSON ids to ever be classified
-  `malformed`. Any `/tasks/complete` call with valid `step_id`/`attempt_id` is
-  treated as success regardless of `output`'s content (including `output`
-  being absent, which persists as a JSON `null` value, not SQL NULL). This is
-  a real code/doc divergence, not a documentation nit — it means part of the
-  attempt-state space the whitepaper describes as reachable (`failed`/
-  `malformed` via async) is, in the current implementation, unreachable by
-  design of the async path. See §6/§7 below.
-- **§5 (The Step Loop):** Code matches — `internal/orchestrator/loop.go`'s
-  `driveSteadyState` implements the 8-step loop verbatim (frontier read →
-  planner ask → TX1 → dispatch → await → TX2/TX3 → planner done/fail →
-  TX7/TX8), Barrier 1 and Barrier 2 both enforced as stated. **None found**
-  beyond the §4/§7 async-malformed gap already noted.
-- **§6 (The Timeout Doctrine):** Code matches — `systemDefaultTimeout = 60 *
-  time.Second`, `effectiveTimeout()` resolves step>workflow>system exactly as
-  documented, `plannerCallTimeout = 30s` / `plannerMaxAttempts = 3` match
-  §7.2's budget verbatim, retry delay is `DefaultRetryPolicy(){Delay: 5 *
-  time.Second}`. The creation-anchored deadline (`createdAt.Add(timeout)`,
-  computed immediately after TX1/TX4/TX5 returns and passed via
-  `context.WithDeadline`) makes §6's "the clock starts at attempt creation"
-  literally true, as the whitepaper itself notes it should be. **None found.**
-- **§7 (Failure Classification, Retry, and Budgets):** Worker side matches
-  exactly (TX3's one-blade DLQ verdict, TX4's atomic handover, the
-  crash-between-TX3-and-TX4 window explicitly claimed by recovery's budget
-  check). Planner side matches exactly (`MalformedError` type +
-  `errors.As` classification in `decideWithBudget`, `fail` verdict consuming
-  no budget). **One divergence** — the same async-malformed gap noted under
-  §4 belongs here too: §7.1's "Malformed edge cases" paragraph explicitly
-  describes the async-unparseable-output case as a real path; it is not
-  implemented. Also note (not a contradiction, a code-only detail the doc
-  doesn't mention): `defaultRetryLimit = 3` (`internal/orchestrator/loop.go:33`)
-  is used when a workflow's `planner_config` omits `retry_limit`. The
-  whitepaper defines X as configurable per-workflow but states no fallback
-  default the way it does for the 60s timeout; this constant is an
-  implementation choice, already flagged as such in the code's own comment
-  ("the whitepaper does not specify a default for X ... flagged in the
-  Session 5 report"). Listed here as "behavior in code the doc doesn't
-  mention" per this session's own instruction, not as a defect.
-- **§8 (Invariants, the Combination Table, and Recovery):** Code matches —
-  all six derived invariants hold by construction (verified via the TX
-  table above: e.g. invariant 3 "attempt_count=X ⇒ step=DLQ ∧ run=DLQ" is
-  exactly TX3's blade). `internal/orchestrator/recovery.go`'s `RecoverRuns`
-  and `loop.go`'s one-time recovery check in `Run()` implement the
-  run×last_step combination table's five legal rows and both impossible
-  combinations are structurally unreachable (verified by reading, not just
-  asserted — `run=done` is only ever set by `MarkRunDone`, called only after
-  `PlannerVerdictDone`, which is only reached inside `driveSteadyState`'s
-  loop top, itself only entered when `LoadFrontier`'s `PendingStep==nil`).
-  Recovery's "skip the 5s retry delay" clause is satisfied by construction
-  (no `time.After` call exists between `StartNewAttempt` and
-  `dispatchAndResolve` in the recovery branch of `Run()`). **None found.**
-- **§9 (Component Failure Overview):** Worker/Planner/Orchestrator rows
-  match (§6/§7/§8 above cover their mechanisms). Storage-down row is an
-  emergent property rather than an explicit code branch — no code
-  specifically "detects storage down"; a failed write simply propagates a Go
-  `error` up through `Loop.Run` (or a handler returns 500), leaving whatever
-  was last committed as the true state, and recovery reclaims it on next
-  restart exactly as recovery already does for any other crash. This
-  matches the whitepaper's own framing ("the system halts as a whole" is a
-  consequence, not a designed subsystem) — **none found**, but flagged as
-  "implicit rather than explicit" for completeness.
-- **§10 (Result Reporting: CAS and the Single Writer):** Code matches
-  exactly — CAS-A verified in the TX table above; the single-writer
-  principle is upheld by construction: `internal/api/server.go`'s
-  `handleTaskComplete`/`handleTaskFail` call only `s.async.DeliverCallback`
-  (validate + push + 200) and `internal/transport/async.go`'s
-  `DeliverCallback` performs zero `StateStore` writes (grep confirms no
-  `s.store.*` or DB write call anywhere in `async.go` — only a read,
-  `LoadFrontier`, to check freshness before routing). All step/run state
-  writes trace back to `orchestrator/loop.go`/`replay.go` alone. A success
-  report arriving after a timeout verdict is correctly rejected by CAS-A
-  (the timeout's TX3 already flipped the attempt to `FAILED`, so the late
-  success's `CheckpointSuccess` CAS predicate `status='RUNNING'` no longer
-  matches → `ReportSuperseded`). **None found.**
-- **§11 (The DLQ and Replay):** Code matches — four DLQ reasons match
-  `core.DLQReason`'s enum exactly; TX5/TX6 match the ledger table above;
-  `replay_round` is confirmed absent from both schema and code (global
-  sweep, §2a). `ResumeReplayedStep` (`internal/orchestrator/replay.go`)
-  implements the "dispatch the worker" clause of TX5's whitepaper
-  description correctly outside the transaction (a DB transaction cannot
-  contain an HTTP call — see the TX5 table row above). **None found.**
-
-**Overall: one genuine, reproducible code/doc divergence found** (async
-callbacks never produce a `malformed` failure, contradicting whitepaper
-§4.2 and §7.1's explicit description of that path) — reported in §6/§7
-below per this session's "report, do not fix" mandate. No other
-contradictions or undocumented behaviors were found in §4–§11.
+**New (unexported) function**: `isAsyncOutputMalformed(output json.RawMessage) bool` in `internal/api/server.go` — the async analogue of `internal/transport/sync.go`'s `extractOutput`. Not part of any public interface; a private classification helper local to the handler.
 
 ## 6. 未解問題（分類 —— 這欄最重要）
-- 🟡 已停下、需裁示：**One genuine defect found this session, NOT fixed per
-  the Session 8 mandate** — whitepaper §4.2's attempt-state table and §7.1's
-  "Malformed edge cases" paragraph both describe an async-worker path where
-  "a callback with valid ids but unparseable output" is classified as
-  `failed(malformed)`. No code implements this: `FailureReasonMalformed` is
-  produced only by `internal/transport/sync.go`'s sync-only `extractOutput`
-  gate; `internal/api/server.go:335 handleTaskComplete` and
-  `internal/transport/async.go`'s `DeliverCallback` unconditionally treat
-  any `/tasks/complete` call with valid `step_id`/`attempt_id` as a success,
-  regardless of `output`'s content or absence. Options for the owner
-  (framed, not decided, per this session's scope): (A) implement the
-  documented behavior — define what "unparseable" means for an async
-  payload (there is no `output_field` concept for async, unlike sync, so
-  this needs its own acceptance rule, e.g. "output must be present and
-  non-null" or similar) and add the classification in
-  `handleTaskComplete`/`DeliverCallback`; (B) correct the whitepaper/rules
-  docs to drop the async-malformed claim and document that async workers
-  cannot currently produce a `malformed` verdict (only `worker_reported` via
-  `/tasks/fail`, or `timeout`/`orphaned` via the loop); (C) accept as a
-  known limitation and add it to the Temporary Design Registry (whitepaper
-  §18) explicitly. This session did not choose an option, per its own
-  "report it first, fix only with owner approval" rule. Full evidence:
-  §5b above and §7 below.
+- 🟡 已停下、需裁示：**None this session that blocks completion** — the one 🟡 item carried in from Session 8 (the async-malformed gap itself) is now RESOLVED by this session's fix. See Question 7 below for the two open sub-questions this session's own design choices raise (both are genuinely ambiguous per the whitepaper text, not blockers — the minimum bar was implemented and verified; these are refinements for the owner to consider, not defects).
 - 🔴 我自行假設後繼續：
-  1. Interpreted "the demo never relies on behavior listed in the Temporary
-     Design Registry" (cross-session invariant checklist) as a spot-check
-     against the registry's 8 items rather than an exhaustive proof; nothing
-     found in `demo/`/`test/acceptance/` contradicts it (e.g. full-history
-     transmission, registry item #1, is used by the demos but that is the
-     registered/accepted MVP behavior, not a violation of it).
-  2. Treated the `defaultRetryLimit = 3` fallback (§5b, §7) as "undocumented
-     but already self-flagged in code" rather than a fresh finding requiring
-     its own owner question, since the code's own comment already discloses
-     it and attributes it to the Session 5 report.
-- 無其他：everything else in this session's instructions (TX ledger table,
-  global sweeps, doc-vs-code diff for §4–§11, full verification, both
-  acceptance oracles) was directly executable and is reported in full above.
+  1. Interpreted the whitepaper's single phrase "valid ids but unparseable output" as covering exactly two cases — key absent, key present as JSON `null` — and NOT covering a present-but-empty `{}`/`[]` object/array. Justification: "unparseable" most naturally reads as a JSON-syntax/absence failure (mirroring sync's two prongs: invalid JSON body, or a *named* field absent), and `{}`/`[]` are neither — they are syntactically valid, semantically empty payloads a worker might legitimately intend ("no fields to report" is a valid business outcome, not necessarily a bug). This is the single most consequential judgment call in this session; see Question 7 for the case for the alternative.
+  2. Used a research subagent (not manual reading) to verify `docs/USER_MANUAL.md` contains no assertion contradicting this session's fix, per the prompt's own instruction to "check first, edit only if genuinely contradicted." Treated the subagent's negative result (no contradicting sentence found) as sufficient grounds to leave the file untouched, rather than re-reading it manually end-to-end myself.
+- 無其他：everything else in this session's instructions (the classification rule, the handler wiring, the three tests, the doc-comment update, all four completion-condition command categories) was directly executable and is reported in full above.
 
 ## 7. CONFIRM 值（unchanged this session）
 - planner_config 內 HTTP planner URL 的欄位名：`url`（no action needed）
 - retry limit X 在 planner_config 的欄位名：`retry_limit`（no action needed）
 - `POST /workflows` / `POST /runs` 回傳的 id 欄位名：`workflow_id` / `run_id`（no action needed）
-- workflow-level timeout override 的欄位名：`default_timeout_seconds`（unchanged
-  since Session 7; still consistent, no contradicting evidence found this
-  session either）
+- workflow-level timeout override 的欄位名：`default_timeout_seconds`（unchanged）
 
-**Open questions for the owner (Session 8, final):**
-1. The async-malformed gap above (§6 🟡) — which of options A/B/C, or
-   another option the owner prefers.
-2. Carried over from Session 7 (§7 of that session's own snapshot, restated
-   here since it was never explicitly resolved): should `README.md`'s "Fast
-   workers (<30s)" line be updated to avoid implying a stale 30s system
-   timeout default? This session did not re-investigate it (out of the
-   audit's file scope — README.md prose beyond doc-vs-code correctness was
-   not this session's focus — but it is repeated here since Session 8 is
-   explicitly the last chance to surface it before the refactor plan ends).
-3. Whether the `defaultRetryLimit = 3` fallback (§5b/§6) should be promoted
-   from an implementation-only constant to a documented whitepaper default,
-   given the timeout knob already has one (60s) and this asymmetry is now
-   visible to an external reader of the whitepaper who has no access to the
-   code comment explaining it.
+**Open questions for the owner (Session 8.5):**
+1. Should a present-but-empty `{}` or `[]` async output also be classified `malformed`? This session's answer is NO (see §6 🔴 1 for the reasoning), but the whitepaper's wording is genuinely ambiguous here — an argument for YES exists too: an empty object is exactly as useless to a downstream planner/step as a null one (`HistoryEntry.Output`'s doc comment says a DONE step's output is "always present," which is technically satisfied by `{}` but arguably not satisfied *in spirit*). If the owner wants `{}`/`[]` included, the fix is a one-line change to `isAsyncOutputMalformed` in `internal/api/server.go`.
+2. This session's fix only classifies the OUTPUT content of an otherwise well-formed `/tasks/complete` callback. It does not, and was not asked to, touch the "malformed JSON body entirely" case (e.g. `POST /tasks/complete` with a body that isn't valid JSON at all) — that already returns 400 via the pre-existing `json.NewDecoder(...).Decode(&req)` error path, before `step_id`/`attempt_id` can even be read, matching whitepaper §7.1's "an async callback missing valid step_id/attempt_id gets a 400." Confirming this reading is correct: is a syntactically-broken JSON body meant to be indistinguishable from a missing-ids callback (both 400, zero effect), or should it also somehow reach `malformed` classification? The current code (unchanged by this session) treats it as the former. Not re-litigated this session since it was outside the stated scope (the prompt's "unparseable output" language is about the `output` field's own value, not body-level JSON validity), but flagged since it's adjacent enough to be worth an explicit owner sign-off.
+3. Carried over from Session 8 (never explicitly re-raised since): should `defaultRetryLimit = 3` (`internal/orchestrator/loop.go`) be promoted from an implementation-only constant to a documented whitepaper default? Out of this session's scope; restated here only because Session 8 flagged it as "Session 8 is the last chance to surface it" before 8.5 existed — now that a 8.5 exists, it is surfaced again in case the owner wants to fold it into a future micro-session.
 
 ---
 
@@ -579,3 +231,4 @@ contradictions or undocumented behaviors were found in §4–§11.
 - Follow-up (`98f113d`, no session number, owner-approved oracle fix)：gave `/sync/fail` in `test/acceptance/fake_worker.py` a configurable delay (mirroring `/async/ok`/`/async/fail`) so the frozen acceptance oracle's `psql`-subprocess polling could observe the ~8ms TX5-reset-to-dispatch window flagged by Session 6.5 as the root cause of its one remaining oracle failure; also folded in an uncommitted `go.mod` correction (`gopkg.in/yaml.v3` promoted from indirect to direct, matching `internal/planner/static.go`'s direct import since Session 5). Confirmed both `crash_recovery_test.py` and `EXPECT_X=2 dlq_replay_test.py` PASS end-to-end against a live stack afterward.
 - Session 7 (`d7925b7`)：aligned all demo scripts/docs and the project's two top-level governance docs to the v1.0 three-state model; zero `.go` files touched (confirmed empty `git status --porcelain internal/ cmd/ migrations/`). `demo/crash_demo.py` gained direct Postgres/log assertions after recovery: exactly one `failure_reason='orphaned'` attempt on the crashed step, the step's Barrier-1 record (`created_at`+`decision`) byte-identical pre/post-crash (proving the planner was asked exactly once), and the worker's real processing log line appearing exactly once (proving idempotency-cache absorption) — all passing against a live stack. `demo/run_demo.sh` gained a `check_dlq_worker_retry_exhausted` assertion in scenario 2 (DLQ reason + per-attempt failure reason present in `context`) and had its two remaining old-model status checks fixed (`FAILED`→`DLQ` for run/step terminal-state checks, since step status never has a `FAILED` value in v1.0); all 3 scenarios re-verified passing end-to-end. Purged the last old-model traces from `demo/playbook/PLAYBOOK.{en,zh}.md` (`attempt_number`/`dispatched_at` SQL → `status`/`failure_reason`/`created_at`; "DECIDED" wording → "decision persisted (TX1, Barrier 1)"). Switched `demo/workers/{ocr,summarize}_worker.py`'s idempotency cache to key primarily on the `X-StateFlow-Step-ID` header (input-hash fallback only), making `docs/USER_MANUAL.md`'s sync-idempotency recommendation concrete in running demo code. Fully rewrote `docs/USER_MANUAL.md`: corrected timeout defaults (60s system default, `default_timeout_seconds` workflow override, per-step override — no more "defaults to 30s" claims anywhere, including the planner-config table, which was also corrected to drop the no-longer-read `max_retries`/planner-local `timeout_seconds` keys and add the real `retry_limit`/`default_timeout_seconds` keys); replaced the single `planner_failed` DLQ reason with the real four-value set plus a full triage table (new §3, explicitly warning against blind-replaying `planner_declared_fail`); added a quantified concurrent-idempotency contract section (up to X concurrent duplicates, explicitly covering timeout-triggered re-dispatch racing a still-alive worker, not just crash re-dispatch); extended the superseded-callback section to cover a success report arriving after a timeout verdict; rewrote the dispatch-format/idempotency sections per whitepaper §13.1 (sync = bare input + `X-StateFlow-Step-ID`/`X-StateFlow-Attempt-ID` headers, header preferred over input-hash for the cache key). Replaced the transitional `CLAUDE.md` with a final version: full Quick Reference (3×3×3 states, the two barriers, the run×last_step combination table, the full TX ledger one-liner-each, the timeout doctrine, the orphan rule, the persisted-retry-budget rule, the CAS rule, the single-writer rule, wire formats), the whitepaper §18 Temporary Design Registry pulled forward verbatim as a named "Deferred / Explicitly Out of Scope" list, and a generalized (no-longer-"TRANSITIONAL") Development Discipline section; confirmed the `-p 1` test-package set is unchanged (`internal/api`, `internal/orchestrator`, `internal/store`, via a fresh grep). Fixed `README.md`'s two broken doc links (`DESIGN.md` → removed, content now lives in the whitepaper; `docs/StateFlow_Whitepaper_v0.8.md` → `docs/StateFlow_Whitepaper_v1_0.md`) and two old-model phrases ("Three recovery rules on restart" → "Combination-table recovery with orphan-claim + budget check on restart"; "Ghost Mode retry" → "in-process orphan sweeper", matching whitepaper §16/§18's explicit dissolution of Ghost Mode). All four completion-condition commands verified green against a live from-`--build` stack: `docker compose up -d --build`, `python demo/crash_demo.py` (PASS, new assertions included), `./demo/run_demo.sh` scenarios 1–3 (all PASS, scenario 2's new DLQ check included), `go test -p 1 ./...` (6/6 packages ok, 2 with no test files) — see §2 for verbatim output. `demo/configs/*.yaml` and `demo/planner/llm_adapter.py`'s DUMMY plan already had explicit, comfortably-exceeding `timeout_seconds` and needed no edits (verified by reading, not assumed).
 - Session 8 (`ab2c4f4` — this snapshot commit adds only STATE_SNAPSHOT.md on top, zero code changed)：final end-to-end conformance audit. Built the full TX ledger conformance table (TX-W through TX9 + CAS-A, all traced statement-by-statement in `internal/store/postgres.go` against whitepaper §19/rules v3 §21 — all ten TXn methods confirmed single `BeginTx...Commit` blades with exactly their ledger-specified contents, or a single already-atomic statement where the ledger specifies one write). Ran the full global-sweep checklist: both mandated greps clean (only anti-regression doc-comments/test-guards, zero real hits), `attempt_count` confirmed written only by TX3(++)/TX5(=0), `time.Now()` confirmed never persisted (used only for in-memory `context.WithDeadline` inputs). Did the whitepaper §4–§11 doc-vs-code diff section by section, explicit "none found" per section except one genuine, reproducible divergence: whitepaper §4.2/§7.1 describe an async-worker `malformed` failure path ("valid ids but unparseable output") that no code implements — `FailureReasonMalformed` is producible only by the sync transport (`internal/transport/sync.go`); `internal/api/server.go`'s `handleTaskComplete` and `internal/transport/async.go`'s `DeliverCallback` unconditionally treat any well-formed `/tasks/complete` call as success regardless of `output`'s content. Reported to the owner (§6/§7 of this snapshot) with three framed options, NOT fixed, per this session's explicit "report it first, fix only with owner approval" mandate — this is the one finding of the entire refactor plan left open for owner decision. Full verification all green: clean-clone `docker compose down -v && up -d --build` (all 8 containers healthy), `python3 demo/crash_demo.py` PASS, `./demo/run_demo.sh` scenarios 1–3 all PASS, `go build`/`go vet`/`gofmt -l` (one pre-existing unrelated flag, unchanged since 6.5), `TEST_DATABASE_URL=... go test -p 1 ./...` 6/6 packages ok, and — independently re-run rather than trusted from the `98f113d` self-report — both owner acceptance oracles (`crash_recovery_test.py`, `EXPECT_X=2 dlq_replay_test.py`) PASS end-to-end against a stack this session itself rebuilt from a fresh Postgres volume. Zero `.go`/`.sql` files changed (confirmed empty `git status --porcelain internal/ cmd/ migrations/`); one incidental file-mode-only change on `demo/run_demo.sh` (100644→100755, a `cp`/`chmod` side effect of the non-interactive scenario-runner technique, zero content diff) was caught and reverted before being reported as "no changes". This is the final session of the numbered plan (0–8, plus 6.5 and two unnumbered follow-ups) — no Session 9 is planned; the one open item is the async-malformed owner decision above.
+- Session 8.5 (`30a2d34`)：owner decided to implement the Session-8-flagged async-malformed gap now rather than defer it. Rewrote `internal/api/server.go`'s `handleTaskComplete`: a new unexported `isAsyncOutputMalformed(output json.RawMessage) bool` classifies an async `/tasks/complete` callback's `output` as `failed(malformed)` when the key is absent from the JSON body OR present but equal to the JSON literal `null` (a present `{}`/`[]` is deliberately left `done` — judgment call, documented and flagged as an open question, not silently guessed); the handler still ACKs HTTP 200 for a malformed report, consistent with the existing CAS/superseded-report contract. No new Ledger transaction: the fix works entirely by choosing which pre-existing `core.Result` (done vs. failed(malformed)) the handler constructs before calling `DeliverCallback` — TX2/TX3 route it exactly as they already did for every other Result. This closes the `migrations/001_initial.sql` schema-invariant violation Session 8 found ("output non-null → step DONE" was being violated by a null-output async success silently checkpointing DONE). Updated `core.StepSpec.OutputField`'s doc comment (`internal/core/interfaces.go`) to describe both the sync subtree-presence mechanism and the new async absent/null mechanism, replacing its old "sync only" overclaim; no field/type shape changed. Added 3 new tests to `internal/api/server_test.go` that drive a REAL async dispatch through a live `Loop.Run()` goroutine (capturing the loop's own dispatch envelope and replying to `/tasks/complete` as the worker would — the pre-existing `TestAPI_Callback_Dedup` plants DB rows directly and never has a live `Dispatch` registered, so it could not have exercised this logic): absent-output stays below budget (RUNNING, attempt_count=1, malformed), null-output at retry_limit=1 exhausts the budget (DLQ, worker_retry_exhausted, zero extra dispatch), real-output is unaffected (regression check). `docs/USER_MANUAL.md` was checked (via a research subagent) for any contradicting claim and found to have none — left untouched, per the session's own "check first, edit only if genuinely contradicted" instruction. Did NOT touch `internal/transport/sync.go`, `internal/transport/async.go`, `docs/StateFlow_Whitepaper_v1_0.md`, `docs/StateFlow_Rules_Consolidation_v3_EN.md`, or `CLAUDE.md` — none required a change and none were in scope. Full verification all green against a live `docker compose down -v && up -d --build` stack: `go build`/`go vet`/`gofmt -l` (same one pre-existing unrelated flag as every session since 6.5), `TEST_DATABASE_URL=... go test -p 1 ./...` 6/6 packages ok including the 3 new tests plus all pre-existing `internal/api` tests unchanged, `python3 demo/crash_demo.py` PASS, `./demo/run_demo.sh` scenarios 1–3 all PASS, and both owner acceptance oracles (`crash_recovery_test.py`, `EXPECT_X=2 dlq_replay_test.py`) PASS — the latter two required diagnosing and working around a nested-shell command-substitution quirk specific to invoking `wsl.exe` from this session's Bash tool (documented in §4/§2c above) that silently produced an empty `ADVERTISE_HOST`, unrelated to any StateFlow code. `git status --porcelain` confirms only the three declared in-scope files changed.
