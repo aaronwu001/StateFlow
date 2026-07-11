@@ -261,6 +261,7 @@ GET  /dlq                            list DLQ entries
 POST /dlq/{id}/replay                replay (worker-side = TX5, planner-side = TX6)
 POST /tasks/complete                 async worker callback
 POST /tasks/fail                     async worker failure callback (optional retry_after_seconds: accepted, ignored — registry item 5)
+GET  /healthz                        liveness (Postgres reachability); no auth, not part of the versioned business API above
 ```
 
 `planner_config` (one JSONB blob on the workflow): `url` (http planner, required),

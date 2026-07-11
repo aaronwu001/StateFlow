@@ -22,4 +22,11 @@ COPY --from=builder /out/stateflow /stateflow
 
 EXPOSE 8080
 
+# Distroless has no shell, curl, or wget, so the probe is the binary itself
+# in its `healthcheck` subcommand (cmd/stateflow/main.go's runHealthcheck):
+# a self HTTP GET against GET /healthz, exit 0/non-zero. Closes Temporary
+# Design Registry item #8 (whitepaper §18).
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=5 \
+    CMD ["/stateflow", "healthcheck"]
+
 ENTRYPOINT ["/stateflow"]

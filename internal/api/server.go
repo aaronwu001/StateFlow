@@ -95,7 +95,39 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /tasks/fail", s.handleTaskFail)
 	mux.HandleFunc("GET /dlq", s.handleGetDLQ)
 	mux.HandleFunc("POST /dlq/{id}/replay", s.handleDLQReplay)
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	return mux
+}
+
+// ── GET /healthz ─────────────────────────────────────────────────────────
+//
+// Closes Temporary Design Registry item #8 (whitepaper §18): the distroless
+// runtime image has no shell, so liveness/readiness previously could only be
+// checked externally. This is a pure read — no auth, not part of the
+// versioned business API surface documented in CLAUDE.md's path table — and
+// it never touches run/step/attempt state (single-writer rule, whitepaper
+// §10: only the orchestrator loop writes that state; this handler doesn't
+// even go through core.StateStore).
+//
+// Liveness is "can this process reach Postgres": a trivial round trip
+// through the *sql.DB connection pool this Server already holds (s.db) —
+// no new ad hoc connection is opened. 200 + small JSON body on success, 503
+// + small JSON body on failure. Bounded by a short local timeout so a
+// wedged DB cannot hang the health probe indefinitely.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	var one int
+	if err := s.db.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+		jsonResp(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unhealthy",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	jsonResp(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // ── POST /workflows (Ledger TX-W) ─────────────────────────────────────────

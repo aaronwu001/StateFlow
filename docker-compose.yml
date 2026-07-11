@@ -30,6 +30,16 @@ services:
       LISTEN_ADDR: ":8080"
     ports:
       - "8080:8080"
+    healthcheck:
+      # Distroless has no shell/curl/wget, so this invokes the binary's own
+      # `healthcheck` subcommand (cmd/stateflow/main.go), which HTTP-GETs
+      # this same process's GET /healthz (internal/api/server.go). Closes
+      # Temporary Design Registry item #8 (whitepaper §18).
+      test: ["CMD", "/stateflow", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
     depends_on:
       postgres:
         condition: service_healthy
