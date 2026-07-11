@@ -256,7 +256,6 @@ narrated version of all three scenarios.
 - [x] `GET /healthz` + `stateflow healthcheck` self-check subcommand, wired into
   the Docker/compose healthchecks shown above
 - [x] This README
-- [ ] Lightweight static status UI
 
 Deferred beyond Phase 1.5 (whitepaper §18's Temporary Design Registry): full-history
 transmission's summary-plus-fetch alternative, late-result salvage, an in-process
