@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StateFlow — Status</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0b0d12;
+    --panel: #12151c;
+    --border: #262b36;
+    --text: #e6e8eb;
+    --muted: #8a91a0;
+    --accent: #5b8cff;
+    --ok: #3ecf8e;
+    --warn: #f5a623;
+    --err: #f2545b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --border: #dde1e8;
+      --text: #14161a;
+      --muted: #5b606c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    line-height: 1.4;
+  }
+  h1 {
+    font-size: 18px;
+    margin: 0 0 4px 0;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 24px;
+  }
+  section h2 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 12px 0;
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  input[type=text] {
+    flex: 1;
+    max-width: 420px;
+    padding: 8px 10px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  button {
+    padding: 8px 14px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { opacity: 0.9; }
+  button.secondary {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    background: rgba(128,128,128,0.15);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }
+  .badge-DONE { background: rgba(62,207,142,0.18); color: var(--ok); }
+  .badge-RUNNING { background: rgba(91,140,255,0.18); color: var(--accent); }
+  .badge-DLQ { background: rgba(242,84,91,0.18); color: var(--err); }
+  .badge-FAILED { background: rgba(245,166,35,0.18); color: var(--warn); }
+  .muted { color: var(--muted); }
+  .error-box {
+    background: rgba(242,84,91,0.1);
+    border: 1px solid rgba(242,84,91,0.4);
+    color: var(--err);
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 12px;
+  }
+  .empty {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 8px 0;
+  }
+  .meta {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .meta span { margin-right: 16px; }
+</style>
+</head>
+<body>
+
+<h1>StateFlow — Status</h1>
+<div class="subtitle">Read-only ops view. No write actions — replay stays a POST /dlq/{id}/replay API call.</div>
+
+<section id="run-section">
+  <h2>Run status</h2>
+  <div class="row">
+    <input type="text" id="run-id-input" placeholder="run_id (e.g. a1b2c3...)" autocomplete="off">
+    <button id="run-fetch-btn">Fetch</button>
+  </div>
+  <div id="run-error"></div>
+  <div id="run-output"></div>
+</section>
+
+<section id="dlq-section">
+  <h2>Dead-letter queue</h2>
+  <div class="row">
+    <button id="dlq-refresh-btn" class="secondary">Refresh</button>
+  </div>
+  <div id="dlq-error"></div>
+  <div id="dlq-output"></div>
+</section>
+
+<script>
+(function () {
+  "use strict";
+
+  function esc(s) {
+    if (s === null || s === undefined) return "";
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function badge(status) {
+    var cls = "badge badge-" + esc(status);
+    return '<span class="' + cls + '">' + esc(status) + "</span>";
+  }
+
+  function fmtTime(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return esc(iso);
+    return d.toISOString().replace("T", " ").replace("Z", " UTC");
+  }
+
+  // ── Run status ──────────────────────────────────────────────────────────
+
+  var runInput = document.getElementById("run-id-input");
+  var runFetchBtn = document.getElementById("run-fetch-btn");
+  var runError = document.getElementById("run-error");
+  var runOutput = document.getElementById("run-output");
+
+  function renderRun(run) {
+    var html = "";
+    html += '<div class="meta">';
+    html += '<span><strong>run_id:</strong> <code>' + esc(run.run_id) + "</code></span>";
+    html += '<span><strong>status:</strong> ' + badge(run.status) + "</span>";
+    html += '<span><strong>created:</strong> ' + esc(fmtTime(run.created_at)) + "</span>";
+    html += '<span><strong>updated:</strong> ' + esc(fmtTime(run.updated_at)) + "</span>";
+    html += "</div>";
+
+    if (run.status === "DLQ" && run.dlq_reason) {
+      html += '<div class="error-box"><strong>DLQ reason:</strong> ' + esc(run.dlq_reason) + "</div>";
+    }
+
+    var steps = run.steps || [];
+    if (steps.length === 0) {
+      html += '<div class="empty">No steps recorded yet.</div>';
+    } else {
+      html += "<table><thead><tr>";
+      html += "<th>seq</th><th>step</th><th>status</th><th>attempts</th>";
+      html += "<th>current attempt</th><th>created</th><th>completed</th>";
+      html += "</tr></thead><tbody>";
+      steps.forEach(function (step) {
+        html += "<tr>";
+        html += "<td>" + esc(step.seq) + "</td>";
+        html += "<td>" + esc(step.step_name) + '<br><span class="muted">' + esc(step.step_id) + "</span></td>";
+        html += "<td>" + badge(step.status) + "</td>";
+        html += "<td>" + esc(step.attempt_count) + "</td>";
+
+        var ca = step.current_attempt;
+        if (ca) {
+          var caText = badge(ca.status);
+          if (ca.reason) {
+            caText += '<br><span class="muted">reason: ' + esc(ca.reason) + "</span>";
+          }
+          if (ca.error) {
+            caText += '<br><span class="muted">' + esc(ca.error) + "</span>";
+          }
+          html += "<td>" + caText + "</td>";
+        } else {
+          html += '<td class="muted">—</td>';
+        }
+
+        html += "<td>" + esc(fmtTime(step.created_at)) + "</td>";
+        html += "<td>" + (step.completed_at ? esc(fmtTime(step.completed_at)) : '<span class="muted">—</span>') + "</td>";
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+    }
+
+    runOutput.innerHTML = html;
+  }
+
+  function fetchRun() {
+    var runID = runInput.value.trim();
+    runError.innerHTML = "";
+    runOutput.innerHTML = "";
+    if (!runID) {
+      runError.innerHTML = '<div class="error-box">Enter a run_id.</div>';
+      return;
+    }
+    fetch("/runs/" + encodeURIComponent(runID))
+      .then(function (resp) {
+        if (!resp.ok) {
+          return resp.json().catch(function () { return {}; }).then(function (body) {
+            throw new Error(resp.status + " " + resp.statusText + (body.error ? ": " + body.error : ""));
+          });
+        }
+        return resp.json();
+      })
+      .then(renderRun)
+      .catch(function (err) {
+        runError.innerHTML = '<div class="error-box">' + esc(err.message) + "</div>";
+      });
+  }
+
+  runFetchBtn.addEventListener("click", fetchRun);
+  runInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") fetchRun();
+  });
+
+  // ── DLQ table ───────────────────────────────────────────────────────────
+
+  var dlqRefreshBtn = document.getElementById("dlq-refresh-btn");
+  var dlqError = document.getElementById("dlq-error");
+  var dlqOutput = document.getElementById("dlq-output");
+
+  function renderDLQ(data) {
+    var entries = (data && data.entries) || [];
+    if (entries.length === 0) {
+      dlqOutput.innerHTML = '<div class="empty">DLQ is empty.</div>';
+      return;
+    }
+    var html = "<table><thead><tr>";
+    html += "<th>id</th><th>run_id</th><th>step_id</th><th>reason</th><th>created</th>";
+    html += "</tr></thead><tbody>";
+    entries.forEach(function (e) {
+      html += "<tr>";
+      html += "<td>" + esc(e.id) + "</td>";
+      html += "<td><code>" + esc(e.run_id) + "</code></td>";
+      html += "<td>" + (e.step_id ? "<code>" + esc(e.step_id) + "</code>" : '<span class="muted">—</span>') + "</td>";
+      html += "<td>" + esc(e.reason) + "</td>";
+      html += "<td>" + esc(fmtTime(e.created_at)) + "</td>";
+      html += "</tr>";
+    });
+    html += "</tbody></table>";
+    dlqOutput.innerHTML = html;
+  }
+
+  function fetchDLQ() {
+    dlqError.innerHTML = "";
+    fetch("/dlq")
+      .then(function (resp) {
+        if (!resp.ok) {
+          throw new Error(resp.status + " " + resp.statusText);
+        }
+        return resp.json();
+      })
+      .then(renderDLQ)
+      .catch(function (err) {
+        dlqError.innerHTML = '<div class="error-box">' + esc(err.message) + "</div>";
+      });
+  }
+
+  dlqRefreshBtn.addEventListener("click", fetchDLQ);
+
+  // Initial load.
+  fetchDLQ();
+})();
+</script>
+
+</body>
+</html>
