@@ -103,10 +103,7 @@ jobs:
               cid=$(docker compose $COMPOSE_FILES ps -q "$svc")
               if [ -n "$cid" ]; then
                 health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$cid" 2>/dev/null || echo "")
-                # `stateflow` has no built-in healthcheck yet (Temporary Design
-                # Registry item #8, closed in Session 10) — a running container
-                # is all we can require for it here.
-                if [ "$health" = "healthy" ] || { [ "$svc" = "stateflow" ] && [ "$health" = "no-healthcheck" ]; }; then
+                if [ "$health" = "healthy" ]; then
                   healthy=1
                   break
                 fi
