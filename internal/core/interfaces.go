@@ -162,8 +162,19 @@ type StepSpec struct {
 	TimeoutSeconds int `json:"timeout_seconds"`
 
 	// OutputField names the subtree of a sync 2xx body to checkpoint as
-	// output; sync only. Its absence in the response body is a
-	// FailureReasonMalformed failure, not a missing field.
+	// output; sync only (internal/transport/sync.go's extractOutput). Its
+	// absence in the response body is a FailureReasonMalformed failure, not
+	// a missing field.
+	//
+	// Async has no OutputField subtree concept — there is nothing here to
+	// declare for an async step. Async gets its own, independent malformed
+	// mechanism instead: internal/api/server.go's handleTaskComplete
+	// classifies an async /tasks/complete callback whose "output" is absent
+	// from the JSON body, or present but the JSON literal null, as
+	// FailureReasonMalformed. The two mechanisms are unrelated checks over
+	// unrelated wire shapes (a subtree-presence check against a declared
+	// field name for sync; an absence/null check with no field name for
+	// async) that both terminate at the same FailureReasonMalformed value.
 	OutputField string `json:"output_field,omitempty"`
 }
 

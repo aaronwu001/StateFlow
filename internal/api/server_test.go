@@ -796,3 +796,255 @@ func TestAPI_DLQ_ReplayPlannerSide(t *testing.T) {
 		t.Logf("PASS — %d step(s) completed after replay (planner was genuinely re-asked, not skipped)", doneSteps)
 	}
 }
+
+// ── Test 7: async malformed-output detection (Session 8.5) ────────────────
+//
+// These three tests drive a REAL async dispatch through a live loop (unlike
+// TestAPI_Callback_Dedup, which plants DB rows directly and therefore never
+// has a live AsyncTransport.Dispatch call registered in the registry — a
+// callback delivered to an unregistered step is always a silent no-op, so
+// that test cannot exercise the classification logic added in this
+// session). Each test here starts a real run via POST /workflows + POST
+// /runs, captures the {step_id,attempt_id,input} envelope the loop's
+// AsyncTransport actually POSTs to a fake async worker, and then acts AS
+// that worker's callback — the same vantage point a real (possibly buggy)
+// async worker has.
+
+// asyncEnvelope mirrors internal/transport/async.go's unexported
+// asyncDispatchBody — duplicated here because this is a different package
+// and the wire shape is the point under test, not an internal Go type.
+type asyncEnvelope struct {
+	StepID    string          `json:"step_id"`
+	AttemptID string          `json:"attempt_id"`
+	Input     json.RawMessage `json:"input"`
+}
+
+// startAsyncStepRun creates a one-step async workflow (worker_url points at
+// a fake worker that captures every dispatch envelope onto envelopes and
+// replies 202, never calling back on its own) with the given retry_limit,
+// starts a run, and returns the run id plus the envelope captured from the
+// step's first dispatch.
+func startAsyncStepRun(t *testing.T, base string, retryLimit int) (runID string, envelopes <-chan asyncEnvelope, firstEnvelope asyncEnvelope) {
+	t.Helper()
+
+	ch := make(chan asyncEnvelope, 8)
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env asyncEnvelope
+		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+			t.Errorf("fake async worker: decode envelope: %v", err)
+			http.Error(w, "bad envelope", http.StatusBadRequest)
+			return
+		}
+		ch <- env
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(worker.Close)
+
+	plannerConfig := fmt.Sprintf(
+		`{"steps":[{"name":"step1","worker_url":%q,"mode":"async","timeout_seconds":5}],"retry_limit":%d}`,
+		worker.URL, retryLimit,
+	)
+	wfBody := fmt.Sprintf(`{"name":"async-malformed-wf","planner_type":"static","planner_config":%s}`, plannerConfig)
+	resp := post(t, base+"/workflows", wfBody)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /workflows: status %d, want 201", resp.StatusCode)
+	}
+	wfData := decodeJSON(t, resp)
+	workflowID := wfData["workflow_id"].(string)
+
+	resp = post(t, base+"/workflows/"+workflowID+"/runs", `{"workflow_input":{}}`)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /runs: status %d, want 202", resp.StatusCode)
+	}
+	runData := decodeJSON(t, resp)
+	runID = runData["run_id"].(string)
+
+	select {
+	case firstEnvelope = <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the fake async worker to receive the first dispatch envelope")
+	}
+	if firstEnvelope.StepID == "" || firstEnvelope.AttemptID == "" {
+		t.Fatalf("captured envelope missing ids: %+v", firstEnvelope)
+	}
+	return runID, ch, firstEnvelope
+}
+
+// pollAttemptFailed polls attempts for the given attempt_id to reach FAILED
+// and returns its failure_reason.
+func pollAttemptFailed(t *testing.T, db *sql.DB, attemptID string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var status string
+		var reason sql.NullString
+		if err := db.QueryRow(`
+			SELECT status, failure_reason FROM attempts WHERE attempt_id = $1::uuid
+		`, attemptID).Scan(&status, &reason); err != nil {
+			t.Fatalf("query attempt %s: %v", attemptID, err)
+		}
+		if status == "FAILED" {
+			if !reason.Valid {
+				t.Fatalf("attempt %s is FAILED with no failure_reason (schema invariant violated)", attemptID)
+			}
+			return reason.String
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("attempt %s did not reach FAILED within %v", attemptID, timeout)
+	return ""
+}
+
+// TestAPI_TaskComplete_AsyncMalformedOutput_Absent verifies that a
+// /tasks/complete callback with valid ids but NO "output" key at all is
+// classified failed(malformed), not done — the confirmed schema-invariant
+// violation this session closes (migrations/001_initial.sql: "output
+// non-null → step DONE"). retry_limit=3 keeps the step below its budget so
+// the failure is directly observable as RUNNING, not masked by an
+// immediate DLQ transition.
+func TestAPI_TaskComplete_AsyncMalformedOutput_Absent(t *testing.T) {
+	db := openDB(t)
+	resetSchema(t, db)
+
+	apiSrv, _ := newTestServer(t, db)
+	base := apiSrv.URL
+
+	_, _, env := startAsyncStepRun(t, base, 3)
+
+	// output key entirely absent from the JSON body.
+	body := fmt.Sprintf(`{"step_id":%q,"attempt_id":%q}`, env.StepID, env.AttemptID)
+	resp := post(t, base+"/tasks/complete", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /tasks/complete (absent output): status %d, want 200 (malformed content is not an HTTP error)", resp.StatusCode)
+	}
+	resp.Body.Close()
+	t.Log("PASS — POST /tasks/complete with output absent → HTTP 200")
+
+	reason := pollAttemptFailed(t, db, env.AttemptID, 5*time.Second)
+	if reason != string(core.FailureReasonMalformed) {
+		t.Errorf("attempt failure_reason = %q, want %q", reason, core.FailureReasonMalformed)
+	} else {
+		t.Logf("PASS — attempt %s failure_reason = %s", env.AttemptID, reason)
+	}
+
+	var stepStatus string
+	var attemptCount int
+	if err := db.QueryRow(`
+		SELECT status, attempt_count FROM steps WHERE step_id = $1
+	`, env.StepID).Scan(&stepStatus, &attemptCount); err != nil {
+		t.Fatalf("query step: %v", err)
+	}
+	if stepStatus != "RUNNING" {
+		t.Errorf("step.status = %q, want RUNNING (retry_limit=3, one malformed failure must not exhaust the budget)", stepStatus)
+	}
+	if attemptCount != 1 {
+		t.Errorf("step.attempt_count = %d, want 1", attemptCount)
+	}
+	t.Logf("PASS — step.status=%s attempt_count=%d after one malformed(absent-output) failure", stepStatus, attemptCount)
+}
+
+// TestAPI_TaskComplete_AsyncMalformedOutput_Null verifies that a
+// /tasks/complete callback with valid ids and output explicitly set to the
+// JSON literal null is ALSO classified failed(malformed) — the second half
+// of this session's minimum bar. retry_limit=1 makes the single malformed
+// failure exhaust the budget, exercising the DLQ boundary (TX3's
+// same-transaction DLQ blade) through the new classification path, and
+// confirms the worker is never re-dispatched once DLQ'd.
+func TestAPI_TaskComplete_AsyncMalformedOutput_Null(t *testing.T) {
+	db := openDB(t)
+	resetSchema(t, db)
+
+	apiSrv, _ := newTestServer(t, db)
+	base := apiSrv.URL
+
+	runID, envelopes, env := startAsyncStepRun(t, base, 1)
+
+	body := fmt.Sprintf(`{"step_id":%q,"attempt_id":%q,"output":null}`, env.StepID, env.AttemptID)
+	resp := post(t, base+"/tasks/complete", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /tasks/complete (null output): status %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+	t.Log("PASS — POST /tasks/complete with output=null → HTTP 200")
+
+	finalStatus := pollRunStatus(t, base, runID, 5*time.Second)
+	if finalStatus != "DLQ" {
+		t.Fatalf("run.status = %q, want DLQ (retry_limit=1, the single malformed failure must exhaust the budget)", finalStatus)
+	}
+	t.Logf("PASS — run %s → DLQ after one malformed(null-output) failure at retry_limit=1", runID)
+
+	reason := pollAttemptFailed(t, db, env.AttemptID, 5*time.Second)
+	if reason != string(core.FailureReasonMalformed) {
+		t.Errorf("attempt failure_reason = %q, want %q", reason, core.FailureReasonMalformed)
+	} else {
+		t.Logf("PASS — attempt %s failure_reason = %s", env.AttemptID, reason)
+	}
+
+	var dlqReason string
+	if err := db.QueryRow(`
+		SELECT reason FROM dead_letter_queue WHERE run_id = $1 ORDER BY created_at DESC LIMIT 1
+	`, runID).Scan(&dlqReason); err != nil {
+		t.Fatalf("query dlq entry: %v", err)
+	}
+	if dlqReason != string(core.DLQReasonWorkerRetryExhausted) {
+		t.Errorf("dlq reason = %q, want %q", dlqReason, core.DLQReasonWorkerRetryExhausted)
+	} else {
+		t.Logf("PASS — dlq entry reason = %s", dlqReason)
+	}
+
+	// No retry dispatch should ever have followed a DLQ'd attempt.
+	select {
+	case extra := <-envelopes:
+		t.Errorf("worker received an unexpected extra dispatch after DLQ: %+v", extra)
+	case <-time.After(200 * time.Millisecond):
+		t.Log("PASS — no extra dispatch envelope after the budget-exhausting malformed failure")
+	}
+}
+
+// TestAPI_TaskComplete_AsyncRealOutput_Regression confirms the new
+// classification introduces no regression on the common case: a
+// /tasks/complete callback carrying real, non-null output is still
+// checkpointed as a normal success (whitepaper §4.2, TX2), and that output
+// is exactly what is stored and later returned by GET /runs/:id.
+func TestAPI_TaskComplete_AsyncRealOutput_Regression(t *testing.T) {
+	db := openDB(t)
+	resetSchema(t, db)
+
+	apiSrv, _ := newTestServer(t, db)
+	base := apiSrv.URL
+
+	runID, _, env := startAsyncStepRun(t, base, 3)
+
+	body := fmt.Sprintf(`{"step_id":%q,"attempt_id":%q,"output":{"processed":true,"count":7}}`, env.StepID, env.AttemptID)
+	resp := post(t, base+"/tasks/complete", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /tasks/complete (real output): status %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	finalStatus := pollRunStatus(t, base, runID, 5*time.Second)
+	if finalStatus != "DONE" {
+		t.Fatalf("run.status = %q, want DONE (a real, non-null output must still checkpoint as success)", finalStatus)
+	}
+	t.Logf("PASS — run %s → DONE with real async output (no regression)", runID)
+
+	resp = get(t, base+"/runs/"+runID)
+	runView := decodeJSON(t, resp)
+	steps := runView["steps"].([]any)
+	if len(steps) != 1 {
+		t.Fatalf("steps count = %d, want 1", len(steps))
+	}
+	s0 := steps[0].(map[string]any)
+	if s0["status"] != "DONE" {
+		t.Errorf("step status = %q, want DONE", s0["status"])
+	}
+	output, ok := s0["output"].(map[string]any)
+	if !ok {
+		t.Fatalf("step output = %v (%T), want a JSON object", s0["output"], s0["output"])
+	}
+	if output["processed"] != true || output["count"] != float64(7) {
+		t.Errorf("step output = %v, want {processed:true,count:7} (exact passthrough)", output)
+	} else {
+		t.Logf("PASS — step output = %v (real output preserved verbatim)", output)
+	}
+}

@@ -5,6 +5,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -316,22 +317,35 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 //
 // Async worker reports success. Handler discipline (whitepaper §10.4):
 //  1. Validate the report is well-formed (ids present).
-//  2. Hand it to the async transport's DeliverCallback, which itself
-//     validates against the live current_attempt_id (a store read) before
-//     routing it to the waiting Dispatch goroutine — see
-//     internal/transport/async.go's DeliverCallback doc comment for the two
-//     independent no-op paths it already covers (unregistered step,
-//     superseded attempt_id).
-//  3. Return 200 unconditionally.
+//  2. Classify the reported output (isAsyncOutputMalformed below) — this is
+//     async's analogue of sync's extractOutput/OutputField gate
+//     (internal/transport/sync.go): a "success" callback whose output is
+//     absent or JSON null cannot feed the next step, so it is reclassified
+//     as a failed(malformed) Result before it ever reaches the store
+//     (whitepaper §4.2, §7.1's "valid ids with unparseable output →
+//     malformed failure").
+//  3. Hand the (possibly reclassified) Result to the async transport's
+//     DeliverCallback, which itself validates against the live
+//     current_attempt_id (a store read) before routing it to the waiting
+//     Dispatch goroutine — see internal/transport/async.go's DeliverCallback
+//     doc comment for the two independent no-op paths it already covers
+//     (unregistered step, superseded attempt_id).
+//  4. Return 200 unconditionally — including for a malformed report: bad
+//     *content* on an otherwise well-formed callback is a normal, expected
+//     failure outcome for the attempt (routed to TX3 like any other
+//     failure), not an HTTP-level transport error, so the caller must not
+//     retry-storm on a 4xx/5xx for something that isn't their transport's
+//     fault.
 //
-// This handler NEVER writes step state — Barrier 2 is always the loop's
-// responsibility. step_id/attempt_id absent from the body ⇒ 400, zero
-// effect (whitepaper §7.1: "an async callback missing valid step_id/
-// attempt_id gets a 400 and has zero effect"). A syntactically valid but
-// stale/unknown pair is NOT rejected here — the transport's own read-time
-// check silently absorbs it as a no-op, so the response is 200 either way,
-// matching "late, duplicate, or superseded reports are ACKed with 200 and
-// have zero state effect" (whitepaper §10).
+// This handler NEVER writes step state — Barrier 2 (TX2) or the failure
+// checkpoint (TX3) is always the loop's responsibility; this handler only
+// decides which of the two Results to hand off. step_id/attempt_id absent
+// from the body ⇒ 400, zero effect (whitepaper §7.1: "an async callback
+// missing valid step_id/attempt_id gets a 400 and has zero effect"). A
+// syntactically valid but stale/unknown pair is NOT rejected here — the
+// transport's own read-time check silently absorbs it as a no-op, so the
+// response is 200 either way, matching "late, duplicate, or superseded
+// reports are ACKed with 200 and have zero state effect" (whitepaper §10).
 func (s *Server) handleTaskComplete(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		StepID    string          `json:"step_id"`
@@ -347,9 +361,45 @@ func (s *Server) handleTaskComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.async.DeliverCallback(r.Context(), core.StepID(req.StepID), core.AttemptID(req.AttemptID),
-		core.Result{Status: core.ResultStatusDone, Output: req.Output})
+	result := core.Result{Status: core.ResultStatusDone, Output: req.Output}
+	if isAsyncOutputMalformed(req.Output) {
+		result = core.Result{
+			Status: core.ResultStatusFailed,
+			Failure: &core.ResultFailure{
+				Reason: core.FailureReasonMalformed,
+				Error:  "async callback: output absent or null",
+			},
+		}
+	}
+
+	s.async.DeliverCallback(r.Context(), core.StepID(req.StepID), core.AttemptID(req.AttemptID), result)
 	jsonResp(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// isAsyncOutputMalformed is the async equivalent of sync's extractOutput
+// malformed gate. Async has no OutputField subtree concept (unlike sync,
+// there is no declared-field-absent case to check), so the rule is
+// content-based and narrower: a JSON body whose "output" key is absent
+// entirely, or present but equal to the JSON literal null, is unparseable —
+// the worker "succeeded" but left nothing a downstream step could consume.
+//
+// This is the minimum bar that closes the schema invariant
+// migrations/001_initial.sql documents ("output non-null → step DONE"):
+// without this check, jsonOrNull() (internal/store/postgres.go) would turn
+// an absent/null async output into a stored JSON `null`, and TX2 would
+// still mark the step DONE with it.
+//
+// Deliberately NOT malformed: a present, syntactically valid empty object
+// ({}) or empty array ([]) — the whitepaper's "unparseable output" wording
+// reads most naturally as a JSON-syntax/absence failure, and {}/[] are
+// neither; a worker may legitimately intend either as "no fields to
+// report". Left as an open question for the project owner rather than
+// silently guessed (see this session's report).
+func isAsyncOutputMalformed(output json.RawMessage) bool {
+	if len(output) == 0 {
+		return true // key absent from the JSON body
+	}
+	return string(bytes.TrimSpace(output)) == "null"
 }
 
 // ── POST /tasks/fail ─────────────────────────────────────────────────────
