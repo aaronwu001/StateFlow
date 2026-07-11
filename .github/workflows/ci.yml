@@ -1,0 +1,164 @@
+name: CI
+
+# Any branch push fires this (so a plain `git push` of a feature branch gets a
+# real run without opening a PR first); pull_request adds the PR-checks view.
+on:
+  push: {}
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit + integration tests (go test -p 1 ./...)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start Postgres (docker compose, applies migrations/001_initial.sql)
+        run: docker compose up -d postgres
+
+      - name: Wait for Postgres to be healthy
+        run: |
+          deadline=$((SECONDS + 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            cid=$(docker compose ps -q postgres)
+            if [ -n "$cid" ]; then
+              health=$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo "")
+              if [ "$health" = "healthy" ]; then
+                echo "postgres healthy"
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+          echo "postgres did not become healthy in time" >&2
+          docker compose logs postgres
+          exit 1
+
+      - name: go test -p 1 ./...
+        env:
+          TEST_DATABASE_URL: postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable
+        run: go test -p 1 ./...
+
+      - name: Dump postgres logs on failure
+        if: failure()
+        run: docker compose logs postgres
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  e2e:
+    name: End-to-end (crash_demo.py + acceptance oracles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_FILES: -f docker-compose.yml -f docker-compose.demo.yml
+      TEST_DATABASE_URL: postgres://stateflow:stateflow@localhost:5432/stateflow?sslmode=disable
+      API_BASE: http://localhost:8080
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # crash_demo.py imports `requests`; the acceptance oracles (_harness.py,
+      # fake_worker.py, fake_planner.py) are stdlib-only and need nothing extra.
+      - name: Install Python deps
+        run: pip install requests
+
+      - name: Ensure psql client is on PATH (acceptance oracles shell out to it)
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+          psql --version
+
+      - name: Build and start full stack (base + demo overlay)
+        run: docker compose $COMPOSE_FILES up -d --build
+
+      - name: Wait for all compose services to be healthy
+        run: |
+          services="postgres stateflow step1 step2 llm-adapter ocr-worker ner-worker summarize-worker"
+          for svc in $services; do
+            echo "waiting for $svc ..."
+            deadline=$((SECONDS + 90))
+            healthy=""
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              cid=$(docker compose $COMPOSE_FILES ps -q "$svc")
+              if [ -n "$cid" ]; then
+                health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$cid" 2>/dev/null || echo "")
+                # `stateflow` has no built-in healthcheck yet (Temporary Design
+                # Registry item #8, closed in Session 10) — a running container
+                # is all we can require for it here.
+                if [ "$health" = "healthy" ] || { [ "$svc" = "stateflow" ] && [ "$health" = "no-healthcheck" ]; }; then
+                  healthy=1
+                  break
+                fi
+              fi
+              sleep 2
+            done
+            if [ -z "$healthy" ]; then
+              echo "$svc did not become healthy in time" >&2
+              docker compose $COMPOSE_FILES ps
+              docker compose $COMPOSE_FILES logs "$svc"
+              exit 1
+            fi
+          done
+          docker compose $COMPOSE_FILES ps
+
+      - name: Run crash_demo.py
+        run: python3 demo/crash_demo.py
+
+      - name: Restart stateflow (crash_demo.py stops it in its own cleanup)
+        run: |
+          docker compose $COMPOSE_FILES up -d stateflow
+          deadline=$((SECONDS + 30))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/runs/__probe__ || echo 000)
+            if [ "$code" = "200" ] || [ "$code" = "404" ]; then
+              echo "stateflow ready (http $code)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "stateflow did not come back up" >&2
+          docker compose $COMPOSE_FILES logs stateflow
+          exit 1
+
+      - name: Run acceptance oracle — crash_recovery_test.py
+        run: |
+          ORCH_CONTAINER=$(docker compose $COMPOSE_FILES ps -q stateflow)
+          export ORCH_CONTAINER
+          python3 test/acceptance/crash_recovery_test.py
+
+      - name: Run acceptance oracle — dlq_replay_test.py (EXPECT_X=2)
+        env:
+          EXPECT_X: "2"
+        run: |
+          ORCH_CONTAINER=$(docker compose $COMPOSE_FILES ps -q stateflow)
+          export ORCH_CONTAINER
+          python3 test/acceptance/dlq_replay_test.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose $COMPOSE_FILES logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose $COMPOSE_FILES down -v
