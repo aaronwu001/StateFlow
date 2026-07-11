@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,17 @@ import (
 	"github.com/aaronwu000/stateflow/internal/orchestrator"
 	"github.com/aaronwu000/stateflow/internal/transport"
 )
+
+// uiHTML is the lightweight, read-only status page (Session 12): a static
+// HTML+JS client over the existing GET /runs/{run_id} and GET /dlq
+// endpoints, embedded into the binary so it ships inside the same
+// distroless image with zero extra deployment surface (whitepaper §18
+// registry item #8's sibling concern — no shell/CDN dependency at runtime).
+// It performs no writes: no auth, no "replay" button — replay stays a
+// POST /dlq/{id}/replay API call (single-writer rule, whitepaper §10).
+//
+//go:embed static/ui.html
+var uiHTML []byte
 
 // Server is the StateFlow HTTP API server.
 //
@@ -96,7 +108,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /dlq", s.handleGetDLQ)
 	mux.HandleFunc("POST /dlq/{id}/replay", s.handleDLQReplay)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /ui", s.handleUI)
 	return mux
+}
+
+// ── GET /ui ──────────────────────────────────────────────────────────────
+//
+// Serves the embedded static status page (Session 12). Same-origin fetch()
+// calls from the page to /runs/{id} and /dlq avoid any CORS question
+// entirely — no CORS headers are added here or anywhere else in this
+// package. Not part of the versioned business API surface documented in
+// CLAUDE.md's path table (same category as /healthz); read-only, no auth,
+// touches no run/step/attempt state.
+func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(uiHTML) //nolint:errcheck
 }
 
 // ── GET /healthz ─────────────────────────────────────────────────────────
