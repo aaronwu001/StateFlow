@@ -183,6 +183,28 @@ guidance, and the idempotency contract: [User Manual](docs/USER_MANUAL.md).
 
 ---
 
+## Configuration
+
+All configuration is via environment variables on the `stateflow` binary/container.
+Every variable below is optional — a fresh clone with none of them set behaves exactly
+as before this table existed.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | *(required)* | Postgres connection string. |
+| `LISTEN_ADDR` | `:8080` | HTTP listen address. |
+| `RETRY_MAX_ATTEMPTS` | `3` | Worker-side retry policy's attempt ceiling (`orchestrator.FixedCountPolicy.MaxRetries`). |
+| `RETRY_DELAY_SECONDS` | `5` | Fixed floor on the delay between a failed attempt and its retry (`orchestrator.FixedCountPolicy.Delay`) — a worker's `retry_after_seconds` can only push this delay up, never below it. |
+| `SWEEP_INTERVAL_SECONDS` | `30` | How often the in-process orphan sweeper scans for runs whose driving goroutine died without the process itself crashing (registry #4). |
+
+`RETRY_MAX_ATTEMPTS`/`RETRY_DELAY_SECONDS`/`SWEEP_INTERVAL_SECONDS` must be positive
+integers if set; the process fails fast at startup on an invalid value rather than
+silently falling back to the default. This does not add a store-backend or transport
+selection mechanism — there is exactly one implementation of each today, so none was
+built.
+
+---
+
 ## Architecture, in brief
 
 Run, step, and attempt each have exactly three states:

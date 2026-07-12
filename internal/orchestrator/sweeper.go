@@ -30,9 +30,13 @@ import (
 	"github.com/aaronwu000/stateflow/internal/core"
 )
 
-// defaultSweepInterval is the fixed sweep interval (Session 18 scope note:
-// not user-configurable this session — a configurable interval is Session
-// 21's config-driven-assembly territory, if genuinely needed later).
+// defaultSweepInterval is the sweep interval used when the caller doesn't
+// supply an override. Session 18 introduced it as a fixed, non-configurable
+// constant; Session 21 (registry #6, config-driven assembly) added
+// StartSweeperWithInterval so cmd/stateflow/main.go can override it via
+// SWEEP_INTERVAL_SECONDS — this constant remains the "widely acceptable
+// default" both StartSweeper and an unset/invalid override fall back to, so
+// zero new env vars reproduces this exact 30s value.
 const defaultSweepInterval = 30 * time.Second
 
 // ── The live-run registry ───────────────────────────────────────────────
@@ -144,6 +148,10 @@ func SweepOnce(
 // shutdown path. stop is safe to call at most once; a second call is a
 // no-op panic-free close of an already-canceled context (context.CancelFunc
 // semantics).
+//
+// Kept as a thin wrapper around StartSweeperWithInterval so any existing
+// caller/test that wants "the documented default, no questions asked" has
+// one call with no interval argument to reason about.
 func StartSweeper(
 	ctx context.Context,
 	store core.StateStore,
@@ -152,11 +160,35 @@ func StartSweeper(
 	return startSweeperEvery(ctx, store, makeLoop, defaultSweepInterval)
 }
 
-// startSweeperEvery is StartSweeper's actual implementation, parameterized
-// by interval so tests can drive many ticks quickly rather than waiting on
-// the real 30s default. StartSweeper itself always passes
-// defaultSweepInterval — the interval is not user-configurable this session
-// (Session 18 scope note).
+// StartSweeperWithInterval is StartSweeper generalized to a caller-supplied
+// interval (Session 21, registry #6 — config-driven assembly). It exists so
+// cmd/stateflow/main.go can honor a SWEEP_INTERVAL_SECONDS override without
+// duplicating the ticker/shutdown mechanics that already live in
+// startSweeperEvery (Session 18 explicitly warns against reimplementing the
+// scan/claim logic a second time; the same reasoning applies to the ticker
+// wrapper around it).
+//
+// interval <= 0 is treated as "use the documented default"
+// (defaultSweepInterval, 30s) rather than a caller error — this keeps a
+// zero-value/unset caller-side variable behaviorally identical to calling
+// StartSweeper, satisfying registry #6's "zero new config ⇒ identical
+// behavior" principle without forcing every caller to resolve the default
+// itself.
+func StartSweeperWithInterval(
+	ctx context.Context,
+	store core.StateStore,
+	makeLoop func(runID core.RunID, workflowID core.WorkflowID, workflowInput json.RawMessage) *Loop,
+	interval time.Duration,
+) (stop func()) {
+	if interval <= 0 {
+		interval = defaultSweepInterval
+	}
+	return startSweeperEvery(ctx, store, makeLoop, interval)
+}
+
+// startSweeperEvery is StartSweeper's/StartSweeperWithInterval's actual
+// implementation, parameterized by interval so tests can drive many ticks
+// quickly rather than waiting on the real 30s default.
 func startSweeperEvery(
 	ctx context.Context,
 	store core.StateStore,
