@@ -175,16 +175,16 @@ consciously registered: the behavior is understood, the impact is bounded, and t
 is scheduled. **Do not "fix" one of these ad hoc** — each remedy interacts with other
 scheduled features and lands together with them.
 
-| # | Item | Current behavior | Impact | Remedy | Phase |
-|---|---|---|---|---|---|
-| 1 | Full-history transmission *(the system's flagged weakest link)* | The planner receives every step's complete output on every call | LLM context bloat; DB row bloat | Summary-plus-fetch (`GET /runs/:id`) + pass-by-reference for large payloads | fast-follow / 2 |
-| 2 | Late-result salvage | A success report after a timeout verdict is discarded; the work re-runs | One redundant execution per mis-kill | Optional salvage, only after re-verifying the state machine | 2+ |
-| 3 | Planner retry count in memory | Resets on crash | None material — planner calls are side-effect-free, so re-asking is always safe | Persist alongside hardening, if ever needed | — |
-| 4 | Storage orphans wait for a restart | A store outage orphans in-flight runs until the next orchestrator restart | Availability gap only; zero correctness impact | In-process orphan sweeper | 2 |
-| 5 | `retry_after_seconds` ignored | Accepted (optional) on `/tasks/fail`, not acted on | None; contract stability only | LLM-aware rate limiting | 2 |
-| 6 | Hardcoded assembly in `main.go` | Store/transport/retry wiring fixed in code | None until alternative implementations exist | Config-driven assembly | 2 |
-| 7 | Init-only migration | Schema applied by Postgres's first-boot hook; no versioning | Fine for exactly one migration file | Real migration tool at migration 002 | 2 / on demand |
-| 8 | No orchestrator healthcheck | Distroless image has no shell; liveness verified externally | Compose/K8s cannot gate on readiness | `/healthz` + self-check subcommand | 1.5–2 |
+| # | Item | Current behavior | Remedy | Status |
+|---|---|---|---|---|
+| 1 | ~~Full-history transmission~~ | **CLOSED (Session 19).** A two-tier size guard bounds what's sent to the planner: any single step's output over 2KB becomes a small pointer object (fetch the full value via `GET /runs/:id`); the cumulative size of retained outputs across the whole history is further capped at 50KB, allocated most-recent-step-first. Nothing changes about what's persisted. | Landed | done |
+| 2 | Late-result salvage | A success report after a timeout verdict is discarded; the work re-runs (one redundant execution per mis-kill) | Optional salvage, only after re-verifying the state machine | open (2+) |
+| 3 | Planner retry count in memory | Resets on crash — none material, planner calls are side-effect-free, so re-asking is always safe | Persist alongside hardening, if ever needed | open (low priority) |
+| 4 | ~~Storage orphans wait for a restart~~ | **CLOSED (Session 18).** An in-process sweeper re-runs the orphan-claim scan every 30s (configurable, see below) for the life of the process, reclaiming a run whose driving goroutine died from a transient store outage — no manual restart needed. Full orchestrator-process crashes are still handled by the unchanged startup `RecoverRuns` scan. | Landed | done |
+| 5 | ~~`retry_after_seconds` ignored~~ | **CLOSED (Session 20).** Honored as a floor: effective worker-side retry delay = `max(worker's retry_after_seconds, system default 5s)`. | Landed | done |
+| 6 | ~~Hardcoded assembly in `main.go`~~ | **CLOSED (Session 21).** Retry policy (`RETRY_MAX_ATTEMPTS`/`RETRY_DELAY_SECONDS`) and the sweeper interval (`SWEEP_INTERVAL_SECONDS`) are env-var-configurable, each defaulting to the exact value that was hardcoded before — a fresh clone with no new env vars is behaviorally identical to pre-Phase-2. | Landed | done |
+| 7 | ~~Init-only migration~~ | **CLOSED (Session 22).** Schema is now versioned `golang-migrate` migrations (`migrations/NNNNNN_title.up.sql`/`.down.sql`), applied automatically by the `stateflow` binary at startup via golang-migrate's Go library (no CLI — the distroless runtime has no shell). | Landed | done |
+| 8 | ~~No orchestrator healthcheck~~ | **CLOSED (Session 10).** `GET /healthz` (pings Postgres) + a `stateflow healthcheck` CLI subcommand back a real `Dockerfile HEALTHCHECK`/`docker-compose.yml healthcheck:`. | Landed | done |
 
 ---
 
@@ -200,9 +200,15 @@ scheduled features and lands together with them.
 3. Verify before reporting: run the actual completion-condition commands and paste
    verbatim output. Never report success from "the code looks correct." If a verifier
    doesn't exist yet, building it is the first task.
-4. Pre-release freedom applies while the project is unpublished: schema changes rewrite
-   `migrations/001_initial.sql` in place; reset with `docker compose down -v`; no
-   migration tooling (registry item 7, above).
+4. Pre-release freedom applies while the project is unpublished, with one exception as of
+   Session 22: schema changes are now versioned `golang-migrate` migrations
+   (`migrations/NNNNNN_title.up.sql` / `.down.sql`), applied automatically by the
+   `stateflow` binary at startup via golang-migrate's Go library (no CLI — the distroless
+   runtime has no shell). A genuinely fresh start still resets with `docker compose down
+   -v` (wipes the volume; migrations re-apply from scratch on next `up`), but an in-place
+   schema change is no longer a rewrite of a single file — add a new
+   `NNNNNN_title.up.sql`/`.down.sql` pair instead of editing an already-shipped migration.
+   Registry item 7 (migration tooling) is closed.
 
 ---
 
@@ -220,9 +226,10 @@ TEST_DATABASE_URL="postgres://stateflow:stateflow@localhost:5432/stateflow?sslmo
   go test -p 1 ./...
 ```
 
-Each integration test calls `resetSchema` (drop + re-apply `migrations/001_initial.sql`) — it
-**wipes** whatever demo/run data is in that database; don't run it while a demo run you
-care about is in progress. **`-p 1` is required** when running more than one package: the
+Each integration test calls `resetSchema` (drop the five StateFlow tables plus
+golang-migrate's own `schema_migrations` tracking table, then re-apply migrations via the
+same `migrations.Apply` function production startup uses) — it **wipes** whatever demo/run
+data is in that database; don't run it while a demo run you care about is in progress. **`-p 1` is required** when running more than one package: the
 store/api/orchestrator packages each reset the same database's schema, and parallel
 package execution makes them race (symptoms: `duplicate key value violates unique
 constraint "pg_type_typname_nsp_index"`, `relation "steps" does not exist`). `-p 1`
