@@ -25,6 +25,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -150,6 +152,35 @@ func runServer() {
 		os.Exit(1)
 	}
 	slog.Info("recovery complete", "resumed", n)
+
+	// Step 1.5: start the periodic orphan sweeper (Temporary Design Registry
+	// item #4, whitepaper §18). RecoverRuns above only runs once, before this
+	// point, and only handles a full orchestrator-process restart. The
+	// sweeper covers the different, longer-lived case: a single run's
+	// driving goroutine dying while this process stays alive (most commonly
+	// a transient Postgres outage) — without it, nothing would ever
+	// relaunch that goroutine short of a manual restart. Uses the same
+	// buildLoop factory as RecoverRuns, reusing its exact scan/claim logic
+	// (internal/orchestrator/sweeper.go).
+	stopSweeper := orchestrator.StartSweeper(ctx, s, buildLoop)
+
+	// Clean shutdown path for the sweeper's ticker goroutine: on SIGINT/
+	// SIGTERM (docker compose stop/down sends SIGTERM), stop the sweeper
+	// (its stop() blocks until its goroutine has actually exited — no
+	// abandoned in-flight tick) before the process exits, rather than
+	// leaving it to be torn down mid-tick along with everything else.
+	// Deliberately scoped to just the sweeper: broader graceful shutdown
+	// (in-flight HTTP requests, in-flight run-driving goroutines) is not
+	// part of this session — see the Session 18 report.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		slog.Info("shutdown signal received, stopping sweeper", "signal", sig.String())
+		stopSweeper()
+		slog.Info("sweeper stopped, exiting")
+		os.Exit(0)
+	}()
 
 	// Step 2: Start HTTP server.
 	srv := api.New(db, s, asyncT, ctx, startLoop)

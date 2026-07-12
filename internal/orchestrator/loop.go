@@ -100,6 +100,13 @@ type Loop struct {
 // goroutine). Run returns a non-nil error only for genuine faults: a store
 // read/write failure, ctx cancellation, or an internal invariant violation.
 func (l *Loop) Run(ctx context.Context) error {
+	// Register this run as "live" for the whole duration of this call, so
+	// the periodic sweeper (sweeper.go, registry #4) never claims it out
+	// from under us — see liveRuns' doc comment in sweeper.go for why this
+	// is marked here rather than at each goroutine-launch call site.
+	liveRuns.mark(l.RunID)
+	defer liveRuns.unmark(l.RunID)
+
 	def, err := l.Store.GetWorkflow(ctx, l.WorkflowID)
 	if err != nil {
 		return fmt.Errorf("loop: GetWorkflow %q: %w", l.WorkflowID, err)

@@ -56,38 +56,64 @@ func RecoverRuns(
 	slog.Info("[RECOVERY] found in-progress runs", "count", len(runs))
 
 	for _, r := range runs {
-		frontier, err := store.LoadFrontier(ctx, r.RunID)
-		if err != nil {
-			slog.Error("[RECOVERY] load frontier", "run_id", string(r.RunID), "err", err)
-			continue
-		}
-
-		step := "-"
-		attemptCount := 0
-		if frontier.PendingStep != nil {
-			step = frontier.PendingStep.Name
-			attemptCount = frontier.AttemptCount
-		}
-		slog.Info("[RECOVERY] resuming run",
-			"run_id", string(r.RunID),
-			"steps_done", len(frontier.History),
-			"pending_step", step,
-			"attempt_count", attemptCount)
-
-		l := makeLoop(r.RunID, r.WorkflowID, r.WorkflowInput)
-		if l == nil {
-			slog.Warn("[RECOVERY] skipping run: makeLoop returned nil", "run_id", string(r.RunID))
-			continue
-		}
-		go func(l *Loop) {
-			if err := l.Run(ctx); err != nil {
-				slog.Error("[RECOVERY] run ended with error", "run_id", string(l.RunID), "err", err)
-			} else {
-				slog.Info("[RECOVERY] run completed", "run_id", string(l.RunID))
-			}
-		}(l)
+		resumeOneRun(ctx, store, r, makeLoop, "[RECOVERY]")
 	}
 
 	slog.Info("[RECOVERY] complete", "resumed", len(runs))
 	return len(runs), nil
+}
+
+// resumeOneRun performs the ONE action both RecoverRuns (startup, once) and
+// the periodic sweeper (sweeper.go, registry #4) take for a RUNNING run they
+// have decided to (re-)enter: load its frontier (for logging only — the
+// actual combination-table/orphan-claim decision lives inside Loop.Run's own
+// one-time recovery check, whitepaper §8.3, NOT here), build a Loop via
+// makeLoop, and launch `go l.Run(ctx)`.
+//
+// This is the single place that action is wired to a goroutine launch, so
+// that the startup and periodic paths can never drift apart (Session 18
+// scope note: "reuse RecoverRuns's existing scan logic ... do not
+// reimplement the combination-table logic a second time"). trigger is a
+// log-only label ("[RECOVERY]" or "[SWEEP]") so ops logs can tell which
+// caller launched a given resume — it has no behavioral effect.
+//
+// Returns true if a goroutine was launched (makeLoop returned non-nil).
+func resumeOneRun(
+	ctx context.Context,
+	store core.StateStore,
+	r core.RunRef,
+	makeLoop func(runID core.RunID, workflowID core.WorkflowID, workflowInput json.RawMessage) *Loop,
+	trigger string,
+) bool {
+	frontier, err := store.LoadFrontier(ctx, r.RunID)
+	if err != nil {
+		slog.Error(trigger+" load frontier", "run_id", string(r.RunID), "err", err)
+		return false
+	}
+
+	step := "-"
+	attemptCount := 0
+	if frontier.PendingStep != nil {
+		step = frontier.PendingStep.Name
+		attemptCount = frontier.AttemptCount
+	}
+	slog.Info(trigger+" resuming run",
+		"run_id", string(r.RunID),
+		"steps_done", len(frontier.History),
+		"pending_step", step,
+		"attempt_count", attemptCount)
+
+	l := makeLoop(r.RunID, r.WorkflowID, r.WorkflowInput)
+	if l == nil {
+		slog.Warn(trigger+" skipping run: makeLoop returned nil", "run_id", string(r.RunID))
+		return false
+	}
+	go func(l *Loop) {
+		if err := l.Run(ctx); err != nil {
+			slog.Error(trigger+" run ended with error", "run_id", string(l.RunID), "err", err)
+		} else {
+			slog.Info(trigger+" run completed", "run_id", string(l.RunID))
+		}
+	}(l)
+	return true
 }
