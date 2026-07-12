@@ -27,6 +27,7 @@ import (
 	"github.com/aaronwu000/stateflow/internal/orchestrator"
 	"github.com/aaronwu000/stateflow/internal/store"
 	"github.com/aaronwu000/stateflow/internal/transport"
+	"github.com/aaronwu000/stateflow/migrations"
 )
 
 // ── DB helpers (mirrors orchestrator/store integration tests) ─────────────
@@ -48,18 +49,23 @@ func openDB(t *testing.T) *sql.DB {
 	return db
 }
 
+// resetSchema drops all StateFlow tables (including golang-migrate's own
+// "schema_migrations" version-tracking table, so migrations.Apply below
+// re-runs 000001_initial.up.sql instead of seeing a stale "already applied"
+// bookkeeping row) and re-applies the migrations via the exact same
+// migrations.Apply function production startup uses (cmd/stateflow/main.go).
 func resetSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
-	for _, tbl := range []string{"dead_letter_queue", "attempts", "steps", "runs", "workflows"} {
+	for _, tbl := range []string{"dead_letter_queue", "attempts", "steps", "runs", "workflows", "schema_migrations"} {
 		if _, err := db.Exec("DROP TABLE IF EXISTS " + tbl + " CASCADE"); err != nil {
 			t.Fatalf("drop %s: %v", tbl, err)
 		}
 	}
-	ddl, err := os.ReadFile("../../migrations/001_initial.sql")
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Fatalf("resetSchema: TEST_DATABASE_URL not set (should have been caught by openDB's skip already)")
 	}
-	if _, err := db.Exec(string(ddl)); err != nil {
+	if err := migrations.Apply(dsn); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
 }

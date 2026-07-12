@@ -7,14 +7,17 @@ services:
       POSTGRES_DB: stateflow
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Migration mechanism decision: postgres:16's entrypoint runs every
-      # *.sql file in /docker-entrypoint-initdb.d/ alphabetically, but only
-      # on first init (empty PGDATA). This is the simplest option that
-      # satisfies "apply migrations/001_initial.sql on first startup" for
-      # an MVP with a single migration file; it does not replay on restart
-      # or track schema versions, so it is not a substitute for a real
-      # migration tool if/when more migrations are added.
-      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+      # No init-script mount: schema migrations are applied by the
+      # `stateflow` service itself at startup, via golang-migrate's Go
+      # library (migrations/apply.go), before RecoverRuns runs — see
+      # cmd/stateflow/main.go. This replaced the previous mechanism
+      # (mounting migrations/001_initial.sql into
+      # /docker-entrypoint-initdb.d/, applied only by Postgres's first-boot
+      # hook) because that mechanism could not apply a second migration to
+      # an existing data volume and required a full `down -v` reset for
+      # every schema change (Temporary Design Registry item #7, whitepaper
+      # §18). A bare `postgres:16` with an empty volume now starts with no
+      # StateFlow schema at all until `stateflow` connects and migrates it.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U stateflow -d stateflow"]
       interval: 5s

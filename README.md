@@ -61,9 +61,11 @@ toolchain needed — the orchestrator builds inside the container.
 docker compose up -d --build
 ```
 
-This starts Postgres (schema applied automatically on first boot) and the
-`stateflow` orchestrator, listening on `:8080`. Give it a few seconds, then
-confirm both services report healthy:
+This starts Postgres and the `stateflow` orchestrator, listening on `:8080`.
+`stateflow` applies its schema migrations itself at startup (via
+[golang-migrate](https://github.com/golang-migrate/migrate)'s Go library,
+before crash recovery runs) — no separate migration step needed. Give it a
+few seconds, then confirm both services report healthy:
 
 ```console
 $ docker compose ps
@@ -258,7 +260,8 @@ narrated version of all three scenarios.
 - [x] This README
 
 Deferred beyond Phase 1.5 (whitepaper §18's Temporary Design Registry): full-history
-transmission's summary-plus-fetch alternative, late-result salvage, an in-process
-storage-orphan sweeper, `retry_after_seconds`-aware rate limiting, config-driven
-component assembly, and real migration tooling. None of these affect Phase 1's
-correctness guarantees; see the whitepaper for the full registry and rationale.
+transmission's summary-plus-fetch alternative and late-result salvage. None of these
+affect Phase 1's correctness guarantees; see the whitepaper for the full registry and
+rationale. (The registry's other Phase-2 items — in-process orphan sweeper,
+`retry_after_seconds`-aware rate limiting, config-driven assembly, and versioned
+migration tooling via `golang-migrate` — have since landed.)

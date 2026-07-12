@@ -10,6 +10,7 @@ RUN go mod download
 
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
+COPY migrations/ ./migrations/
 
 # Pure Go (pgx stdlib driver, no CGO deps) — static binary for distroless.
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
