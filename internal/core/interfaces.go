@@ -192,6 +192,16 @@ type ResultFailure struct {
 	Reason     FailureReason
 	Error      string
 	HTTPStatus int // populated by the sync transport only
+
+	// RetryAfterSeconds is the worker's optionally-reported backoff request
+	// (registry item #5, whitepaper §13.2/§18): populated only from an async
+	// worker's POST /tasks/fail body's optional retry_after_seconds field
+	// (internal/api/server.go's handleTaskFail). nil when the worker didn't
+	// supply one, or for any failure that doesn't originate from that
+	// callback (sync failures, timeouts, orphan claims). RetryPolicy.Next
+	// treats it as a FLOOR on the retry delay, never a ceiling: effective
+	// delay = max(RetryAfterSeconds, the policy's own system-default delay).
+	RetryAfterSeconds *int
 }
 
 // Result is returned by WorkerTransport.Dispatch. The loop routes on Status
@@ -379,10 +389,16 @@ type WorkerTransport interface {
 // budget. The signature is unchanged from v0.9; the contract on where
 // count comes from is now binding (whitepaper §20; Session 2 instructions).
 type RetryPolicy interface {
-	// Next is called after a step failure with the attempt_count so far.
+	// Next is called after a step failure with the attempt_count so far,
+	// and the worker's optionally-reported retry_after_seconds (registry
+	// item #5: nil when the worker didn't supply one, or the failure has no
+	// worker-reported component — e.g. a timeout or orphan claim). A
+	// non-nil value is a FLOOR the policy must respect: effective delay =
+	// max(retryAfterSeconds, the policy's own system-default delay), never
+	// less than the system default.
 	// Returns the delay before the next attempt, or toDLQ=true if the
 	// budget is exhausted and the step should route to the DLQ.
-	Next(count int, err error) (delay time.Duration, toDLQ bool)
+	Next(count int, err error, retryAfterSeconds *int) (delay time.Duration, toDLQ bool)
 }
 
 // StateStore is the durable source of truth. All correctness rests here.

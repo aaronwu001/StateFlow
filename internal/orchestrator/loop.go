@@ -348,16 +348,21 @@ func (l *Loop) dispatchAndResolve(
 		// ── Classify the failure (whitepaper §6 taxonomy, §7.1) ──
 		var reason core.FailureReason
 		var detail string
+		var retryAfterSeconds *int
 		if dispatchErr != nil {
 			// No valid response was obtained at all: ctx deadline exceeded
 			// (the creation-anchored timer), or a transport-level error.
 			// Both take the timeout path — the entire "decision exists, no
 			// result" span is claimed by exactly one rule (whitepaper §6).
+			// There is no worker-reported Result here, so retryAfterSeconds
+			// stays nil (registry item #5 only applies to a worker's own
+			// reported failure, not to an orchestrator-side timeout).
 			reason = core.FailureReasonTimeout
 			detail = dispatchErr.Error()
 		} else {
 			reason = result.Failure.Reason
 			detail = result.Failure.Error
+			retryAfterSeconds = result.Failure.RetryAfterSeconds
 		}
 
 		// ── TX3 ──
@@ -377,12 +382,14 @@ func (l *Loop) dispatchAndResolve(
 
 		// Below budget: read the persisted count back from the store (never
 		// a loop-local counter — the exact defect this refactor targets)
-		// and feed it to RetryPolicy.Next for the delay.
+		// and feed it, plus the worker's optionally-reported
+		// retryAfterSeconds (registry item #5), to RetryPolicy.Next for the
+		// delay.
 		fr, err := l.Store.LoadFrontier(ctx, l.RunID)
 		if err != nil {
 			return false, fmt.Errorf("loop: LoadFrontier (post-failure): %w", err)
 		}
-		delay, _ := retry.Next(fr.AttemptCount, errors.New(detail))
+		delay, _ := retry.Next(fr.AttemptCount, errors.New(detail), retryAfterSeconds)
 
 		select {
 		case <-ctx.Done():
