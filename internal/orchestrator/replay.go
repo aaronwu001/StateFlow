@@ -57,6 +57,14 @@ import (
 // — the run keeps going exactly as it would after any other step
 // completes.
 func (l *Loop) ResumeReplayedStep(ctx context.Context) error {
+	// Register this run as "live" for the whole duration of this call —
+	// same registry, same reasoning as Loop.Run (see sweeper.go's liveRuns
+	// doc comment). This is what lets the sweeper skip a run currently being
+	// resumed via a DLQ worker-side replay without internal/api/server.go
+	// (out of Session 18's scope) needing any change of its own.
+	liveRuns.mark(l.RunID)
+	defer liveRuns.unmark(l.RunID)
+
 	def, err := l.Store.GetWorkflow(ctx, l.WorkflowID)
 	if err != nil {
 		return fmt.Errorf("loop: ResumeReplayedStep: GetWorkflow %q: %w", l.WorkflowID, err)
