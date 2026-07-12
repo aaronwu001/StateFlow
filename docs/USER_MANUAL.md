@@ -44,8 +44,15 @@ On every step, StateFlow POSTs to your planner URL with a JSON body:
 
 - `workflow_input` — the payload the caller passed when starting the run.
 - `history` — every completed step in order (by `seq`, never by timestamp or
-  name), each with its full `output`. The history grows by one entry after
-  each successful step.
+  name). The history grows by one entry after each successful step. As of
+  Phase 2, a given entry's `output` is not guaranteed to be the step's full,
+  unmodified output: any single entry over 2KB (marshaled) is replaced with a
+  small pointer object (`_truncated`/`size_bytes`/a note pointing at
+  `GET /runs/{run_id}` for the full value); on long runs, the oldest entries
+  whose output no longer fits a 50KB total budget carry only `name`+`status`,
+  with `output` omitted entirely. Nothing changes about what's stored — the
+  full output is always available via `GET /runs/{run_id}` — only what's
+  sent to the planner on a given `Decide` call is bounded this way.
 - **Every status string on the wire is UPPERCASE** (`"DONE"`), identical to
   the value stored in the database. This is binding, not a convention — do
   not match on `"done"` (lowercase) when reading `history`.
