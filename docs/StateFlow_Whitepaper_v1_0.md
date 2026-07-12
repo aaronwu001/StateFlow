@@ -357,6 +357,8 @@ The planner **never talks to the database.** It receives everything over HTTP an
 
 > **Registered as the system's weakest link (§18): full-history transmission.** Sending complete outputs risks LLM context bloat and database row bloat. The MVP accepts this for simplicity; the committed fast-follows are **summary-plus-fetch** (send names+statuses; the planner fetches the outputs it wants via `GET /runs/:run_id` — still over HTTP, never the database) and **pass-by-reference** (large payloads live in blob storage; history carries a URI — already valid today since output is opaque JSON). Users must currently design planners with "you will receive the full history" as the premise.
 
+As a first, deliberately mechanical mitigation (registry item #1, Phase 2), the orchestrator now applies a two-tier size guard when marshaling `history` for each `Decide` call, computed fresh from the untruncated stored data every time: any single entry's `output` over 2KB is replaced with a small pointer object (`_truncated`, `size_bytes`, and a note pointing at `GET /runs/:run_id` for the full value), and the cumulative marshaled size of the whole `history` array is capped at 50KB by walking entries most-recent-first — entries that don't fit the remaining budget carry `name`+`status` only, with `output` omitted entirely. `seq`-ascending wire order is unaffected; only per-entry detail level is computed by the recency walk. This changes nothing about what is persisted — Postgres always keeps the full output, reachable in full via `GET /runs/:run_id` — only what is marshaled onto the wire for a given planner call.
+
 ### 12.3 What the planner returns (StepDecision)
 
 ```json

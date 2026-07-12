@@ -43,6 +43,26 @@ const (
 	plannerMaxAttempts = 3
 )
 
+// Bounded-history size guard (registry #1, whitepaper §12.2; "Design
+// decisions log" in the Phase 2 session prompts — the deliberately
+// mechanical, protocol-free two-tier alternative to the multi-round
+// `need_more` design the owner explicitly rejected as overcomplicated).
+// Neither cap is workflow-configurable — both are fixed MVP constants, like
+// the planner call budget above.
+const (
+	// historyEntryCapBytes is the per-entry cap on a single HistoryEntry's
+	// marshaled Output. Over this, Output is replaced with a small pointer
+	// object rather than sent verbatim.
+	historyEntryCapBytes = 2048
+
+	// historyTotalCapBytes is the cumulative cap on the marshaled History
+	// array (summed over each entry's post-per-entry-cap Output size).
+	// Budget is allocated most-recent-step-first, walking backward; entries
+	// that don't fit are reduced to name+status only (Output omitted, not
+	// even a pointer).
+	historyTotalCapBytes = 51200
+)
+
 // Loop is the durable driver loop for a single run.
 //
 // A Loop value is constructed fresh for every Run() invocation — both the
@@ -220,7 +240,11 @@ func (l *Loop) driveSteadyState(
 		state := core.RunState{
 			RunID:         l.RunID,
 			WorkflowInput: l.WorkflowInput,
-			History:       history,
+			// boundHistory is computed fresh from the real, never-truncated
+			// Postgres data on every call — nothing is persisted
+			// differently; only what gets marshaled onto the wire for THIS
+			// Decide call changes (registry #1, whitepaper §12.2).
+			History: boundHistory(history),
 		}
 
 		decision, ok, err := l.decideWithBudget(ctx, pl, state)
@@ -495,4 +519,86 @@ func (l *Loop) decideWithBudget(ctx context.Context, p core.NextStepPlanner, sta
 		return core.StepDecision{}, false, fmt.Errorf("MarkRunDLQPlannerExhausted: %w", err)
 	}
 	return core.StepDecision{}, false, nil
+}
+
+// historyTruncationPointer replaces a HistoryEntry.Output that exceeds
+// historyEntryCapBytes. It carries exactly the three facts registry #1's
+// design calls for: that the value is truncated, its real size, and how to
+// fetch it in full.
+type historyTruncationPointer struct {
+	Truncated bool   `json:"_truncated"`
+	SizeBytes int    `json:"size_bytes"`
+	Note      string `json:"note"`
+}
+
+// boundHistory returns the wire-ready History array for one planner.Decide
+// call: a two-tier, purely mechanical size guard (registry #1; see the
+// "Design decisions log" in the Phase 2 session prompts for why the
+// alternative multi-round `need_more` protocol was proposed and explicitly
+// rejected in favor of this). Nothing is persisted differently — history is
+// read fresh from Postgres on every call (never truncated at rest); this
+// function only decides how much detail per entry gets marshaled onto THIS
+// wire payload.
+//
+// Tier 1 — per-entry cap (historyEntryCapBytes): any entry whose Output
+// marshals to more than the cap is replaced with a historyTruncationPointer
+// naming its real size and pointing at GET /runs/{run_id} for the full
+// value.
+//
+// Tier 2 — total cap (historyTotalCapBytes): walking the (already
+// per-entry-capped) entries from the most recent backward, once an entry
+// would not fit within the remaining budget, that entry AND every older one
+// is reduced to name+status only — Output omitted entirely (omitempty),
+// not even a pointer, since the whole run is already reachable via GET
+// /runs/{run_id}.
+//
+// Final order is unchanged: history is, and remains, seq ascending
+// (whitepaper's existing binding wire-order rule) — this function only
+// varies per-entry detail level, never order.
+func boundHistory(history []core.HistoryEntry) []core.HistoryEntry {
+	if len(history) == 0 {
+		return history
+	}
+
+	capped := make([]core.HistoryEntry, len(history))
+	copy(capped, history)
+
+	// Tier 1: per-entry cap, independent of position.
+	for i, e := range capped {
+		if len(e.Output) <= historyEntryCapBytes {
+			continue
+		}
+		ptr := historyTruncationPointer{
+			Truncated: true,
+			SizeBytes: len(e.Output),
+			Note:      "output exceeds the per-entry wire cap; fetch the full value via GET /runs/{run_id}",
+		}
+		ptrJSON, err := json.Marshal(ptr)
+		if err != nil {
+			// historyTruncationPointer is a fixed, always-marshalable shape
+			// (two scalars and a bool) — this should never happen. Fail
+			// safe by omitting Output entirely rather than risk shipping a
+			// broken payload to the planner.
+			capped[i].Output = nil
+			continue
+		}
+		capped[i].Output = ptrJSON
+	}
+
+	// Tier 2: total cap, walked most-recent-first. History is seq ASC, so
+	// the most recent entry is the last element.
+	var used int
+	for i := len(capped) - 1; i >= 0; i-- {
+		size := len(capped[i].Output)
+		if used+size > historyTotalCapBytes {
+			// This entry, and every older one, drops to name+status only.
+			for j := i; j >= 0; j-- {
+				capped[j].Output = nil
+			}
+			break
+		}
+		used += size
+	}
+
+	return capped
 }

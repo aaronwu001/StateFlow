@@ -130,12 +130,21 @@ type RunState struct {
 	History       []HistoryEntry  `json:"history"` // ordered by seq ASC
 }
 
-// HistoryEntry is one completed (DONE) step in the run history. Output has
-// no omitempty — it is always present for a DONE step.
+// HistoryEntry is one completed (DONE) step in the run history.
+//
+// Output is NOT always present on the wire. The orchestrator loop applies a
+// two-tier size guard (registry #1, whitepaper §12.2) to every RunState it
+// sends to the planner: an Output over the 2KB per-entry cap is replaced
+// with a small pointer object (`_truncated`/`size_bytes`/a note pointing at
+// GET /runs/{run_id}` for the real value), and once the cumulative wire size
+// of the History array would exceed the 50KB total cap, older entries (past
+// the most-recent-first budget walk) omit Output entirely — omitempty
+// applies. This is purely a wire-marshaling concern: Postgres always keeps
+// the full, untruncated output; nothing about persistence changes.
 type HistoryEntry struct {
 	Name   string          `json:"name"`
 	Status StepStatus      `json:"status"`
-	Output json.RawMessage `json:"output"`
+	Output json.RawMessage `json:"output,omitempty"`
 }
 
 // StepDecision is returned BY the planner TO the orchestrator.
