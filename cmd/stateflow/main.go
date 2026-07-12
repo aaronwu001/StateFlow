@@ -3,8 +3,10 @@
 //
 // Startup order (whitepaper §5, §8.3):
 //  1. Open Postgres connection.
-//  2. Run RecoverRuns — resumes any RUNNING runs from before a crash.
-//  3. Start HTTP server — begins accepting new runs.
+//  2. Apply pending schema migrations (migrations package, golang-migrate's
+//     Go library — Temporary Design Registry item #7, whitepaper §18).
+//  3. Run RecoverRuns — resumes any RUNNING runs from before a crash.
+//  4. Start HTTP server — begins accepting new runs.
 //
 // Subcommands: running the binary with no arguments is the default
 // server-start behavior above (unchanged, so ENTRYPOINT ["/stateflow"]'s
@@ -36,6 +38,7 @@ import (
 	"github.com/aaronwu000/stateflow/internal/orchestrator"
 	"github.com/aaronwu000/stateflow/internal/store"
 	"github.com/aaronwu000/stateflow/internal/transport"
+	"github.com/aaronwu000/stateflow/migrations"
 )
 
 func main() {
@@ -106,6 +109,22 @@ func runServer() {
 		slog.Error("ping db", "err", err)
 		os.Exit(1)
 	}
+
+	// Step 0: apply pending schema migrations via golang-migrate's Go
+	// library, before anything reads/writes application tables. This
+	// replaces the previous mechanism (Postgres's init-script hook applying
+	// migrations/001_initial.sql on first boot only, via
+	// docker-compose.yml) — that mechanism could not apply a second
+	// migration to an existing volume and required a full down-v reset for
+	// every schema change (registry item #7, whitepaper §18).
+	// migrations.Apply opens its own short-lived connection from dbURL; it
+	// deliberately does not share this process's db handle (see the
+	// migrations package doc comment for why).
+	if err := migrations.Apply(dbURL); err != nil {
+		slog.Error("apply migrations", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("migrations applied")
 
 	s := store.New(db)
 	syncT := transport.NewSyncTransport()
