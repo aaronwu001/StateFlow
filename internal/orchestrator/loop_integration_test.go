@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aaronwu000/stateflow/internal/core"
 	"github.com/aaronwu000/stateflow/internal/orchestrator"
@@ -40,6 +41,50 @@ func (t *countFailsThenSucceed) Dispatch(_ context.Context, _ core.StepSpec) (co
 		}, nil
 	}
 	return core.Result{Status: core.ResultStatusDone, Output: json.RawMessage(`{"ok":true}`)}, nil
+}
+
+// retryAfterSecondsFailOnceTransport fails the first dispatch with a
+// worker-reported failure carrying RetryAfterSeconds (registry item #5, as
+// an async worker's POST /tasks/fail body would), then succeeds on the
+// second dispatch — mirroring countFailsThenSucceed but exercising the new
+// core.ResultFailure.RetryAfterSeconds field.
+type retryAfterSecondsFailOnceTransport struct {
+	calls             atomic.Int64
+	retryAfterSeconds *int
+}
+
+func (t *retryAfterSecondsFailOnceTransport) Dispatch(_ context.Context, _ core.StepSpec) (core.Result, error) {
+	if t.calls.Add(1) == 1 {
+		return core.Result{
+			Status: core.ResultStatusFailed,
+			Failure: &core.ResultFailure{
+				Reason:            core.FailureReasonWorkerReported,
+				Error:             "rate limited",
+				RetryAfterSeconds: t.retryAfterSeconds,
+			},
+		}, nil
+	}
+	return core.Result{Status: core.ResultStatusDone, Output: json.RawMessage(`{"ok":true}`)}, nil
+}
+
+// recordingRetryPolicy wraps FixedCountPolicy and records every
+// retryAfterSeconds value it is called with, so a test can assert that the
+// loop actually threads core.ResultFailure.RetryAfterSeconds through to
+// RetryPolicy.Next (registry item #5) — the floor arithmetic itself (max
+// against the system default) is unit-tested directly in policy_test.go;
+// this proves the WIRING from a Result to the policy call, which is what
+// dispatchAndResolve (internal/orchestrator/loop.go) is responsible for.
+type recordingRetryPolicy struct {
+	orchestrator.FixedCountPolicy
+	mu       sync.Mutex
+	received []*int
+}
+
+func (p *recordingRetryPolicy) Next(count int, err error, retryAfterSeconds *int) (time.Duration, bool) {
+	p.mu.Lock()
+	p.received = append(p.received, retryAfterSeconds)
+	p.mu.Unlock()
+	return p.FixedCountPolicy.Next(count, err, retryAfterSeconds)
 }
 
 // alwaysFailTransport always returns failed(worker_reported).
@@ -363,6 +408,81 @@ func TestLoop_RetryThenSucceed(t *testing.T) {
 		t.Errorf("transport called %d times, want 3", n)
 	}
 	t.Logf("PASS — transport dispatched %d times", transport.calls.Load())
+}
+
+// ─── Test 2.5: registry item #5 — retry_after_seconds plumbed to RetryPolicy ───
+
+// TestLoop_RetryAfterSeconds_PlumbedFromResultToPolicy verifies that
+// dispatchAndResolve (internal/orchestrator/loop.go) actually threads a
+// worker-reported core.ResultFailure.RetryAfterSeconds through to
+// RetryPolicy.Next's third argument — the concrete wiring registry item #5
+// depends on. recordingRetryPolicy captures what it received; the policy's
+// own Delay is set deliberately tiny (10ms) so that if the wiring were
+// broken (retryAfterSeconds silently dropped), the loop would resume almost
+// instantly instead of waiting out the reported 1s — the elapsed-time
+// assertion below would then fail, catching a regression the value-capture
+// assertion alone might miss (e.g. a copy that is captured but never
+// actually used to compute the sleep).
+func TestLoop_RetryAfterSeconds_PlumbedFromResultToPolicy(t *testing.T) {
+	db := openTestDB(t)
+	resetTestSchema(t, db)
+
+	const (
+		retryLimit = 3
+		wfID       = "wf-retry-after-seconds"
+		runID      = "run-retry-after-seconds"
+	)
+	seedWorkflowAndRun(t, db, wfID, runID, "static", staticPlannerConfigWithRetryLimit(retryLimit))
+
+	s := store.New(db)
+	step := &core.StepSpec{
+		Name:           "process",
+		WorkerURL:      "http://stub/process",
+		Mode:           core.StepModeSync,
+		TimeoutSeconds: 5,
+		Input:          json.RawMessage(`{}`),
+	}
+
+	retryAfterSeconds := 1 // small (not the spec's 30s) purely to keep this test fast; the exact 30/1/nil-vs-5s arithmetic is covered precisely, with no real sleeping, by TestFixedCountPolicy_RetryAfterSecondsFloor in policy_test.go.
+	transport := &retryAfterSecondsFailOnceTransport{retryAfterSeconds: &retryAfterSeconds}
+	policy := &recordingRetryPolicy{FixedCountPolicy: orchestrator.FixedCountPolicy{MaxRetries: retryLimit, Delay: 10 * time.Millisecond}}
+
+	loop := &orchestrator.Loop{
+		RunID:          core.RunID(runID),
+		WorkflowID:     core.WorkflowID(wfID),
+		WorkflowInput:  json.RawMessage(`{}`),
+		Store:          s,
+		Transport:      transport,
+		Retry:          policy,
+		PlannerFactory: staticFactory(&singleStepPlanner{step: step}),
+	}
+
+	start := time.Now()
+	if err := loop.Run(context.Background()); err != nil {
+		t.Fatalf("Run() returned error: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	policy.mu.Lock()
+	received := policy.received
+	policy.mu.Unlock()
+	if len(received) != 1 {
+		t.Fatalf("RetryPolicy.Next called %d times, want 1", len(received))
+	}
+	got := received[0]
+	if got == nil || *got != retryAfterSeconds {
+		t.Fatalf("RetryPolicy.Next received retryAfterSeconds = %v, want pointer to %d — "+
+			"the loop did not plumb core.ResultFailure.RetryAfterSeconds through to RetryPolicy.Next",
+			got, retryAfterSeconds)
+	}
+	t.Logf("PASS — RetryPolicy.Next received retryAfterSeconds=%d (correctly plumbed from Result.Failure)", *got)
+
+	if elapsed < time.Duration(retryAfterSeconds)*time.Second {
+		t.Errorf("elapsed = %v, want >= %ds — the honored retry_after_seconds floor was not actually slept "+
+			"(policy's own Delay is only 10ms, so this would pass wrongly if retry_after_seconds were captured but not used)",
+			elapsed, retryAfterSeconds)
+	}
+	t.Logf("PASS — actual wait was %v, >= the honored %ds retry_after_seconds", elapsed, retryAfterSeconds)
 }
 
 // ─── Test 3: planner declares failure → DLQ(planner_declared_fail) ─────────

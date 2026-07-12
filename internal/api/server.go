@@ -464,15 +464,19 @@ func isAsyncOutputMalformed(output json.RawMessage) bool {
 // ── POST /tasks/fail ─────────────────────────────────────────────────────
 //
 // Same three-step discipline as /tasks/complete. retry_after_seconds is
-// optional, accepted, and ignored — reserved for future LLM-aware rate
-// limiting (whitepaper §13.2, Temporary Design Registry #5) so the
-// worker-facing contract stays stable when that lands.
+// optional; when supplied, it is threaded through core.ResultFailure to the
+// loop's retry-delay decision (registry item #5, "LLM-aware rate limiting",
+// whitepaper §13.2/§18): the effective delay before the next TX4 re-dispatch
+// becomes max(retry_after_seconds, the system default 5s) — a floor, never a
+// ceiling. When omitted, behavior is unchanged (system default 5s). See
+// internal/orchestrator/policy.go's FixedCountPolicy.Next for where the max()
+// is actually computed.
 func (s *Server) handleTaskFail(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		StepID            string `json:"step_id"`
 		AttemptID         string `json:"attempt_id"`
 		Error             string `json:"error"`
-		RetryAfterSeconds *int   `json:"retry_after_seconds"` // optional; accepted, ignored (reserved, whitepaper §13.2)
+		RetryAfterSeconds *int   `json:"retry_after_seconds"` // optional; floors the retry delay (registry item #5)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -487,8 +491,9 @@ func (s *Server) handleTaskFail(w http.ResponseWriter, r *http.Request) {
 		core.Result{
 			Status: core.ResultStatusFailed,
 			Failure: &core.ResultFailure{
-				Reason: core.FailureReasonWorkerReported,
-				Error:  req.Error,
+				Reason:            core.FailureReasonWorkerReported,
+				Error:             req.Error,
+				RetryAfterSeconds: req.RetryAfterSeconds,
 			},
 		})
 	jsonResp(w, http.StatusOK, map[string]bool{"ok": true})

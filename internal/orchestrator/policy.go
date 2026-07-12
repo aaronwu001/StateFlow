@@ -41,10 +41,25 @@ func DefaultRetryPolicy() *FixedCountPolicy {
 
 // Next implements core.RetryPolicy. count is the persisted
 // steps.attempt_count (the binding contract above) — not a loop-local index.
-func (p *FixedCountPolicy) Next(count int, _ error) (time.Duration, bool) {
+//
+// retryAfterSeconds (registry item #5, whitepaper §13.2/§18 — "LLM-aware
+// rate limiting"): the worker's optionally-reported backoff request, floored
+// against p.Delay (the system default, 5s), never used to shrink the delay
+// below it. Owner-confirmed design: "effective retry delay = max(worker's
+// retry_after_seconds, system default 5s)". A retryAfterSeconds below the
+// system default has NO effect — the system default is a floor, not merely
+// an initial value.
+func (p *FixedCountPolicy) Next(count int, _ error, retryAfterSeconds *int) (time.Duration, bool) {
 	if count >= p.MaxRetries {
 		return 0, true // retries exhausted → DLQ (informational; the loop
 		// does not act on this — see the type doc comment)
 	}
-	return p.Delay, false
+	delay := p.Delay
+	if retryAfterSeconds != nil {
+		requested := time.Duration(*retryAfterSeconds) * time.Second
+		if requested > delay {
+			delay = requested
+		}
+	}
+	return delay, false
 }
