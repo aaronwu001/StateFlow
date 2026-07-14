@@ -1,0 +1,66 @@
+name: Publish Docker image
+
+# Mirrors ci.yml's trigger (any branch push fires a real, verifiable run
+# without needing a PR or a merge to main first) but only *pushes* to
+# ghcr.io when the ref is main or a `v*` tag — feature-branch runs still
+# build the image (proving the Dockerfile builds) without publishing it.
+# Uses the automatic, per-run GITHUB_TOKEN — no external PAT/secret needed —
+# per GitHub's documented ghcr.io + Actions integration.
+on:
+  push: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publish:
+    name: Build and push ghcr.io image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags: `latest` + `sha-<short-sha>` on every push to main (so `latest`
+      # always tracks main and any main commit is individually pullable),
+      # and semver tags (`v1.2.3` / `1.2` / `1`) on a `v*` tag push.
+      - name: Compute image tags/labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+
+      # Only main and version-tag pushes actually publish; other branches
+      # still build (via this same action, push:false) so the Dockerfile is
+      # validated on every push, matching ci.yml's build-on-every-branch spirit.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
