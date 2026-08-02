@@ -135,11 +135,14 @@ TX3 之後、TX4 之前抵達的任何回報必須 200 ACK 零效果。機制上
 - `go build ./...`、`go vet ./...` 乾淨
 - `TEST_DATABASE_URL=... go test -p 1 ./...` 全綠（既有測試不得因你的改動而失敗）
 - `docker compose down -v && up -d --build` 後 `\d workflows` 顯示新欄位
-- `python3 demo/crash_demo.py` 與 `./demo/run_demo.sh` scenarios 1–3 仍通過
-- **兩支凍結 oracle 仍通過**（`crash_recovery_test.py`、`EXPECT_X=2 dlq_replay_test.py`）
-- 貼出以下證據：`git status --porcelain test/acceptance/ spec/`（**應為空**）與 `sha256sum spec/BEHAVIOR_MATRIX.md`
 
-**已知環境限制：** `crash_recovery_test.py` 在 Docker Desktop／WSL2 拓樸下會確定性失敗（`host.docker.internal` 轉發問題，Session 21 以 6/6 對照實驗證實與程式碼無關）。**若你遇到這個特徵，記錄下來但不要為了讓它通過而改動 code。** 已知可行的做法是把 `ADVERTISE_HOST` 設為 WSL2 介面的實際 IP。
+- 貼出以下證據：`git status --porcelain test/acceptance/ spec/ archive/`（**應為空**）與 `sha256sum spec/BEHAVIOR_MATRIX.md`
+
+**本輪不驗證 demo 與 acceptance 測試：**
+
+- 舊的 acceptance oracle 已封存到 `archive/old-tests/`。**不要復原、不要修改、不要嘗試讓它們通過。**
+- `demo/` 在本輪**刻意排除**。你的變更會使 demo 建立 workflow 的請求形狀失效（`retry_limit` 移到頂層＋嚴格驗證），這是預期的。**不要修 demo，不要把它列入完成條件。** demo 的重建排在 spec → test → code 迴圈收斂之後，屆時它會依新契約重寫。
+- 若某個既有的 Go 測試因為契約變更而失敗（而不是因為你寫錯），**在報告中列出並說明，不要為了讓它綠而放寬新的驗證規則**。
 
 ---
 

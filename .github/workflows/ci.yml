@@ -138,20 +138,6 @@ jobs:
           docker compose $COMPOSE_FILES logs stateflow
           exit 1
 
-      - name: Run acceptance oracle — crash_recovery_test.py
-        run: |
-          ORCH_CONTAINER=$(docker compose $COMPOSE_FILES ps -q stateflow)
-          export ORCH_CONTAINER
-          python3 test/acceptance/crash_recovery_test.py
-
-      - name: Run acceptance oracle — dlq_replay_test.py (EXPECT_X=2)
-        env:
-          EXPECT_X: "2"
-        run: |
-          ORCH_CONTAINER=$(docker compose $COMPOSE_FILES ps -q stateflow)
-          export ORCH_CONTAINER
-          python3 test/acceptance/dlq_replay_test.py
-
       - name: Dump logs on failure
         if: failure()
         run: docker compose $COMPOSE_FILES logs

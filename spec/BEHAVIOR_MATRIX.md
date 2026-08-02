@@ -119,6 +119,9 @@ checksum 這條是防「動了又改回去」與「偷加一行註解」。
 | C-08 | recovery 認領孤兒時 count 已是 X−1 | 孤兒認領使 count 達 X → **在 TX3 內部**直接進 DLQ；**不得派送任何新 attempt** | L4 | §8.3(b) | SPEC |
 | C-09 | orchestrator 反覆 crash（crash loop） | 每次 crash 的孤兒認領耗一單位預算 → 每個 in-flight step **單調收斂到 DLQ**，無限重試在結構上不可能 | L4 | §8.3 | SPEC |
 | C-10 | crash 恰好落在某個 TXn 的 commit 當下 | 交易語意：要嘛全發生、要嘛全沒發生。不存在半套狀態。**可直接依賴 Postgres，不需另寫測試** | 依 TX | §9 / 裁定 #7 | SPEC |
+| C-14 | **planner 每個持久化的 step 恰被問一次**（frontier model 的核心主張） | 跨 crash、跨 recovery、跨 replay，一個已持久化的決策**永不被重新詢問**。可觀測驗證：planner 端的 decide 呼叫次數 ≤ 已建立的 step 數 + 1（最後一次問到 done／fail）。**這是與 replay family 最大的差異點，必須有直接斷言** | — | §2, §12.1 | SPEC |
+| C-15 | `steps.decision` 的不可變性 | 一旦 TX1 commit，該 step 的 `decision` JSONB 與 `created_at` **永不再被寫入** —— 跨 crash 前後位元相同。recovery 重派讀的是這一欄，若它會變動，「恰問一次」的保證就是空的 | L2 | §4.2, §2 | SPEC |
+| C-16 | 已完成 step 在 replay 之後 | 同 C-15：已 DONE 的 step 其 `output`、`created_at`、`decision` 在 worker 側 replay 之後仍位元相同 | L2 | §11 | SPEC |
 | C-11 | 重啟後掃描 | 只掃 `runs.status='RUNNING'`（索引查找）。run=DONE 與 run=DLQ **永不被掃描、永不被觸碰** | — | §8.3 | SPEC |
 | C-12 | crash 落在「TX1 commit 之後、worker 回應之前」 | 這是 C-02／C-03 的統稱：**attempt 層級的孤兒**，DB 裡留下一列 RUNNING attempt，由 recovery 判 `orphaned` | L2 | 裁定 #7 | SPEC |
 | C-13 | crash 落在「已送出 planner 請求、答案未回或未持久化」 | 這是 C-01：**run 層級的孤兒，不存在孤兒 attempt**。planner 呼叫不持久化，DB 裡沒有任何東西需要認領。recovery 動作只有「重問」，**不耗 attempt 預算、不寫 failure_reason** | L1 | 裁定 #7 | SPEC |
@@ -349,6 +352,21 @@ checksum 這條是防「動了又改回去」與「偷加一行註解」。
 
 ---
 
+## R. 測試環境的自足性要求
+
+> **背景：** 舊的 acceptance 測試（`_harness.py` 與兩支 fake）與 demo 已全數封存。新測試從零重寫，**必須自帶它需要的一切**。本節定義「自帶」的邊界。
+
+| ID | 要求 |
+|---|---|
+| R-01 | 測試套件必須**自行提供 fake planner 與 fake worker**。系統的設計是「planner 與 worker 都是外部 HTTP 端點」，沒有它們就無法啟動任何 run。這不是測試的附屬品，是被測系統的必要對手方 |
+| R-02 | fake planner 必須能：依固定劇本回答 continue／done／fail；**記錄每個 (run_id, history 長度) 被詢問的次數**（C-14 的觀測手段）；刻意回傳不合格的回應（供 D-02／D-02b 使用）；刻意逾時或拒絕連線（供 D-01 使用） |
+| R-03 | fake worker 必須能：成功回應（sync 與 async 兩種）；回非 2xx；回 2xx 但 body 非 JSON；回 2xx 但缺少宣告的 output_field；靜默不回應直到逾時；**以 step_id 為鍵做冪等**（示範 §15 的 worker 契約） |
+| R-04 | **只用 Python 標準函式庫。** 不引入 requests、pytest、flask 等任何外部依賴 —— 增加使用者跑測試的門檻，違背 usability 目標 |
+| R-05 | **網路拓樸必須在容器內解決。** fake planner／worker 跑成 compose 服務，orchestrator 以容器名稱存取。不得依賴 `host.docker.internal`（在 Docker Desktop／WSL2 下確定性失效，Session 21 已證實） |
+| R-06 | 測試撰寫者取得的「操作事實」僅限：如何啟動 stack、服務名稱與埠、DB 連線字串、容器名稱、環境變數。**不得取得任何語意契約**（請求／回應的欄位形狀、狀態機行為）—— 那些一律來自本矩陣。混淆這條界線會使盲寫失去意義 |
+
+---
+
 ## Q. 測試分層與執行方式
 
 > **每一列行為都要指定它的測試落在哪一層。** 這一節定義層級與判準，避免所有東西被硬塞進黑箱測試（有些情境從外部根本觸發不了）。
@@ -474,4 +492,4 @@ v0.1 的八個待裁事項已全數裁定，記錄於此以保留理由（面試
 
 ---
 
-*BEHAVIOR_MATRIX v1.1 — 依 STATE_SNAPSHOT（Session 22, `main` @ `adb24a4`）修正 K 節與 N.4；新增 Q 節（測試分層與 CI）、重試延遲窗口規則（E-08–E-10）、retry delay 可設定性（H-04 系列）。*
+*BEHAVIOR_MATRIX v1.2 — 新增 C-14/C-15/C-16（planner 恰問一次的可觀測斷言、decision 不可變性）與 R 節（測試環境自足性）。v1.1 — 依 STATE_SNAPSHOT（Session 22, `main` @ `adb24a4`）修正 K 節與 N.4；新增 Q 節（測試分層與 CI）、重試延遲窗口規則（E-08–E-10）、retry delay 可設定性（H-04 系列）。*

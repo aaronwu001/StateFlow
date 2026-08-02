@@ -22,6 +22,7 @@
 | 1 | `spec/BEHAVIOR_MATRIX.md` | **權威行為規格。** 每一列都是一條應該成立的斷言 |
 | 2 | `docs/WHITEPAPER_V1_1_PATCHES.md` | **白皮書的修正清單。** 標記白皮書哪些段落已經失實 |
 | 3 | `docs/StateFlow_Whitepaper_v1_0.md` | 架構背景與設計理由。**已知多處落後於實作** |
+| — | `docs/OPERATIONAL_FACTS.md` | **只有操作事實**（怎麼啟動、埠號、DB 連線、容器名稱、網路拓樸）。**刻意不含任何語意契約** —— 系統對某個輸入回什麼，一律從矩陣推導 |
 
 > ⚠️ **白皮書 v1.0 有數處是錯的，而且錯法會讓你寫出錯誤的測試。** 例：§12.2 說 history 帶「完整 output」（實際已上界化為 2 KB／筆、50 KB 累計）；§13.2 說 `retry_after_seconds` 被忽略（實際已生效）；§18 列了八項缺口（其中六項已關閉）。
 >
@@ -47,7 +48,22 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 
 ## 你的產出
 
-### 1. 測試檔案 —— `test/acceptance/` 底下的新檔案
+### 1. 測試基礎設施 —— 你要自己造
+
+舊的 `_harness.py`、`fake_planner.py`、`fake_worker.py` 與兩支 oracle **已全數封存**。你從零開始，沒有既有包袱。
+
+矩陣 R 節定義了自足性要求，摘要：
+
+| 檔案 | 要求 |
+|---|---|
+| `test/acceptance/fake_planner.py` | 依固定劇本回 continue／done／fail；**記錄每個 (run_id, history 長度) 被問過幾次**（C-14 的觀測手段，這是本專案核心主張的唯一直接證據）；可刻意回不合格的回應、可刻意逾時 |
+| `test/acceptance/fake_worker.py` | sync／async 成功；非 2xx；2xx 但 body 非 JSON；2xx 但缺 output_field；靜默到逾時；**以 step_id 為鍵冪等** |
+| `test/acceptance/_harness.py` | HTTP 與 psql 輔助、fake 的生命週期管理 |
+| `docker-compose.acceptance.yml` | **把兩支 fake 跑成 compose 服務**，orchestrator 以容器名稱存取。不得依賴 `host.docker.internal`（R-05） |
+
+**只用 Python 標準函式庫**（R-04）：不引入 requests、pytest、flask。
+
+### 2. 測試檔案 —— `test/acceptance/` 底下
 
 按行為矩陣的節分檔：
 
@@ -61,9 +77,9 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 | `invariants_test.py` | I 節（掃全庫的不變量健檢，**可獨立呼叫**） |
 | `observability_test.py` | K.3（`/healthz` 兩種回應、`/ui` 純讀且不含任何 POST） |
 
-**現有的 `crash_recovery_test.py` 與 `dlq_replay_test.py` 不要改、不要刪。** 新測試是它們的超集，退役的時機由 owner 決定，不由你決定。
+**舊 oracle 已封存，不需要相容。** 已確認它們的全部斷言都被矩陣涵蓋（C-06、I-10、C-02、C-03、A-08、I-05、B-10、F-01、F-03）。你不需要模仿它們，也看不到它們。
 
-### 2. 本機一鍵執行腳本 —— `scripts/test-all.sh`
+### 3. 本機一鍵執行腳本 —— `scripts/test-all.sh`
 
 必須做到：
 
@@ -73,7 +89,7 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 - 任一失敗即以非零離場碼結束，並印出清楚的失敗摘要
 - 支援 `--quick`（只跑 Go 測試與不變量健檢，跳過需要 kill 容器的慢測試）
 
-### 3. CI 接續 —— 修改 `.github/workflows/ci.yml`
+### 4. CI 接續 —— 修改 `.github/workflows/ci.yml`
 
 **CI 已存在，你是接進去，不是重建。** 目前兩個 job：`test`（Go 測試）與 `e2e`（compose stack + demo + 凍結 oracle）。
 
@@ -81,7 +97,7 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 - 不變量健檢在 `e2e` 的每個階段後跑一次
 - 兩個 job 維持每次 push 都觸發
 
-### 4. `FINDINGS.md`
+### 5. `FINDINGS.md`
 
 在這裡回報你在寫測試過程中發現的**規格問題**：矛盾、不明確、無法測試、彼此衝突的列。
 
@@ -95,11 +111,11 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 |---|---|
 | A-1 | **只用 HTTP + SQL。** 不得 import 任何 Go 型別，不得引用任何 `.go` 檔案路徑，不得假設任何內部函式名。斷言一律打在 API 回應或 DB 資料列上 |
 | A-2 | **每個測試函式的 docstring 首行必須寫矩陣 ID**（如 `B-10`、`N-06`）。無 ID 的測試不該存在——它斷言的東西不在規格裡 |
-| A-3 | **只用 Python 標準函式庫。** 沿用 `_harness.py` 的既有做法（`urllib.request` + `subprocess` 呼叫 `psql`）。不新增任何依賴 |
+| A-3 | **只用 Python 標準函式庫**（`urllib.request` + `subprocess` 呼叫 `psql` 即足夠）。不新增任何依賴 —— 每多一個依賴，就多一道使用者跑測試的門檻 |
 | A-4 | **不得為了讓測試通過而放寬斷言。** 你看不到實作，所以你無從得知它會不會過——這正是重點 |
 | A-5 | 每支測試自己建立 workflow 與 run，**不共用狀態**。CI 上會併發執行 |
 | A-6 | 矩陣 K.1 節列的是系統**明確不保證**的事。**不得為 K.1 的任何一列寫失敗測試** |
-| A-7 | `_harness.py` 需要修改時（例如 `retry_limit` 移到 body 頂層），**明確在 `FINDINGS.md` 中提出並說明理由，不要直接改**。凍結檔案的編輯權屬於 owner |
+| A-7 | 請求／回應的形狀一律**從矩陣推導**。`OPERATIONAL_FACTS.md` 刻意不含這些資訊 —— 若你發現自己需要「先看看系統實際回什麼」才寫得下去，那代表**矩陣在該處不完整**：記進 `FINDINGS.md`，並照你對規格的最佳理解寫，不要去猜實作 |
 
 ---
 
@@ -167,42 +183,57 @@ rm -rf "$BLIND"
 mkdir -p "$BLIND"/{docs,spec,test/acceptance,scripts,.github/workflows}
 
 # 規格（三份，有優先序）
-cp "$REPO/spec/BEHAVIOR_MATRIX.md"              "$BLIND/spec/"
-cp "$REPO/docs/WHITEPAPER_V1_1_PATCHES.md"      "$BLIND/docs/"
-cp "$REPO/docs/StateFlow_Whitepaper_v1_0.md"    "$BLIND/docs/"
+cp "$REPO/spec/BEHAVIOR_MATRIX.md"           "$BLIND/spec/"
+cp "$REPO/docs/WHITEPAPER_V1_1_PATCHES.md"   "$BLIND/docs/"
+cp "$REPO/docs/StateFlow_Whitepaper_v1_0.md" "$BLIND/docs/"
 
-# 既有的測試基礎設施（唯讀參考；_harness 用 HERE 相對路徑啟動兩支 fake，必須同目錄）
-cp "$REPO/test/acceptance/_harness.py"          "$BLIND/test/acceptance/"
-cp "$REPO/test/acceptance/fake_worker.py"       "$BLIND/test/acceptance/"
-cp "$REPO/test/acceptance/fake_planner.py"      "$BLIND/test/acceptance/"
-cp "$REPO/test/acceptance/README.md"            "$BLIND/test/acceptance/"
-cp "$REPO/test/acceptance/crash_recovery_test.py" "$BLIND/test/acceptance/"
-cp "$REPO/test/acceptance/dlq_replay_test.py"     "$BLIND/test/acceptance/"
+# 操作事實（Prompt R 的產出 —— 只有怎麼跑，沒有系統會回什麼）
+cp "$REPO/docs/OPERATIONAL_FACTS.md"         "$BLIND/docs/"
 
 # 既有 CI（要就地修改，所以放在正確路徑）
-cp "$REPO/.github/workflows/ci.yml"             "$BLIND/.github/workflows/"
+cp "$REPO/.github/workflows/ci.yml"          "$BLIND/.github/workflows/"
 
-# 確認沒有任何實作洩漏進來 —— 預期輸出為空
+# 安全閘門 —— 預期三行都無輸出
 find "$BLIND" \( -name '*.go' -o -name '*.sql' \) -print
+find "$BLIND/test" -name '*.py' -print
+ls "$BLIND"/docker-compose*.yml 2>/dev/null
 
 echo "OK: $BLIND"
 ```
 
-**最後那行 `find` 是安全閘門。** 有任何輸出就代表隔離破了，停下來查。
+**三個 find／ls 都必須沒有輸出。** 有任何輸出代表實作或既有測試洩漏進來了，停下來查。
 
-兩支既有的 oracle 也複製進來了，理由是讓盲寫 session 看得到既有的斷言風格與 harness 用法。**它們是唯讀參考，不得修改。**
+`test/acceptance/` 是**空的**——舊的 harness 與 fake 已封存，這個 session 從零重建它們。compose 檔案也不複製：它要自己寫 `docker-compose.acceptance.yml`，只依據 `OPERATIONAL_FACTS.md` 的網路拓樸資訊。
 
 ### 產出回收
 
-session 結束後，把新檔案複製回 repo：
-
 ```bash
-cp "$BLIND"/test/acceptance/*.py  "$REPO/test/acceptance/"    # 注意勿覆寫兩支既有 oracle
-cp "$BLIND"/scripts/test-all.sh   "$REPO/scripts/"
+cp "$BLIND"/test/acceptance/*.py     "$REPO/test/acceptance/"
+cp "$BLIND"/docker-compose.acceptance.yml "$REPO/"
+cp "$BLIND"/scripts/test-all.sh      "$REPO/scripts/"
 cp "$BLIND"/.github/workflows/ci.yml "$REPO/.github/workflows/"
-cp "$BLIND"/FINDINGS.md           "$REPO/spec/MATRIX_FINDINGS_tests.md"
-
-cd "$REPO" && git status --porcelain test/acceptance/
+cp "$BLIND"/FINDINGS.md              "$REPO/spec/MATRIX_FINDINGS_tests.md"
 ```
 
-最後那行檢查：**`crash_recovery_test.py` 與 `dlq_replay_test.py` 不該出現在變更清單裡。** 出現就代表盲寫 session 動了凍結的 oracle。
+### 封存指令（**執行 Prompt A 之前先做**）
+
+```bash
+cd "$REPO"
+mkdir -p archive/old-tests
+git mv test/acceptance/_harness.py            archive/old-tests/
+git mv test/acceptance/fake_planner.py        archive/old-tests/
+git mv test/acceptance/fake_worker.py         archive/old-tests/
+git mv test/acceptance/crash_recovery_test.py archive/old-tests/
+git mv test/acceptance/dlq_replay_test.py     archive/old-tests/
+git mv test/acceptance/README.md              archive/old-tests/
+git rm -r --cached test/acceptance/__pycache__ 2>/dev/null || true
+echo "__pycache__/" >> .gitignore
+
+git commit -m "archive: retire v0 acceptance oracles; superseded by BEHAVIOR_MATRIX-derived suite
+
+Coverage verified before archival — every assertion maps to a matrix ID:
+  crash_recovery_test: C-06, I-10, C-02, C-03, A-08, I-05
+  dlq_replay_test:     B-10, I-02, F-01, F-03"
+```
+
+**同時要做的：** 把 `.github/workflows/ci.yml` 中呼叫這兩支 oracle 的步驟拿掉（否則 CI 會立刻紅）。新測試回收後再接上。
