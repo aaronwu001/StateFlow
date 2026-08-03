@@ -225,7 +225,8 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | N-07 | `planner_config` 出現任何未知欄位 | 400（嚴格模式，不接受未知鍵）。合法鍵集合由**輸入 schema** 定義，與 DB 落地形狀無關 | 裁定 #B+#3 |
 | N-08 | static 步驟表中兩個 step 同名 | 400（承 B-15）。static planner 在執行期的「構造上不會失敗」保證，正是靠這一條在提交時成立 | 裁定 #1+#B |
 | N-09 | static 步驟表中某步驟缺 `name`／`worker_url`／`mode`，或 `mode` 不是 sync\|async，或 worker_url 語法不合法 | 400，訊息指出是第幾個步驟的哪個欄位 | 裁定 #B+#4 |
-| N-10 | `retry_limit` 缺失、非整數或 < 1；`timeout_seconds` 為負 | 400 | 裁定 #B |
+| N-10 | `retry_limit` 或 `default_timeout_seconds` **有帶但不合法**（非整數、`retry_limit < 1`、`default_timeout_seconds <= 0`） | 400，訊息指出欄位與合法範圍 | 裁定 #B |
+| N-10b | `retry_limit` 或 `default_timeout_seconds` **未提供** | **合法**，採用預設（`retry_limit=3`、`default_timeout_seconds=60`）。與 N-07／N-18 的嚴格模式不衝突：**嚴格模式拒絕的是多餘的欄位，不是缺席的選填欄位** | 裁定 #B |
 | N-11 | `retry_limit` 與 `default_timeout_seconds` 的位置 | **兩者皆為 `workflows` 表的一級欄位，且在輸入 body 中為頂層欄位。** 它們是 workflow 層級的執行參數，與「怎麼決定下一步」無關；塞進 `planner_config` JSONB 純粹是遷就舊 schema。**本輪直接改 schema，不做 API 層搬運。**詳見 N.4 | 裁定 #3+#D |
 | N-12 | 驗證失敗時的副作用 | **零副作用**：不建立 workflow、不寫任何 DB 列。驗證全部先於 TX-W | 裁定 #B |
 | N-13 | 驗證成功 | 才執行 TX-W，回傳 workflow_id | §19 |
