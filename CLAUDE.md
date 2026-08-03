@@ -1,6 +1,15 @@
 # StateFlow — Development Discipline
 
-**Authoritative design:** `docs/StateFlow_Whitepaper_v1_0.md`
+**Authoritative behavior spec:** `spec/BEHAVIOR_MATRIX.md` — scenario → required observable
+outcome, one row per assertion. **Read-only to you** (see Authorship and Frozen
+Specifications). Where it and any other document disagree, it wins.
+**Authoritative design & rationale:** `docs/StateFlow_Whitepaper_v1_0.md`, corrected by
+`docs/WHITEPAPER_V1_1_PATCHES.md` — the whitepaper lags the implementation in several
+places; read the patch list alongside it and prefer the patch list on any conflict.
+**Backlog (not yet true):** `docs/BACKLOG.md` — whitepaper repairs still owed, and
+possible future work. Nothing here is implemented; do not treat it as spec.
+**Operational facts:** `docs/OPERATIONAL_FACTS.md` — how to start, connect to, and observe
+the stack. Deliberately contains no behavioral contracts.
 **Rule-by-rule spec:** `docs/StateFlow_Rules_Consolidation_v3_EN.md` (the only version — no
 Chinese mirror exists; earlier drafts of this doc referred to one, but it was never actually
 added to the repo).
@@ -106,10 +115,18 @@ matter how it subdivides internally. Resolution order: `step.timeout_seconds` (S
 start their own clock. **Timeout = failure** (reason `timeout`), consuming the retry
 budget exactly like an explicit failure — the only behavioral difference from treating it
 as "uncertain" is budget accounting, and charging the budget errs in the conservative
-direction (reach a human sooner, whitepaper §6). Retry delay between attempts: fixed 5s
-(skipped on crash-recovery re-dispatch — the crash itself already provided cooldown).
-Planner calls get a separate, fixed budget: 30s per call × 3 total attempts, not
-user-configurable.
+direction (reach a human sooner, whitepaper §6). Retry delay between attempts: default 5s, overridable
+process-wide via `RETRY_DELAY_SECONDS` (registry item 6), and raised — never lowered — by
+a worker's `retry_after_seconds` (effective delay = `max(reported, default)`, registry
+item 5). Skipped entirely on crash-recovery re-dispatch: the crash itself already
+provided cooldown. Planner calls get a separate, fixed budget: 30s per call × 3 total
+attempts, not user-configurable.
+
+**Do not confuse the three numbers.** `timeout` is one attempt's lifetime ceiling — how
+long before it is pronounced failed. `retry delay` is the cooldown between a failure
+verdict and the next attempt. `retry limit X` is how many failures before the DLQ. Worst
+case, a step reaches the DLQ in roughly `X × (timeout + retry delay)`; estimating with
+`X × timeout` alone understates it.
 
 ### The orphan rule
 
@@ -185,6 +202,41 @@ scheduled features and lands together with them.
 | 6 | ~~Hardcoded assembly in `main.go`~~ | **CLOSED (Session 21).** Retry policy (`RETRY_MAX_ATTEMPTS`/`RETRY_DELAY_SECONDS`) and the sweeper interval (`SWEEP_INTERVAL_SECONDS`) are env-var-configurable, each defaulting to the exact value that was hardcoded before — a fresh clone with no new env vars is behaviorally identical to pre-Phase-2. | Landed | done |
 | 7 | ~~Init-only migration~~ | **CLOSED (Session 22).** Schema is now versioned `golang-migrate` migrations (`migrations/NNNNNN_title.up.sql`/`.down.sql`), applied automatically by the `stateflow` binary at startup via golang-migrate's Go library (no CLI — the distroless runtime has no shell). | Landed | done |
 | 8 | ~~No orchestrator healthcheck~~ | **CLOSED (Session 10).** `GET /healthz` (pings Postgres) + a `stateflow healthcheck` CLI subcommand back a real `Dockerfile HEALTHCHECK`/`docker-compose.yml healthcheck:`. | Landed | done |
+
+---
+
+## Authorship and Frozen Specifications
+
+Some files here have a single designated author. You are not that author.
+
+| Path | Author | You |
+|---|---|---|
+| `spec/BEHAVIOR_MATRIX.md` | Architect, ratified by the owner | **Read-only** |
+
+**Do not create, modify, or delete any file under `spec/`.** This holds even when a test
+fails, even when you are certain the specification is wrong, and even when the fix looks
+trivial.
+
+When you believe a spec is wrong: stop and report. State which matrix ID is involved,
+what the code actually does, and why you believe the specification rather than the
+implementation is at fault. A correct finding reported is worth more than a silent fix.
+
+Every session report must include:
+
+```bash
+git status --porcelain spec/     # must be empty
+sha256sum spec/BEHAVIOR_MATRIX.md
+```
+
+The checksum catches what `git status` misses: an edit made and then reverted, and a
+comment quietly inserted into the matrix.
+
+Findings go in `spec/MATRIX_FINDINGS.md`, keyed by matrix ID. That file is yours to
+write; it never touches the matrix.
+
+Specification changes flow **spec → tests → code**. When a ratified spec change requires
+a test to change, the owner makes that edit, citing the matrix ID. You changing a test
+because it failed is not that path.
 
 ---
 
@@ -267,14 +319,21 @@ GET  /runs/{run_id}                  status + steps (seq/attempt_count/created_a
 GET  /dlq                            list DLQ entries
 POST /dlq/{id}/replay                replay (worker-side = TX5, planner-side = TX6)
 POST /tasks/complete                 async worker callback
-POST /tasks/fail                     async worker failure callback (optional retry_after_seconds: accepted, ignored — registry item 5)
+POST /tasks/fail                     async worker failure callback (optional retry_after_seconds: honored as a floor — registry item 5)
 GET  /healthz                        liveness (Postgres reachability); no auth, not part of the versioned business API above
+GET  /ui                             read-only status page (embedded HTML; calls only GET /runs/{id} and GET /dlq — no write path anywhere on the page)
 ```
 
 `planner_config` (one JSONB blob on the workflow): `url` (http planner, required),
 `steps` (static planner, required), plus the two workflow-level overrides available to
 either planner type — `retry_limit` (X, default 3) and `default_timeout_seconds` (default
 unset → system 60s). See `docs/USER_MANUAL.md` §1.6 for the full table.
+
+> **This describes the current state and is scheduled to change.** `spec/BEHAVIOR_MATRIX.md`
+> N-11/N-20/N-22 move `retry_limit` and `default_timeout_seconds` out of `planner_config`
+> and into first-class `workflows` columns, leaving `planner_config` holding only what is
+> specific to the planner type (`url` for http, `steps` for static). Update this paragraph
+> when that lands.
 
 ---
 

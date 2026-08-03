@@ -50,52 +50,83 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 
 ### 1. 測試基礎設施 —— 你要自己造
 
-舊的 `_harness.py`、`fake_planner.py`、`fake_worker.py` 與兩支 oracle **已全數封存**。你從零開始，沒有既有包袱。
+系統的設計是「planner 與 worker 都是外部 HTTP 端點」。**沒有它們就無法啟動任何 run**，所以 fake 不是測試的附屬品，是被測系統的必要對手方。
 
-矩陣 R 節定義了自足性要求，摘要：
-
-| 檔案 | 要求 |
+| 檔案 | 必須能做到 |
 |---|---|
-| `test/acceptance/fake_planner.py` | 依固定劇本回 continue／done／fail；**記錄每個 (run_id, history 長度) 被問過幾次**（C-14 的觀測手段，這是本專案核心主張的唯一直接證據）；可刻意回不合格的回應、可刻意逾時 |
-| `test/acceptance/fake_worker.py` | sync／async 成功；非 2xx；2xx 但 body 非 JSON；2xx 但缺 output_field；靜默到逾時；**以 step_id 為鍵冪等** |
+| `test/acceptance/fake_planner.py` | 依固定劇本回 continue／done／fail；**記錄每個 (run_id, history 長度) 被詢問過幾次**；回傳語法不合格的回應；回傳語意不合格的回應；刻意逾時或拒絕連線 |
+| `test/acceptance/fake_worker.py` | sync 成功；async 成功（202 + 回呼）；非 2xx；2xx 但 body 非 JSON；2xx 但缺少宣告的欄位；靜默直到逾時；**以 step_id 為鍵冪等** |
 | `test/acceptance/_harness.py` | HTTP 與 psql 輔助、fake 的生命週期管理 |
-| `docker-compose.acceptance.yml` | **把兩支 fake 跑成 compose 服務**，orchestrator 以容器名稱存取。不得依賴 `host.docker.internal`（R-05） |
+| `docker-compose.acceptance.yml` | 把兩支 fake 跑成 compose 服務 |
 
-**只用 Python 標準函式庫**（R-04）：不引入 requests、pytest、flask。
+**只用 Python 標準函式庫。** 不引入 requests、pytest、flask —— 每多一個依賴，就多一道使用者跑測試的門檻。
 
-### 2. 測試檔案 —— `test/acceptance/` 底下
+> **為什麼 fake planner 一定要記錄呼叫次數：** 矩陣 C-14 是這個專案最核心的主張（planner 每個持久化的 step 恰被問一次），而呼叫計數是它**唯一的直接觀測手段**。沒有這個計數，那條規格就無法驗證。
 
-按行為矩陣的節分檔：
+### 2. 測試檔案 —— 分三層
 
-| 檔名 | 涵蓋矩陣的 |
+**分層依據是「能不能只用 HTTP + SQL 觸發」，不是「寫起來方不方便」。**
+
+| 層 | 位置 | 適用 | 涵蓋 |
+|---|---|---|---|
+| **黑箱** | `test/acceptance/*.py` | 只碰 HTTP API 與 SQL schema | A、B（多數）、D、F、G-01/02、J、N、O 節 |
+| **種狀態** | `internal/store/`、`internal/orchestrator/` 的 Go 測試 | 情境**無法從外部觸發**，必須直接在 DB 種出中間狀態 | C-04、C-05、C-07、C-08、E-08/E-09 |
+| **不變量健檢** | 一支掃全庫的腳本 | 「任何時刻都必須成立」的條件 | I 節全部 |
+
+**你只寫黑箱層與不變量健檢。** 種狀態層需要 Go 型別，盲寫做不到——你只要在覆蓋表上標出哪些矩陣列屬於那一層，並**為每一列寫下它的斷言應該是什麼**（自然語言即可）。實作 session 會照你寫的斷言去實作那些 Go 測試，**它不得自行決定斷言內容**。
+
+規則：黑箱測試**不得 import 任何 Go 型別、不得引用任何 `.go` 檔案路徑**。這是讓盲寫可行的硬條件。
+
+種出來的狀態**必須是合法五組合之一**（矩陣落點 L1–L5）。種一個結構上不可能的狀態然後斷言系統會處理它，是在測試一個不存在的世界。
+
+不變量健檢應在**每一支**黑箱測試結束後跑一次——不變量被破壞時，最有價值的資訊是「哪一個情境破壞了它」。
+
+現有的 `internal/*` unit test **保留，但不主動投資**。它們對「面試講得出來」與「別人用得起來」兩個目標貢獻最小，不要為了提升覆蓋率去擴充它們。
+
+按矩陣的節分檔：
+
+| 檔名 | 涵蓋 |
 |---|---|
-| `config_validation_test.py` | N 節全部（提交時驗證、格式一致性、strict mode） |
-| `worker_failure_test.py` | B 節（四種失敗 reason、預算、DLQ 進入） |
-| `planner_failure_test.py` | D 節（planner 預算、三種 DLQ reason、驗收兩層） |
-| `dlq_replay_full_test.py` | F 節（replay 兩條路徑、冪等 409、`GET /dlq` 過濾與分類） |
-| `wire_format_test.py` | J 節（sync 裸 body + headers、async 信封、大小寫規則） |
-| `invariants_test.py` | I 節（掃全庫的不變量健檢，**可獨立呼叫**） |
-| `observability_test.py` | K.3（`/healthz` 兩種回應、`/ui` 純讀且不含任何 POST） |
-
-**舊 oracle 已封存，不需要相容。** 已確認它們的全部斷言都被矩陣涵蓋（C-06、I-10、C-02、C-03、A-08、I-05、B-10、F-01、F-03）。你不需要模仿它們，也看不到它們。
+| `config_validation_test.py` | N 節（提交時驗證、格式一致性、strict mode 兩層） |
+| `worker_failure_test.py` | B 節（四種失敗 reason、預算、進 DLQ） |
+| `planner_failure_test.py` | D 節（planner 預算、三種 DLQ reason、兩層驗收） |
+| `dlq_replay_test.py` | F 節（replay 兩條路徑、冪等 409、`GET /dlq` 過濾與分類） |
+| `crash_recovery_test.py` | C 節可黑箱觸發的部分（C-01、C-02、C-03、C-06、C-11、C-14、C-15、C-16） |
+| `wire_format_test.py` | J 節（sync 裸 body + headers、async 信封、大小寫、history 上界化） |
+| `invariants_test.py` | I 節（掃全庫的健檢，**必須可被其他測試獨立呼叫**） |
+| `observability_test.py` | O 節（環境變數 fail-fast、`/healthz` 兩種回應、`/ui` 純讀） |
+| `normal_path_test.py` | A 節、G 節可黑箱觸發的部分、H 節 |
 
 ### 3. 本機一鍵執行腳本 —— `scripts/test-all.sh`
 
+目前 repo 的 `scripts/` 是空的，沒有 Makefile。**CI 綠而本機沒人跑得動，等於別人 clone 下來無從驗證這東西是好的** —— 這是 usability 問題，不是便利問題。
+
 必須做到：
 
-- 起 stack、等 healthy（`stateflow` 服務已有 healthcheck，可直接等）
-- 依序跑：Go 測試 → 所有 acceptance 測試 → 不變量健檢
-- **每一支測試結束後自動跑一次 `invariants_test.py`** —— 不變量被破壞時，最有價值的資訊是「哪一個情境破壞了它」
-- 任一失敗即以非零離場碼結束，並印出清楚的失敗摘要
-- 支援 `--quick`（只跑 Go 測試與不變量健檢，跳過需要 kill 容器的慢測試）
+- 起 stack、等所有服務 healthy（用 `docker inspect -f '{{.State.Health.Status}}'`，**不要用 host 端 port 探測** —— Docker Desktop 的 port proxy 會在容器內程序真正 bind 之前就接受連線）
+- 依序跑：Go 測試 → 黑箱測試 → 不變量健檢
+- 每支黑箱測試後自動跑一次不變量健檢
+- 任一失敗即非零離場，印出清楚的失敗摘要
+- `--quick`：只跑 Go 測試與不變量健檢，跳過需要 kill 容器的慢測試
+
+> **重要環境事實：這台機器上沒有安裝 Go**（WSL 與 Windows 都沒有）。既有的 Go 測試一直是在容器裡跑的。腳本**必須走容器**，不能假設本機有 `go`：
+>
+> ```bash
+> docker run --rm --network stateflow_default \
+>   -v "$PWD:/src" -w /src -v go-mod-cache:/go/pkg/mod \
+>   -e TEST_DATABASE_URL="postgres://stateflow:stateflow@postgres:5432/stateflow?sslmode=disable" \
+>   golang:1.25 go test -p 1 ./...
+> ```
+>
+> 若本機有 `go` 則可直接用，腳本應自動偵測。`-p 1` 是必要的：多個 package 共用同一個資料庫且各自重置 schema。
 
 ### 4. CI 接續 —— 修改 `.github/workflows/ci.yml`
 
-**CI 已存在，你是接進去，不是重建。** 目前兩個 job：`test`（Go 測試）與 `e2e`（compose stack + demo + 凍結 oracle）。
+**CI 已存在，你是接進去，不是重建。** 目前兩個 job：`test`（Go 測試）與 `e2e`（完整 stack + demo）。
 
-- 新的 acceptance 測試接進 `e2e` job
-- 不變量健檢在 `e2e` 的每個階段後跑一次
-- 兩個 job 維持每次 push 都觸發
+- 黑箱測試接進 `e2e` job；種狀態層與不變量健檢接進 `test` job
+- 兩個 job 維持每次 push 都觸發。分成兩個不是為了跑得比較少，是**失敗時一眼看出是邏輯錯還是端到端錯**
+- `e2e` job 目前呼叫已封存 oracle 的步驟已被移除，你把新測試接上去
 
 ### 5. `FINDINGS.md`
 
@@ -114,7 +145,7 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 | A-3 | **只用 Python 標準函式庫**（`urllib.request` + `subprocess` 呼叫 `psql` 即足夠）。不新增任何依賴 —— 每多一個依賴，就多一道使用者跑測試的門檻 |
 | A-4 | **不得為了讓測試通過而放寬斷言。** 你看不到實作，所以你無從得知它會不會過——這正是重點 |
 | A-5 | 每支測試自己建立 workflow 與 run，**不共用狀態**。CI 上會併發執行 |
-| A-6 | 矩陣 K.1 節列的是系統**明確不保證**的事。**不得為 K.1 的任何一列寫失敗測試** |
+| A-6 | 矩陣 K 節列的是系統**明確不保證**的事。**不得為 K 節的任何一列寫失敗測試** |
 | A-7 | 請求／回應的形狀一律**從矩陣推導**。`OPERATIONAL_FACTS.md` 刻意不含這些資訊 —— 若你發現自己需要「先看看系統實際回什麼」才寫得下去，那代表**矩陣在該處不完整**：記進 `FINDINGS.md`，並照你對規格的最佳理解寫，不要去猜實作 |
 
 ---
@@ -131,29 +162,25 @@ StateFlow 驅動多步驟 AI pipeline，每一步的決策與結果都持久化�
 
 ---
 
-## 環境：Docker Desktop / WSL2 的已知問題與正確做法
+## 網路拓樸
 
-現有的 oracle 讓 fake planner／worker 跑在**主機**上，orchestrator 在**容器**裡，容器透過 `host.docker.internal` 回連主機。**這在 Docker Desktop／WSL2 拓樸下會確定性失敗**（Session 21 以 6/6 對照實驗證實，與程式碼無關）。
+`docs/OPERATIONAL_FACTS.md` §5 有完整的實測資料，讀那一節。摘要：
 
-**已知可行的做法（Session 8.5 實測成功）：** 把 `ADVERTISE_HOST` 設為 WSL2 介面的實際 IP（例如 `172.31.72.20`），而非預設的 `host.docker.internal`。
+**把 fake 跑成 compose 服務，用容器名稱互相存取。** orchestrator 收到的 worker／planner 位址形如 `http://fake-worker:6000/path` —— 容器**內部**的埠，不是 host published 的埠，位址裡不出現 `localhost`。
 
-**你要做的（優先序由高到低）：**
+**為什麼選這條路：** 不是因為別條會壞，而是因為**它少一個變數**。容器對容器的名稱解析在 Linux／Mac／Windows／CI 上行為完全一致；跨越主機邊界的路徑會隨平台改變。
 
-1. **首選 —— 讓 fakes 進容器。** 在 `docker-compose.demo.yml` 之外新增一個 `docker-compose.acceptance.yml`，把 fake planner／worker 跑成 compose 服務，orchestrator 用**容器名稱**存取它們。這樣主機↔容器的邊界整個消失，Linux／Mac／Windows／CI 行為一致。**這是真正的修法，不是規避。**
-2. **次選 —— 在 `scripts/test-all.sh` 中自動偵測。** 依序嘗試 `host.docker.internal` 與 WSL2 介面 IP，取先連通者，並印出實際使用的值。
-3. **無論做哪一種，都要在 `FINDINGS.md` 記錄，並產出一段可貼進 README 疑難排解的文字。** 第一個 clone 這個專案的人若看到測試是紅的，會直接認定專案是壞的——這是純粹的 usability 傷害，修補成本是三行文字。
+> **一則歷史更正：** 先前的專案文件宣稱 `host.docker.internal` 在 Docker Desktop／WSL2 下「確定性失效」。`OPERATIONAL_FACTS.md` §5.4 的實測**推翻了這個宣稱** —— 兩次乾淨實驗都成功。實際失效原因未確認（可能是當時的環境變數為空）。上面的建議不變，但理由是「少一個變數」，不是「另一條會壞」。
 
-**另一個已知的環境陷阱（Session 8.5 記錄，避免重蹈）：** 從 Git Bash 呼叫 `wsl.exe -d Ubuntu -- bash -lc '...'` 時，內嵌的 `$(...)` 命令替換會**靜默求值為空字串**而非報錯。曾導致 `ADVERTISE_HOST` 為空、planner URL 變成 `http://:7102/`、run 立刻以 `planner_unreachable` 進 DLQ。解法：把指令寫進 `.sh` 檔再執行，並加 `MSYS_NO_PATHCONV=1`。
-
----
+**還有一件事：** 會回呼 orchestrator 的 fake 必須撐得住 orchestrator 不在的情況 —— crash 測試期間，連服務名稱解析本身都會失敗。
 
 ## 完成條件
 
-1. 上述七支測試檔案存在，每個測試函式的 docstring 首行都有矩陣 ID
+1. 上述九支測試檔案存在，每個測試函式的 docstring 首行都有矩陣 ID
 2. `scripts/test-all.sh` 可執行，`--quick` 模式可用
 3. `ci.yml` 已接上新測試
 4. `FINDINGS.md` 已產出
-5. **產出一張覆蓋表**：矩陣每一個 ID → 哪個檔案的哪個函式涵蓋它，或標記「L-SEED（無法黑箱測試）」／「L-SQL（不變量）」／「K.1（不保證，不測）」。**沒有任何 ID 可以沒有歸屬。**
+5. **產出一張覆蓋表**：矩陣每一個 ID → 哪個檔案的哪個函式涵蓋它，或標記「種狀態層（無法黑箱觸發，附上該列的斷言敘述）」／「不變量健檢」／「K 節（不保證，不測）」。**沒有任何 ID 可以沒有歸屬。**
 
 **注意：測試現在會失敗，這是預期的。** 實作由另一個平行的 session 進行。你的工作是把規格變成可執行的斷言，不是讓它們變綠。
 
@@ -214,26 +241,3 @@ cp "$BLIND"/scripts/test-all.sh      "$REPO/scripts/"
 cp "$BLIND"/.github/workflows/ci.yml "$REPO/.github/workflows/"
 cp "$BLIND"/FINDINGS.md              "$REPO/spec/MATRIX_FINDINGS_tests.md"
 ```
-
-### 封存指令（**執行 Prompt A 之前先做**）
-
-```bash
-cd "$REPO"
-mkdir -p archive/old-tests
-git mv test/acceptance/_harness.py            archive/old-tests/
-git mv test/acceptance/fake_planner.py        archive/old-tests/
-git mv test/acceptance/fake_worker.py         archive/old-tests/
-git mv test/acceptance/crash_recovery_test.py archive/old-tests/
-git mv test/acceptance/dlq_replay_test.py     archive/old-tests/
-git mv test/acceptance/README.md              archive/old-tests/
-git rm -r --cached test/acceptance/__pycache__ 2>/dev/null || true
-echo "__pycache__/" >> .gitignore
-
-git commit -m "archive: retire v0 acceptance oracles; superseded by BEHAVIOR_MATRIX-derived suite
-
-Coverage verified before archival — every assertion maps to a matrix ID:
-  crash_recovery_test: C-06, I-10, C-02, C-03, A-08, I-05
-  dlq_replay_test:     B-10, I-02, F-01, F-03"
-```
-
-**同時要做的：** 把 `.github/workflows/ci.yml` 中呼叫這兩支 oracle 的步驟拿掉（否則 CI 會立刻紅）。新測試回收後再接上。

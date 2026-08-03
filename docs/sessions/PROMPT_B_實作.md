@@ -8,7 +8,7 @@
 
 ## 你的角色
 
-你在實作 **StateFlow** 的一批規格變更。`spec/BEHAVIOR_MATRIX.md` 是權威行為規格，`docs/StateFlow_Whitepaper_v1_0.md` 是架構背景（**注意：白皮書多處已落後於實作，矩陣 K 節列出了落差**）。
+你在實作 **StateFlow** 的一批規格變更。`spec/BEHAVIOR_MATRIX.md` 是權威行為規格，`docs/StateFlow_Whitepaper_v1_0.md` 是架構背景（**注意：白皮書多處已落後於實作，落差清單在 `docs/BACKLOG.md`**）。
 
 另一個平行的 session 正在**看不到程式碼**的情況下，依同一份矩陣撰寫驗收測試。你們的共同真相來源是矩陣，不是彼此。**不要去猜它會怎麼寫測試，照規格做。**
 
@@ -18,9 +18,9 @@
 
 **這三件會決定你要做什麼，不要憑假設開工。**
 
-1. **`workflows` 表現在到底長什麼樣？** 執行 `\d workflows`。`retry_limit` 與 `default_timeout_seconds` 是獨立欄位，還是 `planner_config` JSONB 裡的鍵？快照的 CONFIRM 值顯示 `default_timeout_seconds` 可能已存在但 `retry_limit` 仍在 JSONB 內 —— **實測，不要相信文件**。
-2. **migration 現況。** 專案已使用 `golang-migrate`（Session 22），檔案是 `migrations/000001_initial.{up,down}.sql`。確認目錄實際內容與 `main.go` 的套用時機。
-3. **既有的 config 驗證有多少？** `POST /workflows` 現在拒絕什麼、接受什麼？這決定 N 節是新增還是補強。
+1. **`workflows` 表現在長什麼樣？** 執行 `\d workflows`。已知（`docs/OPERATIONAL_FACTS.md` §2.3，2026-08-03 實測）它只有 `workflow_id`／`name`／`planner_type`／`planner_config`／`created_at` —— **`retry_limit` 與 `default_timeout_seconds` 兩個欄位都不存在**，兩者目前都藏在 `planner_config` JSONB 裡。自己再確認一次。
+2. **既有的 config 驗證有多少？** `POST /workflows` 現在拒絕什麼、接受什麼？這決定 N 節是新增還是補強。
+3. **`.yaml` 檔的實際內容是 YAML 還是 JSON？** `grep` 出所有 `.yaml`／`.yml` 並判定（N-01）。
 
 **把這三件的實測結果放在報告最前面。**
 
@@ -32,15 +32,16 @@
 
 ### 1. Migration 000002 —— schema 變更
 
-**做法已變更：** 舊的 session 規則（就地改寫 `001_initial.sql`、不引入 migration 工具）**已於 Session 22 作廢**。
+**目標狀態由矩陣 N-20／N-21 定義；以下是達到它的做法。**
+
+專案使用 `golang-migrate`，檔案為 `migrations/NNNNNN_name.{up,down}.sql`，由 `cmd/stateflow/main.go` 在啟動時、`RecoverRuns` 之前套用（現有的是 `000001_initial.*`）。
 
 - 新增 `migrations/000002_*.{up,down}.sql`，**up 與 down 都要寫**
-- **不得就地改寫 `000001`** —— 那會使已套用該版本的資料庫與檔案不一致
-- 內容：`workflows` 加 `retry_limit INT NOT NULL DEFAULT 3 CHECK (retry_limit >= 1)`；若 `default_timeout_seconds` 尚不存在，一併加上 `INT NOT NULL DEFAULT 60 CHECK (> 0)`
-- **既有資料的搬遷：** up migration 需把現有 `planner_config->>'retry_limit'` 的值搬進新欄位（無值者用預設）
-- 對應矩陣：N-20、N-20a、N-21
+- **不得就地改寫 `000001`** —— 已套用該版本的資料庫會與檔案永久不一致
+- 內容：`workflows` 加 `retry_limit INT NOT NULL DEFAULT 3 CHECK (retry_limit >= 1)`；若 `default_timeout_seconds` 尚不存在，一併加上 `INT NOT NULL DEFAULT 60 CHECK (default_timeout_seconds > 0)`
+- **既有資料搬遷：** up migration 需把現有 `planner_config->>'retry_limit'` 的值搬進新欄位（無值者用預設），並從 JSONB 移除該鍵
 
-**驗收：** `docker compose down -v && up -d`，貼出 `\d workflows`；另測 down migration 可執行。
+**驗收：** `docker compose down -v && up -d`，貼出 `\d workflows`；另實測 down migration 可執行。
 
 ### 2. Config 提交時驗證（矩陣 N 節）
 
@@ -106,7 +107,18 @@
 - README／USER_MANUAL 說明 `X × (timeout + retry delay)` 的估算方式
 - 理由：使用者會用 `X × timeout` 估算進 DLQ 的時間，實際更長
 
-### 9. 冷卻窗口的回報處理（E-08 至 E-10）—— **這一項是查核，多半不需改 code**
+### 9. 種狀態層的 Go 測試（**新增工作項**）
+
+有六列矩陣行為**無法從 HTTP + SQL 外部觸發**，必須直接在 DB 種出中間狀態才測得到：**C-04、C-05、C-07、C-08、E-08、E-09**。盲寫的測試 session 做不到（它沒有 Go 型別），所以由你實作。
+
+**嚴格限制，避免自己閱卷：**
+
+- 斷言內容**一律照抄矩陣該列的「預期結果」欄**，逐字轉成程式碼。**你不得自行決定該斷言什麼**
+- 測試 session 的覆蓋表會為每一列附上斷言敘述（自然語言）。**以該敘述為準**，與你的實作直覺衝突時，停下來回報
+- 種出來的狀態**必須是合法五組合之一**（矩陣落點 L1–L5）。種一個結構上不可能的狀態然後斷言系統會處理它，是在測試一個不存在的世界
+- 位置：`internal/store/`、`internal/orchestrator/` 的 Go 測試
+
+### 10. 冷卻窗口的回報處理（E-08 至 E-10）—— **這一項是查核，多半不需改 code**
 
 TX3 之後、TX4 之前抵達的任何回報必須 200 ACK 零效果。機制上這應該**已經自然成立**（該 attempt 已非 `RUNNING`，CAS 必然不匹配）。
 
