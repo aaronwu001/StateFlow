@@ -111,7 +111,7 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | C-08 | recovery 認領孤兒時 count 已是 X−1 | 孤兒認領使 count 達 X → **在 TX3 內部**直接進 DLQ；**不得派送任何新 attempt** | L4 | §8.3(b) |
 | C-09 | orchestrator 反覆 crash（crash loop） | 每次 crash 的孤兒認領耗一單位預算 → 每個 in-flight step **單調收斂到 DLQ**，無限重試在結構上不可能 | L4 | §8.3 |
 | C-10 | crash 恰好落在某個 TXn 的 commit 當下 | 交易語意：要嘛全發生、要嘛全沒發生。**不存在半套狀態** | 依 TX | §9, 裁定 #7 |
-| C-14 | **同一個決策點永不重問**（frontier model 的核心主張） | 以 history 深度標記決策點。planner **可能**在同一深度被問多次（答案未通過驗收會重問，耗 planner 預算）。但**一旦某深度的答案被接受並持久化，該深度永不再被詢問** —— 跨 crash、跨 recovery、跨 replay 皆然。可觀測：對每個深度，「答案被接受」的呼叫恰好一次。**注意：呼叫總數沒有 step 數 + 1 的上界**，被拒絕的答案耗呼叫但不建 step | — | §2, §12.1 |
+| C-14 | **同一個決策點永不重問**（frontier model 的核心主張） | 以 history 深度標記決策點。planner **可能**在同一深度被問多次（答案未通過驗收會重問，耗 planner 預算）。但**一旦某深度的答案被接受並持久化為一個 step，該深度永不再被詢問** —— 跨 crash、跨 recovery、跨 worker 側 replay 皆然。可觀測：對每個深度，「被接受且建立了 step 的答案」恰好一次。**兩個例外不算違反**：(a) 終局答案（done／fail）不建 step，planner 側 replay 正是撤回它，因此該深度會被重問（F-04）；(b) 呼叫總數沒有上界，被拒絕的答案耗呼叫但不建 step | — | §2, §12.1 |
 | C-15 | `steps.decision` 的不可變性 | 一旦 TX1 commit，該 step 的 `decision` 與 `created_at` **永不再被寫入**（讀取兩次得到相同的值）。recovery 重派讀的是這一欄，若它會變動，「恰問一次」的保證就是空的。**注意：儲存值與 planner 送出的原始位元組不必相同**（見 K-14），此列斷言的是「存進去之後不再改變」 | L2 | §4.2, §2 |
 | C-16 | 已完成 step 在 replay 之後 | 同 C-15：已 DONE 的 step 其 `output`、`created_at`、`decision` 在 worker 側 replay 前後讀取結果相同 | L2 | §11 |
 | C-11 | 重啟後掃描 | 只掃 `runs.status='RUNNING'`（索引查找）。run=DONE 與 run=DLQ **永不被掃描、永不被觸碰** | — | §8.3 |
@@ -147,8 +147,9 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | E-06 | callback 抵達時該 run 已經是 DLQ | **不需任何額外檢查**：該 attempt 早已非 RUNNING，CAS 自然不匹配 → 200 零效果。這是刻意把判斷交給 DB 層的設計利用，應用層不得重複實作這個檢查 | 不變 | 裁定 #6 |
 | E-08 | **重試延遲窗口內抵達的任何回報** | 一律 200 ACK、**零狀態效果**。這是 E-03 的一般化：不只「超時後的成功」被拒，**冷卻期間的任何回報一律不承認、不採用、不寫入**。**由哪一層攔下不構成規格** —— 可能是 CAS，也可能更早在 transport 層就沒有登記項 | 不變 | 裁定 #G |
 | E-09 | 上述窗口的邊界 | 窗口自 TX3 commit 起、至 TX4 commit 止。TX4 commit 之後抵達的是**新 attempt** 的回報，帶舊 attempt_id 者仍被 CAS 擋掉（E-01） | 不變 | 裁定 #G |
-| E-10 | 冷卻窗口內的回報 vs 其他 superseded 回報 | 兩者**行為完全相同**：同樣 200、同樣零效果、同樣不產生任何日誌或狀態差異。系統對「冷卻期」沒有特殊處理路徑 —— 這是可觀測的等價性斷言 | 不變 | 裁定 #G+#6 |
+| E-10 | 冷卻窗口內的回報 vs 其他 superseded 回報 | 兩者**行為完全相同**：同樣 200、同樣零效果、同樣不產生任何狀態差異。**本條只約束回報處理路徑** —— 唯讀查詢揭露冷卻狀態（F-06e 的 `retry_state`／`next_attempt_not_before`）不受此限，它不 gate 任何回報 | 不變 | 裁定 #G+#6 |
 | E-07 | 回報遇到非 current 或非 RUNNING 的 attempt | 一律回傳**型別化的 superseded 結果，不是 error**。呼叫端據此回 200、零效果。判斷必須同時涵蓋兩個條件：該 attempt 仍為 RUNNING，**且**它仍是該 step 的 current_attempt_id —— 少了後者 E-01 不成立 | — | §19 CAS-A |
+| E-11 | 回報帶的 attempt_id 格式正確、真實存在，但屬於**別的 step** | **200 ACK，零狀態效果**，與其他 superseded 情況不可分辨。不得為了區分「屬於別的 step」而多做一次查詢 —— 那是第二個判斷來源。B-08 的 400 只適用於畸形 ids（缺漏或無法解析） | 不變 | 裁定 #J |
 ---
 
 ## F. DLQ 與 Replay
@@ -157,12 +158,13 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 |---|---|---|---|---|
 | F-01 | worker 側耗盡進 DLQ | 恰好一列 dead_letter_queue，reason=`worker_retry_exhausted`，step_id 非 null，context **非空**且含逐次 attempt 的 reason 與 error | L4 | §11, §7.1 |
 | F-02 | planner 側進 DLQ | dead_letter_queue 的 step_id 為 **null**（無 step 有過錯），reason 為三種 planner 值之一 | L5 | §14.1, §11 |
-| F-03 | `POST /dlq/{id}/replay`，該 entry 是 worker 側（step_id 非 null） | TX5 單一交易：**attempt_count 歸零** ＋ step→RUNNING ＋ run→RUNNING ＋ 建新 attempt ＋ 設 current_attempt_id → 派送。**歸零是強制的**，否則 count 已等於 X，step 立刻回 DLQ，按鈕變裝飾品 | L2 | §19 TX5, §11 |
-| F-04 | `POST /dlq/{id}/replay`，該 entry 是 planner 側（step_id 為 null） | TX6：run→RUNNING → 重問 planner | L1 | §19 TX6 |
+| F-03 | `POST /dlq/{id}/replay`，該 run 目前為 **worker 側 DLQ**（`run=DLQ ∧ last_step=DLQ`） | TX5 單一交易：**attempt_count 歸零** ＋ step→RUNNING ＋ run→RUNNING ＋ 建新 attempt ＋ 設 current_attempt_id → 派送。**歸零是強制的** | L2 | §19 TX5, §11 |
+| F-04 | `POST /dlq/{id}/replay`，該 run 目前為 **planner 側 DLQ**（`run=DLQ ∧ last_step=DONE` 或無 step） | TX6：run→RUNNING → 重問 planner | L1 | §19 TX6 |
+| F-04b | 分支的判斷依據 | **一律由 run 與 last_step 的現況推導（組合表），不看 entry 的 `step_id`。** 多輪 run 用舊 entry id replay 時兩者會分歧；現況是真相，entry 是歷史（I-14） | — | 裁定 #K |
 | F-05 | replay 之後 | 已 DONE 的 steps **不得重跑**；planner 收到的 history 仍完整 | L1/L2 | §2 |
 | F-06 | `GET /runs/{id}` 的頂層形狀 | 恆有 `run_id`、`status`、`workflow_input`、`created_at`、`updated_at`、`steps`（陣列）。`dlq_reason` **僅在 `status="DLQ"` 時出現** | — | §11 |
 | F-06b | `steps` 陣列中每一項的形狀 | 恆有 `step_id`、`step_name`、`seq`、`status`、`attempt_count`、`created_at`。**注意 `step_name`：與送給 planner 的 history 中的 `name` 是同一個東西，但兩個表面用不同鍵名**（J-04 是 planner 契約，此處是讀取 API） | — | §11 |
-| F-06c | 選填欄位的表示法 | `output`、`completed_at`、`current_attempt` 等選填欄位在無值時**整個鍵不出現**，不是 `null`。**斷言必須檢查鍵是否存在，不得比對 `== null`** | — | §11 |
+| F-06c | 選填欄位的表示法 | **系統產生的**選填欄位（`output`、`completed_at`、`current_attempt`、`reason`、`error`、`retry_state`、`next_attempt_not_before`、DLQ entry 的 `step_id`）在無值時**整個鍵不出現**，不是 `null`。**斷言必須檢查鍵是否存在，不得比對 `== null`**。**此規則不適用於使用者資料**：`workflow_input` 與 step 的 `output` 內部可合法含 `null`，其內容一律原樣透傳，不得清理 | — | §11 |
 | F-06d | `current_attempt` 的內容 | **單數，只含最新的一個 attempt**，恆有 `attempt_id` 與 `status`；失敗時另有 `reason` 與 `error`。**完整的 attempt 歷史不在此處**，只在 DLQ entry 的 `context.attempts` | — | §11 |
 | F-06e | 重試冷卻期的可見性（承 H-04d） | 處於冷卻期的 step 帶 `retry_state` 與 `next_attempt_not_before`；非冷卻期時兩鍵不出現 | — | 裁定 #G |
 | F-07 | `GET /runs/{id}` 的欄位命名 | step 時間欄位名為 `created_at`。JSON 中**任何地方都不得出現 `decided_at`** | — | §14.1 |
