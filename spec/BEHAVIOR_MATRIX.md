@@ -111,9 +111,9 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | C-08 | recovery 認領孤兒時 count 已是 X−1 | 孤兒認領使 count 達 X → **在 TX3 內部**直接進 DLQ；**不得派送任何新 attempt** | L4 | §8.3(b) |
 | C-09 | orchestrator 反覆 crash（crash loop） | 每次 crash 的孤兒認領耗一單位預算 → 每個 in-flight step **單調收斂到 DLQ**，無限重試在結構上不可能 | L4 | §8.3 |
 | C-10 | crash 恰好落在某個 TXn 的 commit 當下 | 交易語意：要嘛全發生、要嘛全沒發生。**不存在半套狀態** | 依 TX | §9, 裁定 #7 |
-| C-14 | **planner 每個持久化的 step 恰被問一次**（frontier model 的核心主張） | 跨 crash、跨 recovery、跨 replay，一個已持久化的決策**永不被重新詢問**。可觀測驗證：planner 端的 decide 呼叫次數 ≤ 已建立的 step 數 + 1（最後一次問到 done／fail）。**這是與 replay family 最大的差異點，必須有直接斷言** | — | §2, §12.1 |
-| C-15 | `steps.decision` 的不可變性 | 一旦 TX1 commit，該 step 的 `decision` JSONB 與 `created_at` **永不再被寫入** —— 跨 crash 前後位元相同。recovery 重派讀的是這一欄，若它會變動，「恰問一次」的保證就是空的 | L2 | §4.2, §2 |
-| C-16 | 已完成 step 在 replay 之後 | 同 C-15：已 DONE 的 step 其 `output`、`created_at`、`decision` 在 worker 側 replay 之後仍位元相同 | L2 | §11 |
+| C-14 | **同一個決策點永不重問**（frontier model 的核心主張） | 以 history 深度標記決策點。planner **可能**在同一深度被問多次（答案未通過驗收會重問，耗 planner 預算）。但**一旦某深度的答案被接受並持久化，該深度永不再被詢問** —— 跨 crash、跨 recovery、跨 replay 皆然。可觀測：對每個深度，「答案被接受」的呼叫恰好一次。**注意：呼叫總數沒有 step 數 + 1 的上界**，被拒絕的答案耗呼叫但不建 step | — | §2, §12.1 |
+| C-15 | `steps.decision` 的不可變性 | 一旦 TX1 commit，該 step 的 `decision` 與 `created_at` **永不再被寫入**（讀取兩次得到相同的值）。recovery 重派讀的是這一欄，若它會變動，「恰問一次」的保證就是空的。**注意：儲存值與 planner 送出的原始位元組不必相同**（見 K-14），此列斷言的是「存進去之後不再改變」 | L2 | §4.2, §2 |
+| C-16 | 已完成 step 在 replay 之後 | 同 C-15：已 DONE 的 step 其 `output`、`created_at`、`decision` 在 worker 側 replay 前後讀取結果相同 | L2 | §11 |
 | C-11 | 重啟後掃描 | 只掃 `runs.status='RUNNING'`（索引查找）。run=DONE 與 run=DLQ **永不被掃描、永不被觸碰** | — | §8.3 |
 | C-12 | crash 落在「TX1 commit 之後、worker 回應之前」 | 這是 C-02／C-03 的統稱：**attempt 層級的孤兒**，DB 裡留下一列 RUNNING attempt，由 recovery 判 `orphaned` | L2 | 裁定 #7 |
 | C-13 | crash 落在「已送出 planner 請求、答案未回或未持久化」 | 這是 C-01：**run 層級的孤兒，不存在孤兒 attempt**。planner 呼叫不持久化，DB 裡沒有任何東西需要認領。recovery 動作只有「重問」，**不耗 attempt 預算、不寫 failure_reason** | L1 | 裁定 #7 |
@@ -145,10 +145,10 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | E-04 | 任何 callback 抵達 | callback handler 只做：驗證 → 推 channel → 回 200。**永不寫 step/run 狀態**（單一寫入者原則；第二寫入者會與 timer 競爭終局） | — | §10.4 |
 | E-05 | timeout timer 觸發後，遲到的 callback 才抵達 | timer 觸發時必須**清乾淨 channel registry**，使遲到 callback 找不到登記項而被 ACK 為 superseded | 不變 | §10.2 |
 | E-06 | callback 抵達時該 run 已經是 DLQ | **不需任何額外檢查**：該 attempt 早已非 RUNNING，CAS 自然不匹配 → 200 零效果。這是刻意把判斷交給 DB 層的設計利用，應用層不得重複實作這個檢查 | 不變 | 裁定 #6 |
-| E-08 | **重試延遲窗口內抵達的任何回報** | 舊 attempt 已是 FAILED、新 attempt 尚未建立，此期間 `steps.current_attempt_id` 指向的 attempt **狀態不是 RUNNING** ⇒ CAS 必然不匹配 ⇒ 200 ACK、**零狀態效果**。這是 E-03 的一般化：不只「超時後的成功」被拒，**冷卻期間的任何回報一律不承認、不採用、不寫入** | 不變 | 裁定 #G |
+| E-08 | **重試延遲窗口內抵達的任何回報** | 一律 200 ACK、**零狀態效果**。這是 E-03 的一般化：不只「超時後的成功」被拒，**冷卻期間的任何回報一律不承認、不採用、不寫入**。**由哪一層攔下不構成規格** —— 可能是 CAS，也可能更早在 transport 層就沒有登記項 | 不變 | 裁定 #G |
 | E-09 | 上述窗口的邊界 | 窗口自 TX3 commit 起、至 TX4 commit 止。TX4 commit 之後抵達的是**新 attempt** 的回報，帶舊 attempt_id 者仍被 CAS 擋掉（E-01） | 不變 | 裁定 #G |
 | E-10 | 冷卻窗口內的回報 vs 其他 superseded 回報 | 兩者**行為完全相同**：同樣 200、同樣零效果、同樣不產生任何日誌或狀態差異。系統對「冷卻期」沒有特殊處理路徑 —— 這是可觀測的等價性斷言 | 不變 | 裁定 #G+#6 |
-| E-07 | CAS 的實作形式 | 必須是**單一條件式 UPDATE**：`UPDATE ... WHERE attempt_id=$1 AND status='RUNNING'`。零列受影響 ⇒ 回傳型別化的 superseded 結果，**不是 error** | — | §19 CAS-A |
+| E-07 | 回報遇到非 current 或非 RUNNING 的 attempt | 一律回傳**型別化的 superseded 結果，不是 error**。呼叫端據此回 200、零效果。判斷必須同時涵蓋兩個條件：該 attempt 仍為 RUNNING，**且**它仍是該 step 的 current_attempt_id —— 少了後者 E-01 不成立 | — | §19 CAS-A |
 ---
 
 ## F. DLQ 與 Replay
@@ -160,11 +160,18 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | F-03 | `POST /dlq/{id}/replay`，該 entry 是 worker 側（step_id 非 null） | TX5 單一交易：**attempt_count 歸零** ＋ step→RUNNING ＋ run→RUNNING ＋ 建新 attempt ＋ 設 current_attempt_id → 派送。**歸零是強制的**，否則 count 已等於 X，step 立刻回 DLQ，按鈕變裝飾品 | L2 | §19 TX5, §11 |
 | F-04 | `POST /dlq/{id}/replay`，該 entry 是 planner 側（step_id 為 null） | TX6：run→RUNNING → 重問 planner | L1 | §19 TX6 |
 | F-05 | replay 之後 | 已 DONE 的 steps **不得重跑**；planner 收到的 history 仍完整 | L1/L2 | §2 |
-| F-06 | `GET /runs/{id}`，run=DLQ | 回應含 `dlq_reason`（自 DLQ 表 join）；每個 step 含 status、seq、attempt_count 與最新失敗 attempt 的 reason/error 摘要 | — | §11 |
+| F-06 | `GET /runs/{id}` 的頂層形狀 | 恆有 `run_id`、`status`、`workflow_input`、`created_at`、`updated_at`、`steps`（陣列）。`dlq_reason` **僅在 `status="DLQ"` 時出現** | — | §11 |
+| F-06b | `steps` 陣列中每一項的形狀 | 恆有 `step_id`、`step_name`、`seq`、`status`、`attempt_count`、`created_at`。**注意 `step_name`：與送給 planner 的 history 中的 `name` 是同一個東西，但兩個表面用不同鍵名**（J-04 是 planner 契約，此處是讀取 API） | — | §11 |
+| F-06c | 選填欄位的表示法 | `output`、`completed_at`、`current_attempt` 等選填欄位在無值時**整個鍵不出現**，不是 `null`。**斷言必須檢查鍵是否存在，不得比對 `== null`** | — | §11 |
+| F-06d | `current_attempt` 的內容 | **單數，只含最新的一個 attempt**，恆有 `attempt_id` 與 `status`；失敗時另有 `reason` 與 `error`。**完整的 attempt 歷史不在此處**，只在 DLQ entry 的 `context.attempts` | — | §11 |
+| F-06e | 重試冷卻期的可見性（承 H-04d） | 處於冷卻期的 step 帶 `retry_state` 與 `next_attempt_not_before`；非冷卻期時兩鍵不出現 | — | 裁定 #G |
 | F-07 | `GET /runs/{id}` 的欄位命名 | step 時間欄位名為 `created_at`。JSON 中**任何地方都不得出現 `decided_at`** | — | §14.1 |
 | F-08 | 對同一個 DLQ entry 連續呼叫 replay 兩次 | **第一次**的 TX5／TX6 在單一交易內把 run 帶離 DLQ（→RUNNING），這本身就是冪等閘門。**第二次**檢查 run 現況：非 DLQ ⇒ 回 **409 Conflict**，訊息明說「此 run 已在執行中」，零狀態效果。判斷依據是 **run 的現況，不是 DLQ entry 是否存在** | 不變 | 裁定 #2 |
 | F-09 | 四種 DLQ reason | 純資訊性，**replay 機制完全相同**；差別只在人的分診動作。`planner_declared_fail` 不可盲目 replay | — | §11 |
-| F-10 | `GET /dlq` 列表 | 預設只列出**目前 run.status='DLQ'** 的項目（真正待處理的人工佇列）。已被 replay 帶離 DLQ 的歷史 entry 不出現在預設列表 | — | 裁定 #2+#8 |
+| F-10 | `GET /dlq` 的形狀與預設過濾 | 回應為 `{"entries": [...]}`。預設**只列出目前 `run_status="DLQ"` 的項目**；`?all=true` 列出全部（含已被 replay 帶離 DLQ 的歷史） | — | 裁定 #2 |
+| F-10b | 每一筆 entry 的形狀 | 恆有 `id`、`run_id`、`reason`、`context`、`created_at`、`run_status`。`step_id` **僅 worker 側有**（planner 側整個鍵不出現）。`side` 僅在 `run_status="DLQ"` 時出現（組合表不分類已離開 DLQ 的 run） | — | 裁定 #8 |
+| F-10c | `context` 的形狀 | **兩側必須都是真正的 JSON 物件，不得雙重編碼。** 恆有 `detail`（最後一次失敗的錯誤字串）與 `attempts`（陣列，逐次嘗試的明細）。worker 側另有 `step_id` | — | 裁定 #I |
+| F-10d | `side_conflict` | 由組合表推導出的 side 與 entry 的 `step_id` 不一致時出現，明示衝突而非靜默擇一 | — | 裁定 #8 |
 | F-11 | `GET /dlq` 每一項的分類 | 由組合表推導，**不新增儲存欄位**：run=DLQ ∧ last_step=DLQ ⇒ **worker 側**；run=DLQ ∧ last_step=DONE（含無 step）⇒ **planner 側**。前者 step_id 非 null，後者為 null，兩者必須一致 | L4/L5 | 裁定 #8, §8.2 |
 | F-12 | replay 後再次失敗 | `dead_letter_queue` 會**累積第二列**（歷史紀錄永不刪除）。同一 run 可有多列 DLQ 紀錄，時間戳區分輪次。`GET /dlq` 與 replay 的查找必須容忍「一個 run 對多列」 | L4/L5 | 裁定 #2, §11 |
 | F-13 | 對「run 目前不是 DLQ」的 entry 呼叫 replay | 同 F-08：409，且訊息須指出目前的實際狀態（RUNNING／DONE），讓操作者知道發生了什麼 | 不變 | 裁定 #2 |
@@ -230,6 +237,7 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | N-11 | `retry_limit` 與 `default_timeout_seconds` 的位置 | **兩者皆為 `workflows` 表的一級欄位，且在輸入 body 中為頂層欄位。** 它們是 workflow 層級的執行參數，與「怎麼決定下一步」無關；塞進 `planner_config` JSONB 純粹是遷就舊 schema。**本輪直接改 schema，不做 API 層搬運。**詳見 N.4 | 裁定 #3+#D |
 | N-12 | 驗證失敗時的副作用 | **零副作用**：不建立 workflow、不寫任何 DB 列。驗證全部先於 TX-W | 裁定 #B |
 | N-13 | 驗證成功 | 才執行 TX-W，回傳 workflow_id | §19 |
+| N-16 | *[已作廢]* | 舊 oracle 相容性條款；oracle 已封存 | — |
 | N-17 | `POST /workflows` 帶已存在的 `name` | **允許，正常建立。** `name` 僅為顯示標籤，**不加 UNIQUE 約束**；唯一識別一律靠 `workflow_id`。理由：workflow 是可重複建立的模板，調參時會自然產生同名的多個版本，強制唯一只會逼使用者發明無意義的名字 | 裁定 #E |
 | N-18 | 頂層出現未知欄位（非 `name`／`planner_type`／`retry_limit`／`default_timeout_seconds`／`planner_config`） | 400，訊息指出是哪個欄位。**與 N-07 是兩個不同層級的檢查**：一個查頂層、一個查 `planner_config` 內部，兩者互不涵蓋 | 裁定 #E |
 | N-19 | 型別錯誤（`retry_limit` 給字串、`planner_config` 給陣列、`planner_type` 給數字） | 400，訊息指出欄位與期望型別。不得靜默轉型（例如把 `"2"` 當成 2） | 裁定 #E+#B |
@@ -237,6 +245,7 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 
 | ID | 觸發情境 | 預期結果 | 來源 |
 |---|---|---|---|---|
+| N-14 | *[已作廢]* | 移至 `docs/BACKLOG.md` §1 #14（planner 格式規格是交付物，非系統行為） | — |
 | N-15 | planner 輸出不符該契約 | 一律歸為 planner 錯誤（`malformed`），耗預算，**絕不嘗試「猜測修正」**（不剝 markdown 圍欄、不容錯解析、不補預設值）。容錯解析會讓錯誤靜默通過，違反本節治理原則 | 裁定 #C |
 ---
 
@@ -284,7 +293,9 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 
 | ID | 觸發情境 | 預期結果 | 來源 |
 |---|---|---|---|---|
-| J-01 | 派送 sync worker | POST body 是**裸的 input，位元對位元**等於 planner 決定的內容，**無任何包裝** | §13.1 |
+| J-01 | 派送 sync worker | POST body 就是 planner 決定的 input **本身**：無信封、無新增欄位、無移除欄位、值不變。識別碼一律走 header，不進 body。**保證的是 JSON 文件等價，不是位元組等價**（見 K-14） | §13.1 |
+| J-11 | static planner 決定的 input 形狀 | worker 收到的裸 body 為 `{"workflow_input": <本 run 的輸入>, "history": <至今的步驟歷史>}`。**這是 static workflow 的 worker 作者必須遵守的線上契約** | §12.1 |
+| J-12 | J-11 的 history 與上界化的交互 | 該 history 是**已依 J-08／J-09 上界化**的版本。因此 worker 可能收到指標物件而非前一步的完整 output。**worker 作者必須預期這件事** | §18 #1 |
 | J-02 | 派送 sync worker | 必帶 header `X-StateFlow-Step-ID` 與 `X-StateFlow-Attempt-ID`，值正確 | §13.1 |
 | J-03 | 派送 async worker | POST body 是信封 `{step_id, attempt_id, input}` | §13.1 |
 | J-04 | 送給 planner 的 RunState | history 中**每一個 status 字串皆為大寫**（"DONE"），與儲存值一致 | §12.2 |
@@ -309,7 +320,8 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | K-11 | 認證授權 | 完全沒有。生產環境須置於 gateway/mesh 之後 | §15.5 |
 | K-12 | **單一 run 內的 fan-out** | 一 run 一 goroutine、step 嚴格序列。planner 一次只能決定一個 step。**多個 run 併發是完全支援的**（A-09） | §5, 裁定 #5 |
 | K-13 | **具名 worker 註冊表** | planner 直接給完整 `worker_url`，系統沒有已知 worker 的清單，因此不存在「查無此 worker」。語法檢查歸 planner（D-08），連不上歸 worker（D-09） | 裁定 #4 |
-
+| K-14 | **body 的位元組穩定性** | 不保證。`decision` 存為 `jsonb`，鍵順序與空白在寫入時被正規化，因此 recovery 重派時 worker 收到的 bytes 可能與首次派送不同 —— **同一份 JSON 文件，不同的位元組**。冪等**不得**以 raw body 的雜湊為鍵；請用 `X-StateFlow-Step-ID`（J-02 保證它每次派送都在） | 裁定 #H |
+| K-15 | **`GET /runs/{id}` 不提供完整的 attempt 歷史** | 只給 `current_attempt`（最新一個）。完整歷史僅在該 step 進 DLQ 之後，於 DLQ entry 的 `context.attempts` 中可見。這是刻意的：`GET /runs` 是狀態查詢，不是稽核介面 | 裁定 #I |
 ---
 
 ## O. 執行期組態與可觀測端點
@@ -343,7 +355,7 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | L-5 | **不可能組合覆蓋** | §8.2 的兩個不可能組合各有一列不變量（I-07、I-08） |
 | L-6 | **crash window 覆蓋** | 每一對相鄰的持久化寫入都有一列 C-：run 建立↔TX1（C-01）、TX1↔派送（C-02）、派送↔回報（C-03）、TX3↔TX4（C-04/C-05）、TX2↔下次 planner（C-06） |
 | L-7 | **API endpoint 覆蓋** | 九個路由各至少一列：POST /workflows→A-01；POST /workflows/{id}/runs→A-02；GET /runs/{id}→F-06；POST /tasks/complete→A-06；POST /tasks/fail→B-02；GET /dlq→F-10；POST /dlq/{id}/replay→F-03/F-04；GET /healthz→O-05/O-06；GET /ui→O-08 |
-| L-8 | **核心主張有直接斷言** | 「planner 每個持久化的 step 恰被問一次」必須有可觀測的驗證方式（C-14），而非只由其他規則間接推導 |
+| L-8 | **核心主張有直接斷言** | 「同一個決策點永不重問」必須有可觀測的驗證方式（C-14），而非只由其他規則間接推導 |
 | L-9 | **純度檢查** | 隨機抽十列，每一列都必須能改寫成「系統在 X 情況下必須 Y」。改寫不了的（實作步驟、環境資訊、待辦、工具規格）就是雜質，移出 |
 | L-10 | **來源可追溯** | 每一列的來源欄指向白皮書章節或 M 節的裁定編號。**不得引用 session 編號或快照** —— 那是專案歷史，不是規格依據 |
 | L-11 | **規格與白皮書一致** | 本檔有而白皮書沒有的規格，必須列在 `docs/BACKLOG.md` 的白皮書修補待辦中。未回填 ⇒ 出現兩個真相來源 |
@@ -363,6 +375,7 @@ v0.1 的八個待裁事項已全數裁定，記錄於此以保留理由（面試
 | 5 | 多 run 併發 | 完全支援。run 是併發單位；不支援的是 run 內 fan-out | A-09, K-12 |
 | 6 | callback 遇 DLQ run | 靠 CAS 自然擋掉，應用層不得重複檢查 | E-06 |
 | 7 | crash 落在 commit 當下 | 依賴交易語意，不另寫測試。並釐清：attempt 層孤兒 vs run 層孤兒是兩件事 | C-10, C-12, C-13 |
+| 12 | body 位元組穩定性（裁定 #H） | **不保證，不修。** J-01 要保護的是「無包裝、無增減欄位」，位元組穩定性從未承諾。冪等是 worker 責任，鍵是 `X-StateFlow-Step-ID`。改用 `json` 型別的代價（允許重複鍵、失去查詢與索引能力）大於收益 | J-01, K-14 |
 | 8 | GET /dlq | 補齊行為；worker 側／planner 側由組合表推導，不新增欄位 | F-10 – F-13 |
 | 9 | workflow name 是否唯一 | **不唯一。** name 僅為顯示標籤，不加 UNIQUE；唯一識別靠 workflow_id | N-17 |
 | 10 | per-step 覆寫 retry limit | **做。** 存於 StepSpec（decision JSONB），不新增 DB 欄位；解析為 step > workflow | N-24 – N-28 |
@@ -374,4 +387,4 @@ v0.1 的八個待裁事項已全數裁定，記錄於此以保留理由（面試
 
 ---
 
-*BEHAVIOR_MATRIX v2.0 — 純行為規格。實作指示移入 session prompts，測試基礎設施移入測試 prompt，待辦移入 `docs/BACKLOG.md`，環境資訊在 `docs/OPERATIONAL_FACTS.md`。*
+*BEHAVIOR_MATRIX v2.1 — 純行為規格。實作指示移入 session prompts，測試基礎設施移入測試 prompt，待辦移入 `docs/BACKLOG.md`，環境資訊在 `docs/OPERATIONAL_FACTS.md`。*
