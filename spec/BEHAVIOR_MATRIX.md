@@ -63,8 +63,8 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 
 | ID | 觸發情境 | 預期結果 | 落點 | 來源 |
 |---|---|---|---|---|
-| A-01 | `POST /workflows`，planner_type=static 或 http | TX-W 單一交易寫入 workflow 定義（含 planner_type + planner_config）；回傳 workflow_id | — | §19, §12.1 |
-| A-02 | `POST /workflows/{id}/runs` 帶 workflow_input | TX0 建 run（RUNNING）；回傳 run_id；啟動**恰好一個** loop goroutine | L1 | §5, §19 |
+| A-01 | `POST /workflows`，planner_type=static 或 http | TX-W 單一交易寫入 workflow 定義（含 planner_type + planner_config）；回傳 **201** 與 workflow_id | — | §19, §12.1 |
+| A-02 | `POST /workflows/{id}/runs` 帶 workflow_input | TX0 建 run（RUNNING）；回傳 **202** 與 run_id；啟動**恰好一個** loop goroutine | L1 | §5, §19 |
 | A-03 | loop 讀 frontier，planner 回 continue + 完整 StepSpec | TX1 單一交易：建 step（RUNNING、seq=MAX+1、attempt_count=0、decision=完整 StepSpec）＋ 建首個 attempt（RUNNING）＋ 設 current_attempt_id。**commit 之後才准派送** | L2 | §19 TX1, §2 |
 | A-04 | sync worker 回 2xx + 合法 JSON body | TX2 單一交易：attempt→DONE ＋ step→DONE ＋ 寫 output（整個 body）。**commit 之後才准問下一次 planner** | L1 | §19 TX2, §13.2 |
 | A-05 | StepSpec 指定 output_field 且該欄位存在 | output 只存該子樹，不是整個 body | L1 | §13.2 |
@@ -234,6 +234,7 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | N-07 | `planner_config` 出現任何未知欄位 | 400（嚴格模式，不接受未知鍵）。合法鍵集合由**輸入 schema** 定義，與 DB 落地形狀無關 | 裁定 #B+#3 |
 | N-08 | static 步驟表中兩個 step 同名 | 400（承 B-15）。static planner 在執行期的「構造上不會失敗」保證，正是靠這一條在提交時成立 | 裁定 #1+#B |
 | N-09 | static 步驟表中某步驟缺 `name`／`worker_url`／`mode`，或 `mode` 不是 sync\|async，或 worker_url 語法不合法 | 400，訊息指出是第幾個步驟的哪個欄位 | 裁定 #B+#4 |
+| N-09b | static 步驟表中單一 step 物件的合法鍵 | `name`、`worker_url`、`mode`、`timeout_seconds`、`retry_limit`。**其餘一律 400。** static planner 目前不支援 per-step 的 `input` 與 `output_field`；每個 worker 收到的都是 J-11 的固定形狀，前一步的 output 由 worker 自 `history` 取用 | 裁定 #L |
 | N-10 | `retry_limit` 或 `default_timeout_seconds` **有帶但不合法**（非整數、`retry_limit < 1`、`default_timeout_seconds <= 0`） | 400，訊息指出欄位與合法範圍 | 裁定 #B |
 | N-10b | `retry_limit` 或 `default_timeout_seconds` **未提供** | **合法**，採用預設（`retry_limit=3`、`default_timeout_seconds=60`）。與 N-07／N-18 的嚴格模式不衝突：**嚴格模式拒絕的是多餘的欄位，不是缺席的選填欄位** | 裁定 #B |
 | N-11 | `retry_limit` 與 `default_timeout_seconds` 的位置 | **兩者皆為 `workflows` 表的一級欄位，且在輸入 body 中為頂層欄位。** 它們是 workflow 層級的執行參數，與「怎麼決定下一步」無關；塞進 `planner_config` JSONB 純粹是遷就舊 schema。**本輪直接改 schema，不做 API 層搬運。**詳見 N.4 | 裁定 #3+#D |
@@ -337,7 +338,9 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | O-05 | `GET /healthz`，storage 可連線 | 200。**純讀，不得寫入任何狀態** | — | §18 #8 |
 | O-06 | `GET /healthz`，storage 不可連線 | 503 | — | §18 #8 |
 | O-07 | `stateflow healthcheck` CLI 子指令 | 等同 `GET /healthz`：健康離場碼 0，不健康離場碼 1。**必須在無 shell 的 distroless 環境可用** | — | §18 #8 |
-| O-08 | `GET /ui` | 200，回傳自足的 HTML。**純讀**：頁面只呼叫 `GET /runs/{id}` 與 `GET /dlq`，**不存在任何寫入請求** | — | §18 #8 |
+| O-08 | `GET /ui` 的回應 | 200，回傳自足的 HTML，無外部 CDN 依賴 | — | §18 #8 |
+| O-08b | 頁面載入與重新整理時發出的請求 | **只有讀取請求**（`GET /runs/{id}`、`GET /dlq`）。不得有任何自動發出的狀態變更請求 | — | 裁定 #M |
+| O-08c | 使用者明確操作觸發的請求 | 允許狀態變更（例如點擊 replay 送出 `POST /dlq/{id}/replay`）。**必須由明確的使用者動作觸發**，不得為自動、輪詢或副作用式 | — | 裁定 #M |
 | O-10 | orchestrator 啟動，資料庫尚未套用最新 migration | 自動套用所有未套用的 migration，**且在開始服務 HTTP 之前完成**。全新的空資料庫啟動後即具備完整 schema，不需任何手動步驟 | — | §18 #7 |
 | O-11 | 啟動順序 | migration 套用 → recovery 掃描 → 開始服務。三者的先後可由啟動日誌觀察 | — | §18 #7 |
 | O-09 | `GET /ui` 讀取的欄位 | 必須全部存在於 `GET /runs/{id}` 與 `GET /dlq` 的實際回應中（F-06、F-10 定義的形狀）。頁面上不得出現 `undefined` | — | F-06 |

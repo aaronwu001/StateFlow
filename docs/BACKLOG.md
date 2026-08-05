@@ -25,6 +25,7 @@
 | 13 | §15 使用者契約 | 補上：config 錯誤在提交時就會被拒絕，不會留到執行期 |
 | 14 | §12.1 Planner 契約 | 需要一份可交付給使用者的完整格式規格（RunState 進、StepDecision 出，含語法／語意兩層驗收），LLM planner 附 prompt 模板 |
 | 15 | Q&A | 建議增補三題：三個數字的差別、為什麼 config 錯誤要在提交時拒絕、為什麼 `retry_limit` 搬出 `planner_config` |
+| 16 | `StateFlow_Rules_Consolidation_v3_EN.md` | 未隨本輪規格變更更新。決定：更新它、或正式標記為凍結的歷史文件並停止交叉引用 |
 
 ---
 
@@ -39,3 +40,5 @@
 | 5 | **Kubernetes / Helm** | `/healthz` 已就緒，硬前置條件解除 | 單一 replica 限制（K-10）必須在部署文件中明講 |
 | 6 | **UI 即時更新** | 目前靠使用者手動重新整理。能即時看到 frontier 前進與 recovery 回收的畫面，是讓陌生人三十秒看懂這系統的最直接手段 | 中等 |
 | 7 | **ghcr.io 預先 build 的 image** | 別人現在要用得自己 build，這是採用門檻最大的一道牆 | 低 |
+| 8 | **demo 依新契約重寫** | `retry_limit` 移到 body 頂層後，demo 建 workflow 的請求形狀失效。連帶：`demo/configs/*.yaml` 副檔名是 .yaml 但內容是 JSON，且 `llm_planner.yaml` 帶有 N-22 之下已非法的 `timeout_seconds`。三件事一起處理 | 需在 config 驗證與 schema 變更落地之後 |
+| 9 | **static planner 的 per-step `input` / `output_field`** | 目前每個 worker 都收到相同的 `{workflow_input, history}`，只能自己從 history 挑前一步的 output。加上之後 static pipeline 才能真正組裝資料 | 需先決定：有 `input` 時改送 `input`（兩種 body 形狀），還是放進信封第三個鍵（一致但改變 J-11） |
