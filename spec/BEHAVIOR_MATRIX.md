@@ -85,7 +85,8 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | B-05 | sync worker 回 2xx 但 body 非合法 JSON | attempt→FAILED(`malformed`) | L2 | §4.2, §13.2 |
 | B-06 | sync worker 回 2xx，但 StepSpec 宣告的 output_field 不存在 | attempt→FAILED(`malformed`) | L2 | §13.2 |
 | B-07 | async callback ids 合法但 output 不可解析 | attempt→FAILED(`malformed`) | L2 | §7.1 |
-| B-08 | async callback 缺少或帶非法 step_id/attempt_id | 回 **400**，**零狀態效果**（等該 attempt 自己的 timeout 認領） | L2 | §7.1 |
+| B-08 | async callback 的 `step_id`／`attempt_id` **缺漏或無法解析為 UUID** | 回 **400**，**零狀態效果**（等該 attempt 自己的 timeout 認領） | L2 | §7.1 |
+| B-08b | ids 格式合法但**查無此物、或屬於別的 step** | 回 **200**，零狀態效果（承 E-01／E-11）。**400 只保留給語法問題**；要區分「查無此物」與「已過期」需要額外查詢，那是第二個判斷來源 | 不變 | 裁定 #J |
 | B-09 | 任一失敗且 attempt_count < X | TX3：attempt→FAILED(reason) ＋ count++；等待**生效重試延遲**（H-04）；TX4：建新 attempt ＋ CAS 換 current_attempt_id；再派送 | L2 | §7.1, §6 |
 | B-10 | 失敗使 attempt_count 達到 X | **TX3 同一交易內**：attempt→FAILED ＋ count=X ＋ step→DLQ ＋ run→DLQ ＋ 插入一列 dead_letter_queue（reason=`worker_retry_exhausted`，context 含逐次 attempt 的 reason 與 error） | L4 | §19 TX3, §7.1 |
 | B-11 | B-10 之後 | **不得再派送任何 attempt**。step 與 run 皆為終態，唯一出口是 replay | L4 | §7.1, §11 |
@@ -158,8 +159,9 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 |---|---|---|---|---|
 | F-01 | worker 側耗盡進 DLQ | 恰好一列 dead_letter_queue，reason=`worker_retry_exhausted`，step_id 非 null，context **非空**且含逐次 attempt 的 reason 與 error | L4 | §11, §7.1 |
 | F-02 | planner 側進 DLQ | dead_letter_queue 的 step_id 為 **null**（無 step 有過錯），reason 為三種 planner 值之一 | L5 | §14.1, §11 |
-| F-03 | `POST /dlq/{id}/replay`，該 run 目前為 **worker 側 DLQ**（`run=DLQ ∧ last_step=DLQ`） | TX5 單一交易：**attempt_count 歸零** ＋ step→RUNNING ＋ run→RUNNING ＋ 建新 attempt ＋ 設 current_attempt_id → 派送。**歸零是強制的** | L2 | §19 TX5, §11 |
-| F-04 | `POST /dlq/{id}/replay`，該 run 目前為 **planner 側 DLQ**（`run=DLQ ∧ last_step=DONE` 或無 step） | TX6：run→RUNNING → 重問 planner | L1 | §19 TX6 |
+| F-03 | `POST /dlq/{id}/replay`，該 run 目前為 **worker 側 DLQ**（`run=DLQ ∧ last_step=DLQ`） | 回 **202** 與 run_id。TX5 單一交易：**attempt_count 歸零** ＋ step→RUNNING ＋ run→RUNNING ＋ 建新 attempt ＋ 設 current_attempt_id → 派送。**歸零是強制的** | L2 | §19 TX5, §11 |
+| F-04 | `POST /dlq/{id}/replay`，該 run 目前為 **planner 側 DLQ**（`run=DLQ ∧ last_step=DONE` 或無 step） | 回 **202** 與 run_id。TX6：run→RUNNING → 重問 planner | L1 | §19 TX6 |
+| F-03b | replay 為何是 202 而非 200 | 與 A-02 同性質：交易 commit 之後由背景 goroutine 續跑，回應時工作尚未完成。**202 Accepted 是誠實的狀態碼** | — | 裁定 #N |
 | F-04b | 分支的判斷依據 | **一律由 run 與 last_step 的現況推導（組合表），不看 entry 的 `step_id`。** 多輪 run 用舊 entry id replay 時兩者會分歧；現況是真相，entry 是歷史（I-14） | — | 裁定 #K |
 | F-05 | replay 之後 | 已 DONE 的 steps **不得重跑**；planner 收到的 history 仍完整 | L1/L2 | §2 |
 | F-06 | `GET /runs/{id}` 的頂層形狀 | 恆有 `run_id`、`status`、`workflow_input`、`created_at`、`updated_at`、`steps`（陣列）。`dlq_reason` **僅在 `status="DLQ"` 時出現** | — | §11 |
@@ -325,6 +327,7 @@ findings 按情境 ID 對齊，兩份文件實體上永不共編。凍結的驗�
 | K-13 | **具名 worker 註冊表** | planner 直接給完整 `worker_url`，系統沒有已知 worker 的清單，因此不存在「查無此 worker」。語法檢查歸 planner（D-08），連不上歸 worker（D-09） | 裁定 #4 |
 | K-14 | **body 的位元組穩定性** | 不保證。`decision` 存為 `jsonb`，鍵順序與空白在寫入時被正規化，因此 recovery 重派時 worker 收到的 bytes 可能與首次派送不同 —— **同一份 JSON 文件，不同的位元組**。冪等**不得**以 raw body 的雜湊為鍵；請用 `X-StateFlow-Step-ID`（J-02 保證它每次派送都在） | 裁定 #H |
 | K-15 | **`GET /runs/{id}` 不提供完整的 attempt 歷史** | 只給 `current_attempt`（最新一個）。完整歷史僅在該 step 進 DLQ 之後，於 DLQ entry 的 `context.attempts` 中可見。這是刻意的：`GET /runs` 是狀態查詢，不是稽核介面 | 裁定 #I |
+| K-16 | **async 回報中 `{}` 或 `[]` 的分類尚未裁定** | 目前實作只把「`output` 鍵缺席」與「`output` 為 `null`」判為 `malformed`；語法合法但語意為空的 `{}`／`[]` 被視為成功。**這是實作者留下的未裁決判斷，不是規格。**在裁定之前，不得為此寫失敗測試 | 裁定 #O |
 ---
 
 ## O. 執行期組態與可觀測端點
