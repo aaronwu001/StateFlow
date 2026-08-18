@@ -1,14 +1,14 @@
-# StateFlow
-
-[![CI](https://github.com/aaronwu001/StateFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/aaronwu001/StateFlow/actions/workflows/ci.yml)
-
-**Durable execution for AI pipelines. Crash, restart, don't re-run completed steps.**
-
 > **Status: v1 feature-complete, frozen.**
 > StateFlow v1 implements and verifies the frontier-model approach to durable
 > execution end-to-end (see Project status below). It is kept as a working
 > reference implementation and is not receiving new features. A successor
 > project is in early development; this README will link to it when it's public.
+
+# StateFlow
+
+[![CI](https://github.com/aaronwu001/StateFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/aaronwu001/StateFlow/actions/workflows/ci.yml)
+
+**Durable execution for AI pipelines. Crash, restart, don't re-run completed steps.**
 
 ![Crash-recovery demo](demo/demo.gif)
 
