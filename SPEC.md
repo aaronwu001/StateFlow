@@ -1497,7 +1497,7 @@ shown until DLQ exists.
 system useful to someone else, and everything before it is the engine proving it is trustworthy.
 
 Each milestone section states its demo script: what the operator does by hand, and what he must see
-in the database afterwards. α's and γ's are written; the rest are written when that milestone
+in the database afterwards. α's, γ's and β's are written; the rest are written when that milestone
 starts.
 **Why:** a demo script is an operational verification artefact, not an architectural commitment.
 Writing the later ones now would mean inventing detail that no ruling covers.
@@ -1639,6 +1639,160 @@ fail at run time (§12.1), so the only way to reach L5 today is an unbuilt plann
 is unbuilt — which would demonstrate the milestone's absence, not the mechanism. It is demonstrated
 at **ζ**, the first milestone with a planner that can genuinely fail. Also absent: crash recovery
 (β), replay (δ), and everything α already excluded.
+
+### 18.3 Milestone β — demo script
+
+**Capability:** an operator kills the orchestrator while a step is in flight, restarts it, and
+watches the run resume — while a run that had already reached the dead-letter queue is left exactly
+as it was.
+
+**Environment** — `demos/beta/`:
+
+| File | Content |
+|---|---|
+| `docker-compose.yml` | `postgres`, `orchestrator` and one worker. The orchestrator carries `restart: "no"` |
+| `piton.yaml` | As α's, but with faster coordination timings — see below |
+| `piton-badstorage.yaml` | A second configuration naming a database host that does not resolve, for leg 5 |
+| `workflow-survives-crash.json` | Leg 1 — three steps: one completes before the crash, one is in flight during it, one runs after |
+| `workflow-dlq.json` | Leg 2 — a run driven into DLQ **before** the crash |
+| `workflow-clean-shutdown.json` | Leg 3 — a step in flight when the orchestrator is asked to stop politely |
+| `workflow-crash-loop.json` | Leg 4 — a step that is killed on every attempt it is given |
+| `demo.sh` | All five legs against one environment, runnable unattended |
+
+**`restart: "no"` is required, not incidental.** A container runtime that restarts the orchestrator
+by itself takes the demonstration away from the operator: he never sees the state the crash left
+behind, because something else repaired it before he looked. The recovery under test is Piton's
+(§13), never the runtime's.
+
+**β does not use §8.6 and §8.7's default timings**, and runs at sweep 2 s, heartbeat 2 s, lease TTL
+6 s. §8.5's claim cannot take a run from an orchestrator that is still live, so every kill is
+followed by a mandatory wait for the dead process's lease to expire. The values change how *long*
+failover takes and never what recovery *does*; §4.4 makes all three configuration precisely so a
+deployment may choose, and §8.7's relationship — a lease tolerating two missed heartbeats — is
+preserved.
+
+**Legs 1 and 2 share one crash.** The DLQ'd run is created *before* the kill, so the same restart
+that resumes one run must leave the other alone.
+
+**What the operator types, and what he must see.**
+
+*Leg 1 — the orchestrator is killed at any instant (§13.1.1):*
+
+```bash
+# start the run, wait until the slow step is on the wire, then:
+docker compose kill -s KILL orchestrator
+```
+
+```sql
+SELECT owner_id FROM runs WHERE run_id = :run;
+-- unchanged. §8.7 names four writers of coordination metadata and all four live
+-- inside an orchestrator process, so a killed process releases nothing
+```
+
+```bash
+docker compose start orchestrator
+```
+
+```sql
+SELECT seq, step_name, status, attempt_count FROM steps WHERE run_id = :run ORDER BY seq;
+-- every static step present and DONE;  the run resumed past the crash
+
+SELECT s.step_name, a.attempt_no, a.status, a.failure_reason, a.dispatched_by
+  FROM attempts a JOIN steps s ON s.step_id = a.step_id
+ WHERE a.run_id = :run ORDER BY s.seq, a.attempt_no;
+-- the step that completed BEFORE the crash is untouched: one attempt, DONE,
+--   the same attempt_id and the same completed_at (§13.1.1, "completed steps never re-run")
+-- the step that was IN FLIGHT has attempt 1 FAILED with failure_reason = 'orphaned'
+--   (§5.3, §8.6 — a sync attempt is expired immediately at claim time, regardless
+--   of deadline_at, because its HTTP connection died with its previous owner)
+-- attempt 2 names a DIFFERENT dispatched_by (§6.4): a restarted orchestrator
+--   takes a fresh orchestrator_id
+```
+
+*Leg 2 — recovery never auto-replays a DLQ'd run (§13.2.7):*
+
+The whole run — its row, every step, every attempt, every dead-letter entry — is digested before the
+crash of leg 1 and again after it. **The two digests must be identical.** In addition:
+
+```sql
+SELECT status, owner_id, replay_count FROM runs WHERE run_id = :run;
+-- DLQ;  owner_id NULL — the sweep filters on status = 'RUNNING' (§8.6), so a DLQ
+-- run is never claimed;  replay_count = 0 — reaching DLQ means a human decides
+```
+
+*Leg 3 — a clean shutdown releases (§8.7):*
+
+```bash
+docker compose stop orchestrator          # SIGTERM, not SIGKILL
+```
+
+```sql
+SELECT owner_id FROM runs WHERE run_id = :run;   -- already NULL, with nothing else running
+```
+
+This is the contrast that gives leg 1 its meaning: §8.7 calls release *"an optimisation that makes
+failover immediate rather than `lease_ttl` later; correctness does not depend on it"*, and legs 1
+and 3 are what that sentence looks like from a terminal. The orchestrator is then restarted and the
+run finishes.
+
+*Leg 4 — a crash loop converges (§13.1.4):*
+
+The orchestrator is killed once per unit of `step_max_attempts`, each time only after the next
+attempt has actually been dispatched.
+
+```sql
+SELECT attempt_no, status, failure_reason FROM attempts WHERE run_id = :run ORDER BY attempt_no;
+-- step_max_attempts rows, all FAILED, all 'orphaned'
+
+SELECT status, attempt_count FROM steps WHERE run_id = :run;   -- DLQ, attempt_count = step_max_attempts
+SELECT reason, step_id FROM dead_letter_queue WHERE run_id = :run;
+-- exactly one row, worker_budget_exhausted, naming the step
+```
+
+If a crash did not burn budget this loop would not terminate. §12.2: *"every dispatch increments a
+persisted counter before the work begins, so no crash afterwards — including one during recovery —
+can undo it."*
+
+*Leg 5 — storage unreachable at startup (§13.1.5):*
+
+```bash
+docker compose run --rm --no-deps orchestrator --config /etc/piton/piton-badstorage.yaml
+```
+
+A non-zero exit, and an error message that names storage as the cause. This section fixes those two
+properties and **not the wording**.
+
+*Across the legs:*
+
+```sql
+SELECT orchestrator_id, last_seen_at FROM orchestrators;
+-- one row per process that ran, and exactly one of them live by §8.7's definition.
+-- The dead rows are not a defect: §5.3's 'orphaned' is decided against this table
+-- long after the process is gone
+
+SELECT count(*) FROM runs WHERE status <> 'RUNNING' AND (owner_id IS NOT NULL OR claimed_at IS NOT NULL);
+-- 0 (§6.2, §8.7)
+```
+
+**Which endpoints β implements.** None beyond α's.
+
+**Which of §13.1's six situations β demonstrates:** 1, 4 and 5 directly, and 3 without isolating it —
+leg 4's kills each land on a process that has just recovered the previous one.
+
+**What β deliberately does not demonstrate.** §13.1.2 — a single run's driver dying while the process
+lives — has no external handle: staging it would mean adding a test-only hook to the orchestrator for
+the benefit of its own test. §13.1.6 — storage unreachable at runtime — is stageable, but its
+assertion is the state leg 1 already reaches, by a slower and far more timing-dependent path. Both
+remain guaranteed by §13.1; neither is shown here.
+**Why this is stated rather than left silent:** an unlisted absence reads as an oversight, and the
+next reader cannot tell whether a situation was considered and set aside or simply forgotten.
+
+Also absent, as in every milestone before δ: replay, cancellation, `raw` dispatch, `async`, an HTTP
+planner, and overrides.
+
+**§13.2.1 is visible here and is a non-guarantee, not a defect.** The re-dispatch after a crash
+re-runs a step that was already executing, so the demo's worker counts how many times each step
+reached it and prints the count. *"The worker must be idempotent on `step_id`."*
 
 ---
 
