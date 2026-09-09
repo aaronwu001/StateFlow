@@ -426,6 +426,7 @@ the Postgres implementation's choices; another backend may choose differently fo
 | `name` | TEXT | no | Display label. Not an identity |
 | `planner_type` | TEXT | no | `static` \| `http` |
 | `planner_url` | TEXT | yes | Required iff `planner_type = 'http'`; must be absent otherwise |
+| `fetch_base_url` | TEXT | yes | Required iff `planner_type = 'http'`; must be absent otherwise. The base URL this workflow's planner is told to read from, sent verbatim as §9.2's field of the same name |
 | `planner_static_steps` | JSON bytes | yes | Required iff `planner_type = 'static'`: an ordered array of StepSpecs (§9.4) |
 | `step_timeout_seconds` | INT | no | §11.1 |
 | `step_max_attempts` | INT | no | §11.1 |
@@ -434,9 +435,24 @@ the Postgres implementation's choices; another backend may choose differently fo
 | `planner_max_attempts` | INT | no | §11.1 |
 | `created_at` | TIMESTAMPTZ | no | |
 
-Invariants: exactly one of `planner_url` / `planner_static_steps` is present, determined by
-`planner_type`; all five numeric configuration columns are ≥ 1 except
+Invariants: `planner_url` and `fetch_base_url` are both present iff `planner_type = 'http'`, and
+`planner_static_steps` is present iff `planner_type = 'static'` — the two sides are never mixed and
+never both absent; all five numeric configuration columns are ≥ 1 except
 `step_retry_delay_seconds`, which is ≥ 0 (§11.1).
+
+**Why `fetch_base_url` is a column of the workflow rather than a value in the orchestrator's
+configuration file (§4.4):** it is one half of a pair. `planner_url` says where the orchestrator
+calls this workflow's planner, and `fetch_base_url` says where that same planner reads back — one
+relationship, two directions, so both are settled at the same moment, live in the same row and
+expire together. It also lets two workflows name two different routes to the same orchestrator,
+which a single process-wide value cannot: a planner inside the cluster and a planner hosted outside
+it do not reach the read API by the same address.
+**The accepted cost, stated plainly:** §10.1 has no endpoint that modifies a workflow, so a
+deployment that changes its externally visible address strands every existing `http` workflow —
+including the replay (§14) of a run that is sitting in DLQ under one, which will ask the planner
+again and send it an address that no longer answers. The remedy is to create a new workflow. This is
+not a new class of cost: `planner_url` is already immutable in exactly the same way and fails in
+exactly the same way when a planner moves.
 
 **The built-in static planner.** It holds no state. Asked for a decision, it answers with
 `planner_static_steps[n]` where `n` is the number of steps the run already has, and answers `done`
@@ -905,7 +921,7 @@ POST {planner_url}
 | `run_id` | string | yes | The run being decided |
 | `workflow_input` | object | yes | `runs.input`, verbatim |
 | `history` | array | yes | Catalogue of completed steps, oldest first. May be empty |
-| `fetch_base_url` | string | yes | Base URL of the read API (§10.2) |
+| `fetch_base_url` | string | yes | Base URL of the read API (§10.2). The workflow's `fetch_base_url` column (§6.1), verbatim |
 
 `history` row fields: `step_id`, `step_name`, `seq`, `status`, `output_bytes`, `attempt_count`,
 `completed_at`.
@@ -1436,10 +1452,11 @@ produces dead-letter entries and wastes triage.
 `POST /workflows` returns 400, before any run exists, for:
 
 1. `planner_type` not one of `static` / `http` — this catches the typo `"htp"`.
-2. `planner_type = "http"` with no `planner_url`, or a `planner_url` that is not a valid absolute
-   HTTP(S) URL.
+2. `planner_type = "http"` with no `planner_url` or no `fetch_base_url`, or either of them not a
+   valid absolute HTTP(S) URL.
 3. `planner_type = "static"` with no `planner_static_steps`, an empty array, or any element that is
-   not a valid StepSpec by §9.4 and §9.8 (§6.1).
+   not a valid StepSpec by §9.4 and §9.8 (§6.1) — or carrying `fetch_base_url`, which belongs to
+   `http` alone (§6.1).
 4. Any unknown key. A silently ignored `retrylimit` makes the user believe a setting took effect.
 5. Any configuration field of the wrong JSON type — `"3"` is not `3`, and must not be coerced.
 6. Any `*_max_attempts` below 1, or any `*_timeout_seconds` below 1, or a negative
