@@ -1,0 +1,230 @@
+# Milestone delta - environment definition.
+#
+# SPEC.md 18 names delta "replay in its variants". SPEC.md 18.4 - the demo
+# script - is NOT written: CLAUDE.md 2 rule 1 forbids this agent from editing
+# SPEC.md on its own initiative, so the section that would name this file and
+# fix its shape is the owner's to rule on. Everything below is therefore a
+# proposal about the ENVIRONMENT, and nothing in test/delta cites it as
+# authority. The suite's assertions trace to sections that are already ratified:
+# SPEC.md 14, 10.1, 10.5, 12.2, 12.3, 6.2, 6.3, 6.5, 5.5 and 5.6.
+#
+# Three services: postgres, orchestrator, and one worker whose behaviour each
+# step selects through its own params - the shape gamma's environment already
+# has, for the same reason. There is no second worker and no fourth service.
+#
+# It is a near-copy of demos/gamma/docker-compose.yml, deliberately: SPEC.md 4.4
+# gives each milestone its own directory with its own compose file, and
+# CLAUDE.md 5.5.4 requires the automated suite to reference the milestone's own
+# file. Sharing one file between milestones would mean a change made for delta
+# could silently alter what the owner has already verified by hand for alpha,
+# gamma and beta.
+#
+# WHY THE ORCHESTRATOR CARRIES NO restart POLICY HERE
+#   Beta's compose file states `restart: "no"` and SPEC.md 18.3 makes that a
+#   rule, because beta kills the process and a runtime that restarted it would
+#   take the demonstration away from the operator. Delta kills nothing. The
+#   default policy is left in place rather than restated, so that the one file
+#   which says something about restarts is the one where it means something.
+#
+# Teardown between runs is `docker compose down -v`. The volume wipe is not
+# optional: CLAUDE.md 5.5.2 requires every group to start from a clean database.
+
+name: piton-delta
+
+services:
+
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: piton
+      POSTGRES_PASSWORD: piton
+      POSTGRES_DB: piton
+    volumes:
+      # Postgres 18+ wants ONE mount at /var/lib/postgresql, not at
+      # /var/lib/postgresql/data. See the same note in alpha's compose file.
+      - pgdata:/var/lib/postgresql
+    # No host port is published, for the reason alpha's file gives: a fixed
+    # port collides with any Postgres the operator already runs. SPEC.md 17.1's
+    # access path needs nothing installed on the host:
+    #
+    #   docker compose exec -T postgres psql -U piton -d piton
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piton -d piton"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------ orchestrator
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile_inline: |
+        FROM golang:1.27-alpine AS build
+        WORKDIR /src
+        COPY . .
+        RUN CGO_ENABLED=0 go build -trimpath -o /out/piton ./cmd/piton
+
+        FROM alpine:3.22
+        COPY --from=build /out/piton /usr/local/bin/piton
+        ENTRYPOINT ["/usr/local/bin/piton"]
+    command: ["--config", "/etc/piton/piton.yaml"]
+    volumes:
+      - ./piton.yaml:/etc/piton/piton.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Demo determinism, not an architectural dependency - see alpha's file.
+      # It matters here for the same reason it does in gamma: a worker that was
+      # not yet listening would make a leg fail by transport_error at a moment
+      # no leg of this milestone is about.
+      worker:
+        condition: service_healthy
+    # A 200 from /healthz proves migrations finished: there is no migration
+    # service, so the orchestrator applies them at boot and binds its listener
+    # only afterwards.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+
+  # ------------------------------------------------------------------ worker
+  #
+  # One service, whose behaviour each step selects through its own params. It
+  # speaks sync + envelope, the only combination legal before theta and epsilon
+  # (SPEC.md 9.7).
+  #
+  # params.mode selects one of two behaviours:
+  #
+  #   echo               success, immediately. SPEC.md 9.6's sync + envelope
+  #                      success shape
+  #   fail_then_succeed  fails params.fail_times times for this (run_id,
+  #                      step_id) pair, then sleeps params.sleep_seconds and
+  #                      succeeds
+  #
+  # WHY DELTA'S WORKER IS SMALLER THAN GAMMA'S AND NOT LARGER
+  #   Gamma needed four behaviours because SPEC.md 5.3 puts each way a worker
+  #   fails in a different row, and gamma exists to show that they are
+  #   different. Delta is not about how a step fails - gamma settled that - it
+  #   is about what happens to a run AFTER it has failed. One way of failing is
+  #   therefore enough, and CLAUDE.md 5's subtractive default puts the burden of
+  #   proof on including a second. http_500 and the worker_error envelope are
+  #   absent for that reason, not by oversight.
+  #
+  # WHY fail_then_succeed IS THE ONE MODE DELTA NEEDS
+  #   A replay demonstrates nothing unless the second round can end differently
+  #   from the first. The counter is keyed on (run_id, step_id) and is NOT reset
+  #   by a replay - the worker knows nothing about replay rounds - so a step
+  #   with fail_times = 2 under step_max_attempts = 2 exhausts its budget in
+  #   round 0 and succeeds on the first dispatch of round 1. That is the whole
+  #   mechanism, and it lives in the fixture rather than in Piton.
+  #
+  # WHY sleep_seconds SITS ON THE SUCCESS PATH ONLY
+  #   One leg has to be observed WHILE it is running: SPEC.md 14 puts the
+  #   replayed step back into RUNNING, and a step that succeeded in
+  #   milliseconds would be DONE before anything could look. Sleeping only
+  #   after the failures means round 0 still reaches DLQ promptly, and only the
+  #   post-replay dispatch is slow.
+  #
+  # WHY THE COUNTER IS KEYED ON (run_id, step_id)
+  #   The envelope carries no attempt number and no replay round (SPEC.md 9.5),
+  #   so "how many times have I been asked to do this step" is something only
+  #   the worker can know. The count is in memory and dies with the container,
+  #   which is right for a demo fixture: SPEC.md 1 forbids the SYSTEM from
+  #   making anything in memory load-bearing, and this worker is not the system.
+  worker:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json, threading, time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = {}
+        lock = threading.Lock()
+
+        def calls_so_far(key):
+            with lock:
+                seen[key] = seen.get(key, 0) + 1
+                return seen[key]
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply(200, {"status": "ok"})
+                else:
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+
+            def do_POST(self):
+                if self.path != "/work":
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+                    return
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    env = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply(400, {"status": "failure",
+                                      "error": "unparseable body: %s" % exc})
+                    return
+
+                params = env.get("params") or {}
+                mode = params.get("mode", "echo")
+                key = (env.get("run_id"), env.get("step_id"))
+                n = calls_so_far(key)
+
+                if mode == "fail_then_succeed":
+                    fail_times = int(params.get("fail_times", 0))
+                    if n <= fail_times:
+                        # SPEC.md 9.6: a sync + envelope failure is a 200 whose
+                        # BODY says failure. Replying non-2xx here would produce
+                        # transport_error instead - a different row of SPEC.md
+                        # 5.3, and not the one this milestone is built on.
+                        self._reply(200, {"status": "failure",
+                                          "error": "fail_then_succeed: call %d for this step, "
+                                                   "failing the first %d" % (n, fail_times)})
+                        return
+                    time.sleep(float(params.get("sleep_seconds", 0)))
+
+                self._succeed(env, n, mode)
+
+            def _succeed(self, env, n, mode):
+                # SPEC.md 9.6, the sync + envelope success shape.
+                self._reply(200, {"status": "success",
+                                  "output": {"mode": mode,
+                                             "call_number_for_this_step": n,
+                                             "run_id": env.get("run_id"),
+                                             "step_id": env.get("step_id"),
+                                             "attempt_id": env.get("attempt_id")}})
+
+            def _reply(self, code, payload):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("worker: " + (fmt % args), flush=True)
+
+        print("worker: listening on 0.0.0.0:9090", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  pgdata:

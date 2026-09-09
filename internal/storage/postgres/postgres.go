@@ -304,6 +304,117 @@ func (s *Store) ListAttempts(ctx context.Context, runID string) ([]*model.Attemp
 	return out, rows.Err()
 }
 
+// ReplayRun is SPEC.md 14, in one transaction, and it returns the run's new
+// replay_count.
+//
+// SPEC.md 14 lists what the transaction does: "increment runs.replay_count; run
+// → RUNNING; if last_step = DLQ, that step returns to RUNNING with
+// attempt_count reset to 0; reset planner_attempt_count to 0; clear owner_id
+// and claimed_at so the next sweep picks it up".
+//
+// WHY THE FIRST STATEMENT IS THE WHOLE GATE
+//
+//	SPEC.md 14: "the idempotency gate is 'is this run in DLQ right now'. Not
+//	'has this run been replayed before'... the transaction that takes the run
+//	out of DLQ IS the gate, so a double-click has exactly one winner."
+//
+//	That is a CAS in the sense of SPEC.md 8.1 - "an UPDATE ... WHERE <expected
+//	state>, evaluated atomically with the write", where "zero rows affected
+//	means the expectation was wrong, and is not an error condition, it is the
+//	answer". Two replays arriving together do not race: the first takes the
+//	row lock, and the second blocks on that lock until the first commits, then
+//	re-evaluates status = 'DLQ' against what the first wrote. It finds RUNNING,
+//	affects zero rows, and is refused. Nothing outside this statement decides
+//	the winner, which is what SPEC.md 14 asks for - a SELECT followed by an
+//	UPDATE would be the shape SPEC.md 8.1 rejects outright.
+//
+// WHY THERE IS NO OWNERSHIP FENCE
+//
+//	SPEC.md 8.2's fence asks "am I still this run's owner?", and it is asked by
+//	a driver about a run it is driving. A replay is the operator's, and a run
+//	in DLQ has no owner to test: SPEC.md 6.2 makes owner_id non-NULL only while
+//	status = 'RUNNING', and SPEC.md 8.7's fourth writer cleared it in the same
+//	transaction that wrote the DLQ verdict. The gate above is what stands in
+//	its place, and SPEC.md 14 is the ruling that puts it there.
+//
+// WHY owner_id AND claimed_at ARE STILL WRITTEN
+//
+//	SPEC.md 14 asks for it and then says why it costs nothing: "under 8.7 a DLQ
+//	run already holds both as NULL, so this is a restatement for the reader,
+//	not a second mechanism". Writing NULL over NULL cannot make this a fifth
+//	writer of coordination metadata in the sense SPEC.md 8.7 enumerates - the
+//	gate has already established that the run is in DLQ, and SPEC.md 6.2's
+//	invariant makes both columns NULL for every such row.
+func (s *Store) ReplayRun(ctx context.Context, runID string) (int, error) {
+	if !isUUID(runID) {
+		return 0, storage.ErrNotFound
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: cannot begin a transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var replayCount int
+	err = tx.QueryRowContext(ctx, `
+UPDATE runs
+   SET status                = 'RUNNING',
+       replay_count          = replay_count + 1,
+       planner_attempt_count = 0,
+       owner_id              = NULL,
+       claimed_at            = NULL
+ WHERE run_id = $1 AND status = 'DLQ'
+RETURNING replay_count;`, runID).Scan(&replayCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Zero rows is the answer, but it does not yet say WHICH answer.
+		// SPEC.md 10.5 separates them: 404 is "no such entity", 409 is "the
+		// entity exists but is in a state that forbids this operation". The
+		// question is asked inside the same transaction so that the reply
+		// cannot describe a run that has since changed.
+		var exists bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT true FROM runs WHERE run_id = $1;`, runID).Scan(&exists); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return 0, storage.ErrNotFound
+			}
+			return 0, fmt.Errorf("postgres: cannot read the run: %w", err)
+		}
+		return 0, storage.ErrNotInDLQ
+	}
+	if err != nil {
+		return 0, fmt.Errorf("postgres: cannot replay the run: %w", err)
+	}
+
+	// SPEC.md 14: "if last_step = DLQ, that step returns to RUNNING with
+	// attempt_count reset to 0". SPEC.md 5.4 makes last_step derived and says
+	// how - the highest-seq step - and SPEC.md 12.3 is why the branch is on
+	// CURRENT STATE rather than on the dead-letter entry: "after several rounds
+	// an old entry and current reality diverge. This is the whole reason replay
+	// targets the run."
+	//
+	// Zero rows here is legitimate and is not an error: it is SPEC.md 12.3's
+	// planner-side column, L5, where the run is in DLQ with last_step = DONE
+	// and what replay resumes is "asking the planner again" - which needs no
+	// step to be touched at all.
+	//
+	// completed_at goes back to NULL because SPEC.md 6.3 sets it "exactly when
+	// status leaves RUNNING", so a step that has returned to RUNNING cannot
+	// still carry one.
+	if _, err := tx.ExecContext(ctx, `
+UPDATE steps
+   SET status = 'RUNNING', attempt_count = 0, completed_at = NULL
+ WHERE step_id = (SELECT step_id FROM steps WHERE run_id = $1 ORDER BY seq DESC LIMIT 1)
+   AND status = 'DLQ';`, runID); err != nil {
+		return 0, fmt.Errorf("postgres: cannot return the dead-lettered step to RUNNING: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("postgres: commit failed: %w", err)
+	}
+	return replayCount, nil
+}
+
 // StepOutputAtSeq returns the identity and stored output of the run's step at
 // one position, provided that step is DONE.
 //

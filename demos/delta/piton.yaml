@@ -1,0 +1,54 @@
+# Milestone delta - the orchestrator's boot configuration.
+#
+# SPEC.md 4.4: "The orchestrator reads one YAML configuration file at boot. It
+# declares at minimum the storage backend and its connection details, the HTTP
+# listen address, the sweep interval, the heartbeat interval and the lease TTL."
+#
+# SPEC.md fixes WHAT this file must declare. It does not fix the key names, so
+# the names below are this demo's choice, not a ratified rule - the same two
+# conventions alpha's and gamma's files follow: every name reuses SPEC's own
+# vocabulary, and durations carry the `_seconds` suffix that SPEC.md 11.1
+# already uses for step_timeout_seconds and friends.
+
+storage:
+  # SPEC.md 4.4: "The storage backend is a value in that file", in support of
+  # the storage abstraction of SPEC.md 7.
+  backend: postgres
+
+  # `postgres` is the compose service name (docker-compose.yml), not localhost:
+  # SPEC.md 4.4 states the database "is not assumed to be on the same host".
+  dsn: "postgres://piton:piton@postgres:5432/piton?sslmode=disable"
+
+http:
+  # Container-internal. The host reaches this through the published port in
+  # docker-compose.yml.
+  listen_address: "0.0.0.0:8080"
+
+# The three numbers that govern ownership, written out at their SPEC defaults.
+#
+#   sweep_interval_seconds     SPEC.md 8.6 - "5 seconds by default"
+#   heartbeat_interval_seconds SPEC.md 8.7 - heartbeat every 10 s
+#   lease_ttl_seconds          SPEC.md 8.7 - 30 s, tolerating two missed
+#                              heartbeats before another orchestrator may take
+#                              over
+#
+# WHY DELTA USES THE DEFAULTS AND BETA DOES NOT
+#   Beta runs at sweep 2 s / heartbeat 2 s / lease TTL 6 s, and SPEC.md 18.3
+#   makes those values a rule with a reason: SPEC.md 8.5's claim cannot take a
+#   run from a live owner, so every kill in beta is followed by a MANDATORY wait
+#   for the dead process's lease to expire, and the defaults would have made the
+#   demo mostly waiting. Delta kills nothing and expires no lease. No assertion
+#   in this milestone is about how long anything takes, so there is nothing here
+#   for faster timings to buy - and a timing value that differs between
+#   milestones for no stated reason is one more thing the operator must hold in
+#   his head while reading the database.
+#
+# One of them is still visible in what delta does. SPEC.md 14 ends a replay by
+# clearing owner_id and claimed_at "so the next sweep picks it up", so a
+# replayed run waits up to sweep_interval_seconds before its step is dispatched
+# again. That is latency, not a rule, and every wait in the suite polls for the
+# STATE rather than sleeping for a computed duration - so raising or lowering
+# this number changes how long the demo takes and nothing that it proves.
+sweep_interval_seconds: 5
+heartbeat_interval_seconds: 10
+lease_ttl_seconds: 30

@@ -3,9 +3,14 @@
 // SPEC.md 18.1 fixes which of it milestone α implements: "POST /workflows,
 // POST /workflows/{id}/runs, GET /runs/{run_id}, GET /runs/{run_id}/steps and
 // GET /healthz. The remaining read endpoints land with ζ, the first milestone
-// that has a planner able to call them." Nothing else is registered below —
-// SPEC.md 10.2 states the complete read surface because it is a contract a
-// planner author builds against, not because α owes all of it.
+// that has a planner able to call them." SPEC.md 10.2 states the complete read
+// surface because it is a contract a planner author builds against, not because
+// α owes all of it.
+//
+// Milestone δ adds one control endpoint to that list and nothing else:
+// POST /runs/{run_id}/replay (SPEC.md 10.1, SPEC.md 14). POST
+// /runs/{run_id}/cancel is milestone ι and GET /runs/{run_id}/dlq lands with
+// the rest of SPEC.md 10.2's read surface, so neither is registered here.
 //
 // SPEC.md 10.2 also settles who the read endpoints are for: "the planner's read
 // access and the operator's read access are one surface, not two", because
@@ -50,6 +55,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("POST /workflows", a.createWorkflow)
 	mux.HandleFunc("POST /workflows/{workflow_id}/runs", a.createRun)
+	// SPEC.md 10.1, added at milestone δ (SPEC.md 18, order 4: "replay in its
+	// variants"). It is the first control endpoint since α.
+	mux.HandleFunc("POST /runs/{run_id}/replay", a.replayRun)
 	mux.HandleFunc("GET /runs/{run_id}", a.getRun)
 	mux.HandleFunc("GET /runs/{run_id}/steps", a.getRunSteps)
 	return mux
@@ -86,6 +94,10 @@ const (
 	slugInvalidRequest = "invalid_request"
 	slugNotFound       = "not_found"
 	slugUnavailable    = "storage_unavailable"
+
+	// slugConflict is the one slug SPEC.md fixes by printing it. SPEC.md 10.5's
+	// worked example is a refused replay, and it carries `"error": "conflict"`.
+	slugConflict = "conflict"
 )
 
 func (a *API) writeJSON(w http.ResponseWriter, code int, body any) {
@@ -264,6 +276,110 @@ func (a *API) createRun(w http.ResponseWriter, r *http.Request) {
 		"status":      run.Status,
 		"created_at":  run.CreatedAt,
 	})
+}
+
+// replayRun is POST /runs/{run_id}/replay (SPEC.md 10.1, SPEC.md 14).
+//
+// SPEC.md 14 targets the RUN and not a dead-letter entry, and says why: "a
+// dead-letter entry is history and diverges from current reality after several
+// rounds. The previous design exposed POST /dlq/{entry_id}/replay and then
+// needed a patch rule saying the worker-side/planner-side branch must be
+// derived from current state rather than from the entry. Targeting the run
+// deletes that entire class of confusion." Nothing in this handler reads
+// dead_letter_queue.
+//
+// The decision is not taken here. The whole of it is the conditional UPDATE
+// inside storage.ReplayRun, because SPEC.md 14 makes that transaction the gate;
+// this function's job is to turn its three answers into SPEC.md 10.5's three
+// codes.
+func (a *API) replayRun(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("run_id")
+
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	defer cancel()
+
+	replayCount, err := a.store.ReplayRun(ctx, runID)
+	switch {
+	case err == nil:
+		// SPEC.md 14 fixes no success code and no success body, so this is the
+		// smallest honest answer: what the run now is, and the counter SPEC.md
+		// 14 requires to be inspectable. SPEC.md 6.2's replay_count is returned
+		// because "the owner must be able to see, at a terminal, which round a
+		// given attempt belonged to" and this is the round he just started.
+		a.writeJSON(w, http.StatusOK, map[string]any{
+			"run_id":       runID,
+			"status":       model.StatusRunning,
+			"replay_count": replayCount,
+		})
+		// The nudge asks the sweep to run now rather than at its next tick.
+		// SPEC.md 14 hands the run to "the next sweep", and this changes only
+		// which one that is — latency, not mechanism, exactly as in createRun.
+		if a.engine != nil {
+			a.engine.Nudge()
+		}
+
+	case errors.Is(err, storage.ErrNotInDLQ):
+		a.writeError(w, http.StatusConflict, a.describeRefusedReplay(ctx, runID))
+
+	default:
+		// ErrNotFound becomes SPEC.md 10.5's 404, anything else its 503.
+		a.writeStorageError(w, "no run with that run_id", err)
+	}
+}
+
+// describeRefusedReplay builds SPEC.md 10.5's body for a replay the gate
+// refused.
+//
+// SPEC.md 10.5: "a rejection states the actual current state, not merely that
+// the request was refused... the operator's next action depends on what is true
+// now. '409 Conflict' alone forces a second request to find out." And beyond
+// `error` and `message`, "a rejection carries the identifier and current status
+// of every entity the request named or would have touched, and omits only those
+// that do not exist" — so the step is described too, when the run has one, and
+// omitted when it does not. SPEC.md 10.5 gives the reason in the case that is
+// exactly this one: "a refused replay is explained by the run's status, but
+// what he does next depends on the step's."
+//
+// SPEC.md 5.4's last_step is the step described: it is the one a replay "would
+// have touched" (SPEC.md 14 returns it to RUNNING when it is in DLQ).
+//
+// The reads are best effort. A rejection that could not describe the run is
+// still a rejection, and answering 409 with two fields is better than turning a
+// refusal into a 503 because a follow-up query failed.
+func (a *API) describeRefusedReplay(ctx context.Context, runID string) errorBody {
+	body := errorBody{
+		Error:   slugConflict,
+		Message: "run is not in DLQ and cannot be replayed",
+		RunID:   runID,
+	}
+
+	run, err := a.store.GetRun(ctx, runID)
+	if err != nil {
+		a.logf("cannot describe the run a replay was refused for: %v", err)
+		return body
+	}
+	body.RunStatus = run.Status
+
+	steps, err := a.store.ListSteps(ctx, runID)
+	if err != nil {
+		a.logf("cannot describe the steps a replay was refused for: %v", err)
+		return body
+	}
+	// SPEC.md 5.4: last_step is the step with the highest seq, and "a run with
+	// no steps is defined to have last_step = DONE" — a definition, not a row,
+	// so there is nothing to name and SPEC.md 10.5's "omits only those that do
+	// not exist" applies.
+	if len(steps) > 0 {
+		last := steps[len(steps)-1]
+		for _, st := range steps {
+			if st.Seq > last.Seq {
+				last = st
+			}
+		}
+		body.StepID = last.StepID
+		body.StepStatus = last.Status
+	}
+	return body
 }
 
 // ---------------------------------------------------------------------------

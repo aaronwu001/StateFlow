@@ -1,0 +1,27 @@
+{
+  "name": "delta-replay-resumes",
+  "planner_type": "static",
+  "step_timeout_seconds": 300,
+  "step_max_attempts": 2,
+  "step_retry_delay_seconds": 0,
+  "planner_timeout_seconds": 30,
+  "planner_max_attempts": 3,
+  "planner_static_steps": [
+    {
+      "step_name": "stumbles",
+      "worker_url": "http://worker:9090/work",
+      "connection_mode": "sync",
+      "dispatch_style": "envelope",
+      "params": { "mode": "fail_then_succeed", "fail_times": 2 },
+      "input_from": []
+    },
+    {
+      "step_name": "after-replay",
+      "worker_url": "http://worker:9090/work",
+      "connection_mode": "sync",
+      "dispatch_style": "envelope",
+      "params": { "mode": "echo" },
+      "input_from": []
+    }
+  ]
+}

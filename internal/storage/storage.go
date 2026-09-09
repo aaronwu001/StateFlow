@@ -38,6 +38,17 @@ var (
 	// rows: the attempt has already been expired, superseded or cancelled, so
 	// this report is a late one and is discarded.
 	ErrAttemptNotRunning = errors.New("storage: the attempt is no longer RUNNING")
+
+	// ErrNotInDLQ is the replay gate of SPEC.md 14 returning zero rows: the
+	// run exists, but its status is not DLQ, so it cannot be replayed.
+	//
+	// SPEC.md 14: "the idempotency gate is 'is this run in DLQ right now'. Not
+	// 'has this run been replayed before'." It is the same answer SPEC.md 8.1
+	// describes for the other conditional writes - "zero rows affected means
+	// the expectation was wrong, and is not an error condition, it is the
+	// answer" - and SPEC.md 14 states which answer: 409, "stating the actual
+	// current status (SPEC.md 10.5)".
+	ErrNotInDLQ = errors.New("storage: the run is not in DLQ and cannot be replayed")
 )
 
 // DriverState is what SPEC.md 4.2 step 2 reads: "the run's status and the
@@ -177,6 +188,21 @@ type Store interface {
 	GetRun(ctx context.Context, runID string) (*model.Run, error)
 	ListSteps(ctx context.Context, runID string) ([]*model.Step, error)
 	ListAttempts(ctx context.Context, runID string) ([]*model.Attempt, error)
+
+	// ReplayRun is SPEC.md 14, and it returns the run's new replay_count.
+	//
+	// It is an OPERATOR action rather than a driver action, which is why it
+	// takes no orchestrator_id and does not open with the ownership fence of
+	// SPEC.md 8.2. A run in DLQ has no owner - SPEC.md 6.2 makes owner_id
+	// non-NULL only while status = 'RUNNING', and SPEC.md 8.7's fourth writer
+	// cleared it in the same transaction that wrote the DLQ verdict - so there
+	// is no ownership to test. SPEC.md 14 names its own gate instead, and it
+	// is a CAS in the sense of SPEC.md 8.1: "the transaction that takes the
+	// run out of DLQ IS the gate, so a double-click has exactly one winner."
+	//
+	// It returns ErrNotFound when no such run exists (SPEC.md 10.5's 404) and
+	// ErrNotInDLQ when the run exists but the gate refused it (the 409).
+	ReplayRun(ctx context.Context, runID string) (replayCount int, err error)
 
 	// --- assembling SPEC.md 9.5's `inputs` ---------------------------------
 	//
