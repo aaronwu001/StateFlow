@@ -1,0 +1,541 @@
+# Milestone zeta - environment definition.
+#
+# SPEC.md 18 does not yet name zeta's demo script (18.5 is not written, for the
+# same reason 18.4 was not written for delta: CLAUDE.md 2 rule 1 forbids this
+# agent from editing SPEC.md on its own initiative). Everything below is
+# therefore a proposal about the ENVIRONMENT, not an authority on behaviour.
+#
+# Until this milestone the only planner is the built-in static one (SPEC.md
+# 6.1): the list of steps is fixed at workflow creation. Zeta adds the HTTP
+# planner (SPEC.md 9.2, 9.3): the orchestrator asks an external HTTP service,
+# synchronously, what the next step is, and that service may branch on what an
+# earlier step actually produced. That is why this file has two new services
+# where delta and gamma had one: a `worker` still does the work, but a
+# `planner` now decides what work there is to do.
+#
+# It is a near-copy of demos/delta/docker-compose.yml and demos/gamma's before
+# it, deliberately: SPEC.md 4.4 gives each milestone its own directory with its
+# own compose file, and CLAUDE.md 5.5.4 requires the automated suite to
+# reference the milestone's own file. Sharing one file between milestones would
+# mean a change made for zeta could silently alter what the owner has already
+# verified by hand for alpha, gamma, beta and delta.
+#
+# Teardown between runs is `docker compose down -v`. The volume wipe is not
+# optional: CLAUDE.md 5.5.2 requires every group to start from a clean database.
+
+name: piton-zeta
+
+services:
+
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: piton
+      POSTGRES_PASSWORD: piton
+      POSTGRES_DB: piton
+    volumes:
+      # Postgres 18+ wants ONE mount at /var/lib/postgresql, not at
+      # /var/lib/postgresql/data. See the same note in alpha's compose file.
+      - pgdata:/var/lib/postgresql
+    # No host port is published, for the reason alpha's file gives: a fixed
+    # port collides with any Postgres the operator already runs. SPEC.md 17.1's
+    # access path needs nothing installed on the host:
+    #
+    #   docker compose exec -T postgres psql -U piton -d piton
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piton -d piton"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------ orchestrator
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile_inline: |
+        FROM golang:1.27-alpine AS build
+        WORKDIR /src
+        COPY . .
+        RUN CGO_ENABLED=0 go build -trimpath -o /out/piton ./cmd/piton
+
+        FROM alpine:3.22
+        COPY --from=build /out/piton /usr/local/bin/piton
+        ENTRYPOINT ["/usr/local/bin/piton"]
+    command: ["--config", "/etc/piton/piton.yaml"]
+    volumes:
+      - ./piton.yaml:/etc/piton/piton.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Demo determinism, not an architectural dependency - see alpha's file.
+      # It matters for both of these the same way it mattered in gamma and
+      # delta: a worker or planner that was not yet listening would turn a leg
+      # about HTTP-planner behaviour into a leg about container startup order
+      # instead, which is not what any fixture here exists to demonstrate.
+      worker:
+        condition: service_healthy
+      planner:
+        condition: service_healthy
+    # A 200 from /healthz proves migrations finished: there is no migration
+    # service, so the orchestrator applies them at boot and binds its listener
+    # only afterwards.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+
+  # ------------------------------------------------------------------ worker
+  #
+  # Speaks sync + envelope only, the sole combination legal before milestones
+  # theta and epsilon (SPEC.md 9.7). params.mode selects one of two behaviours:
+  #
+  #   echo       success, immediately. Output is {"mode":"echo","params":<the
+  #              params it received>,"run_id":...,"step_id":...,"attempt_id":...}
+  #              - SPEC.md 9.6's sync+envelope success shape.
+  #   classify   the heart of this milestone: it answers with one of two
+  #              branches, ALTERNATING across runs, so that the fixture
+  #              downstream of it (workflow-dynamic.json) genuinely has two
+  #              different paths to take rather than one path dressed up as a
+  #              choice.
+  #
+  # WHY DELTA/GAMMA'S RETRY MODES ARE ABSENT
+  #   Both of those milestones needed a worker that could fail on command,
+  #   because they were about what happens to a step or a run once a worker
+  #   attempt does not succeed (SPEC.md 12.1, 12.2). Zeta is not about that -
+  #   it is about the planner reading a worker's OUTPUT and branching on it -
+  #   so the worker here never fails, and CLAUDE.md 5's subtractive default
+  #   puts the burden of proof on adding a mode this milestone does not use.
+  #
+  # HOW classify STAYS DETERMINISTIC ACROSS A RETRY
+  #   An ordered, in-memory registry of run_ids assigns each run the next
+  #   index the FIRST time it is seen, and looks the assignment up on every
+  #   later call instead of advancing the counter again. The answer is
+  #   "invoice" on an even index and "receipt" on an odd one. A retried
+  #   dispatch of the same step therefore sees the same run_id and gets back
+  #   the exact answer it got before - the planner's branch (SPEC.md 9.3) never
+  #   flips underneath a run that merely had to ask twice.
+  #   Unlike delta's and gamma's failure counters, this one is keyed on run_id
+  #   alone, not on (run_id, step_id): a run in this environment never sees the
+  #   classify step more than once, so run_id alone is already unambiguous, and
+  #   a compound key would be a distinction with no fixture that needs it.
+  #   As in delta and gamma, this state is in memory and dies with the
+  #   container - correct for a demo fixture, since SPEC.md 1 forbids the
+  #   SYSTEM (not this worker) from relying on anything in-memory.
+  worker:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json, threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        # classify's alternating assignment. classify_order records the run_ids
+        # in first-seen order; classify_index maps a run_id straight to its
+        # index so a retry looks the answer up instead of re-deriving it.
+        classify_order = []
+        classify_index = {}
+        lock = threading.Lock()
+
+        def classify_for(run_id):
+            with lock:
+                if run_id not in classify_index:
+                    classify_index[run_id] = len(classify_order)
+                    classify_order.append(run_id)
+                idx = classify_index[run_id]
+            return ("invoice" if idx % 2 == 0 else "receipt"), idx
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply(200, {"status": "ok"})
+                else:
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+
+            def do_POST(self):
+                if self.path != "/work":
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+                    return
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    env = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply(400, {"status": "failure",
+                                      "error": "unparseable body: %s" % exc})
+                    return
+
+                params = env.get("params") or {}
+                mode = params.get("mode", "echo")
+                run_id = env.get("run_id")
+                step_id = env.get("step_id")
+
+                if mode == "classify":
+                    kind, idx = classify_for(run_id)
+                    print("worker: run %s classified as %s (index %d)" %
+                          (run_id, kind, idx), flush=True)
+                    self._reply(200, {"status": "success",
+                                      "output": {"mode": "classify",
+                                                 "kind": kind,
+                                                 "run_index": idx,
+                                                 "run_id": run_id,
+                                                 "step_id": step_id}})
+                    return
+
+                # echo, and the default for any mode this fixture set does not
+                # name - the same "unrecognised falls through to echo" choice
+                # delta's and gamma's workers make.
+                self._reply(200, {"status": "success",
+                                  "output": {"mode": "echo",
+                                             "params": params,
+                                             "run_id": run_id,
+                                             "step_id": step_id,
+                                             "attempt_id": env.get("attempt_id")}})
+
+            def _reply(self, code, payload):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("worker: " + (fmt % args), flush=True)
+
+        print("worker: listening on 0.0.0.0:9090", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ----------------------------------------------------------------- planner
+  #
+  # The HTTP planner SPEC.md 9.2/9.3 describes: the orchestrator POSTs an M1
+  # request and gets back one of exactly three M2 responses (continue / done /
+  # fail). One process, many paths - each path is a different planner
+  # behaviour, and which fixture is under test is entirely a matter of which
+  # path its workflow's planner_url names (see the fixture table below).
+  #
+  # WHY THE PORT IS PUBLISHED (unlike postgres, worker or the internal parts of
+  # the orchestrator's own surface)
+  #   The automated suite calls GET /stats directly from the host to read back
+  #   the call and fetch counters below. Nothing else in this environment needs
+  #   a host-reachable port for a reason that is only about the test runner.
+  #
+  # WHY THIS SERVICE HAS NO depends_on
+  #   It must be able to start before the orchestrator - its own healthcheck is
+  #   the only thing gating the orchestrator's start (see orchestrator's
+  #   depends_on above) - and the one time it reaches the orchestrator at all
+  #   is when /dynamic or /recovers fetches a step's output through the read
+  #   API (SPEC.md 10.2), which happens well after both services are up.
+  #
+  # /dynamic         the real planner.
+  #                    history empty        -> continue, step_name "classify",
+  #                                             params {"mode":"classify"}
+  #                    history has 1 entry  -> GET {fetch_base_url}/steps/
+  #                                             {step_id}/output (SPEC.md 10.2)
+  #                                             for that entry's step_id, read
+  #                                             its classify verdict, and
+  #                                             continue with "extract-invoice"
+  #                                             or "extract-receipt"
+  #                                             accordingly. A fetch that fails,
+  #                                             or a reply we cannot make sense
+  #                                             of, becomes a visible "fail"
+  #                                             answer rather than a silent
+  #                                             wrong branch or a crash.
+  #                    history has 2+       -> done
+  #                  Every M1 call and every read-API fetch is counted (see
+  #                  /stats).
+  # /http500         always HTTP 500, plain text. SPEC.md 12.1 counts a non-2xx
+  #                  planner response as a planner failure; it burns
+  #                  planner_attempt_count (SPEC.md 12.2) exactly like an
+  #                  unreachable planner does.
+  # /slow            sleeps 5s, then answers as /dynamic would. Paired with a
+  #                  workflow whose planner_timeout_seconds is 1, so the
+  #                  orchestrator's own deadline is what actually fires first -
+  #                  this path exists to be too slow, not to be wrong.
+  # /garbage         always 200 {"status":"maybe"} - a status that is none of
+  #                  SPEC.md 9.3's three. A planner failure by SPEC.md 12.1,
+  #                  same as /http500, but for a different reason: the HTTP
+  #                  exchange succeeded and the JSON parsed; it is the DOMAIN
+  #                  value that is wrong.
+  # /badstep         always 200 continue, but the StepSpec carries an unknown
+  #                  top-level key (worker_ur1). SPEC.md 9.8 rule 6 makes an
+  #                  unknown key on a StepSpec invalid regardless of who wrote
+  #                  it - planner or operator - and SPEC.md 9.8 makes an
+  #                  invalid StepSpec a planner failure that consumes budget
+  #                  and never creates a step.
+  # /mixed           per run_id: the 1st call is /http500's reply, every call
+  #                  after that is /garbage's. SPEC.md 12.1 counts both as
+  #                  planner failures, so one run's planner-failure history can
+  #                  be two different KINDS of failure, not the same one
+  #                  repeated.
+  # /fail            always 200 {"status":"fail","reason":"..."}."fail" is a
+  #                  VALID answer (SPEC.md 9.3) - SPEC.md 12.1 is explicit that
+  #                  it is not a planner failure and consumes no budget; the
+  #                  run goes to DLQ on the strength of this one reply.
+  #                  planner_max_attempts is 3 on this fixture's workflow for
+  #                  that reason: nothing here should ever consume it, and a
+  #                  demo that shows the count still at 0 in DLQ is the point.
+  # /recovers        per run_id: the first 2 calls are /http500's reply, every
+  #                  call from the 3rd on behaves like /dynamic. Paired with a
+  #                  workflow whose planner_max_attempts is 2, a run under this
+  #                  path exhausts its budget (SPEC.md 12.2) and lands in the
+  #                  dead-letter queue before it ever reaches a call that would
+  #                  have succeeded - and a replay's fresh budget (its own
+  #                  planner_attempt_count starts again) lets the 3rd call
+  #                  happen and the run complete.
+  # /stats           {"calls": {run_id: n, ...}, "fetches": {run_id: n, ...}} -
+  #                  M1 calls received and read-API fetches performed, by
+  #                  run_id. Both counters are guarded by the same lock the
+  #                  handlers use, because the server is threaded.
+  #
+  # Every decision is logged to stdout with a "planner: " prefix, in worker's
+  # style, so `docker compose logs planner` shows the operator what it chose
+  # and why without needing the database.
+  planner:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json, threading, time, urllib.request
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        calls = {}
+        fetches = {}
+        lock = threading.Lock()
+
+        def record_call(run_id):
+            with lock:
+                calls[run_id] = calls.get(run_id, 0) + 1
+                return calls[run_id]
+
+        def record_fetch(run_id):
+            with lock:
+                fetches[run_id] = fetches.get(run_id, 0) + 1
+                return fetches[run_id]
+
+        def decide(run_id, history, fetch_base_url):
+            # SPEC.md 9.2: history is the catalogue of completed steps for
+            # this run, oldest first, DONE-only. This fixture never sees more
+            # than the two steps it dispatches, so length alone tells us where
+            # we are.
+            if len(history) == 0:
+                print("planner: run %s - no history yet, dispatching classify" %
+                      run_id, flush=True)
+                return {"status": "continue", "step": {
+                    "step_name": "classify",
+                    "worker_url": "http://worker:9090/work",
+                    "connection_mode": "sync",
+                    "dispatch_style": "envelope",
+                    "params": {"mode": "classify"},
+                    "input_from": []
+                }}
+
+            if len(history) == 1:
+                step_id = history[0].get("step_id")
+                url = fetch_base_url.rstrip("/") + "/steps/" + str(step_id) + "/output"
+                try:
+                    record_fetch(run_id)
+                    with urllib.request.urlopen(url, timeout=10) as resp:
+                        raw = resp.read()
+                    body = json.loads(raw)
+                except Exception as exc:
+                    print("planner: run %s - fetch of %s failed: %s" %
+                          (run_id, url, exc), flush=True)
+                    return {"status": "fail",
+                            "reason": "could not fetch the classify output: %s" % exc}
+
+                # SPEC.md 6.3: steps.output is the worker's WHOLE response
+                # body, verbatim - and SPEC.md 9.6's sync+envelope success
+                # shape wraps the worker's own output one level down, inside
+                # {"status":"success","output":{...}}. The classify verdict
+                # therefore sits at body["output"]["kind"], not body["kind"].
+                # Read defensively: a wrong shape must become a visible "fail"
+                # answer, never a silent wrong branch.
+                output = body.get("output") if isinstance(body, dict) else None
+                kind = output.get("kind") if isinstance(output, dict) else None
+
+                if kind == "invoice":
+                    print("planner: run %s - classify said invoice, "
+                          "dispatching extract-invoice" % run_id, flush=True)
+                    step_name, branch = "extract-invoice", "invoice"
+                elif kind == "receipt":
+                    print("planner: run %s - classify said receipt, "
+                          "dispatching extract-receipt" % run_id, flush=True)
+                    step_name, branch = "extract-receipt", "receipt"
+                else:
+                    print("planner: run %s - fetched output has no usable "
+                          "kind: %r" % (run_id, body), flush=True)
+                    return {"status": "fail",
+                            "reason": "could not fetch the classify output: "
+                                      "expected body.output.kind to be "
+                                      "\"invoice\" or \"receipt\", got %r" % (body,)}
+
+                return {"status": "continue", "step": {
+                    "step_name": step_name,
+                    "worker_url": "http://worker:9090/work",
+                    "connection_mode": "sync",
+                    "dispatch_style": "envelope",
+                    "params": {"mode": "echo", "branch": branch},
+                    "input_from": []
+                }}
+
+            print("planner: run %s - history has %d entries, done" %
+                  (run_id, len(history)), flush=True)
+            return {"status": "done"}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply_json(200, {"status": "ok"})
+                elif self.path == "/stats":
+                    with lock:
+                        self._reply_json(200, {"calls": dict(calls),
+                                               "fetches": dict(fetches)})
+                else:
+                    self._reply_json(404, {"error": "no such path: " + self.path})
+
+            def do_POST(self):
+                known = ("/dynamic", "/http500", "/slow", "/garbage",
+                         "/badstep", "/mixed", "/fail", "/recovers")
+                if self.path not in known:
+                    self._reply_json(404, {"error": "no such path: " + self.path})
+                    return
+
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    env = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply_json(400, {"error": "unparseable body: %s" % exc})
+                    return
+
+                run_id = env.get("run_id")
+                history = env.get("history") or []
+                fetch_base_url = env.get("fetch_base_url") or ""
+                n = record_call(run_id)
+
+                if self.path == "/dynamic":
+                    print("planner: run %s - /dynamic call %d, history has "
+                          "%d entries" % (run_id, n, len(history)), flush=True)
+                    self._reply_json(200, decide(run_id, history, fetch_base_url))
+                    return
+
+                if self.path == "/http500":
+                    print("planner: run %s - /http500 call %d, replying 500" %
+                          (run_id, n), flush=True)
+                    self._reply_text(500, "planner: deliberate 500\n")
+                    return
+
+                if self.path == "/slow":
+                    print("planner: run %s - /slow call %d, sleeping 5s "
+                          "before answering" % (run_id, n), flush=True)
+                    time.sleep(5)
+                    self._reply_json(200, decide(run_id, history, fetch_base_url))
+                    return
+
+                if self.path == "/garbage":
+                    print("planner: run %s - /garbage call %d, replying an "
+                          "unknown status" % (run_id, n), flush=True)
+                    self._reply_json(200, {"status": "maybe"})
+                    return
+
+                if self.path == "/badstep":
+                    print("planner: run %s - /badstep call %d, replying a "
+                          "StepSpec with an unknown top-level key" %
+                          (run_id, n), flush=True)
+                    self._reply_json(200, {
+                        "status": "continue",
+                        "step": {
+                            "step_name": "bad",
+                            "worker_url": "http://worker:9090/work",
+                            "connection_mode": "sync",
+                            "dispatch_style": "envelope",
+                            "params": {},
+                            "input_from": [],
+                            "worker_ur1": "typo"
+                        }
+                    })
+                    return
+
+                if self.path == "/mixed":
+                    if n == 1:
+                        print("planner: run %s - /mixed call %d, replying "
+                              "500" % (run_id, n), flush=True)
+                        self._reply_text(500,
+                            "planner: /mixed deliberate 500 on the first call\n")
+                    else:
+                        print("planner: run %s - /mixed call %d, replying an "
+                              "unknown status" % (run_id, n), flush=True)
+                        self._reply_json(200, {"status": "maybe"})
+                    return
+
+                if self.path == "/fail":
+                    print("planner: run %s - /fail call %d, replying a valid "
+                          "fail" % (run_id, n), flush=True)
+                    self._reply_json(200, {"status": "fail",
+                        "reason": "the planner cannot determine the next step "
+                                  "from this document"})
+                    return
+
+                if self.path == "/recovers":
+                    if n <= 2:
+                        print("planner: run %s - /recovers call %d, replying "
+                              "500" % (run_id, n), flush=True)
+                        self._reply_text(500,
+                            "planner: /recovers deliberate 500 (call %d of 2)\n" % n)
+                    else:
+                        print("planner: run %s - /recovers call %d, behaving "
+                              "like /dynamic" % (run_id, n), flush=True)
+                        self._reply_json(200, decide(run_id, history, fetch_base_url))
+                    return
+
+            def _reply_json(self, code, payload):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _reply_text(self, code, text):
+                raw = text.encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "text/plain")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("planner: " + (fmt % args), flush=True)
+
+        print("planner: listening on 0.0.0.0:9100", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9100), Handler).serve_forever()
+    ports:
+      - "9100:9100"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9100/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  pgdata:

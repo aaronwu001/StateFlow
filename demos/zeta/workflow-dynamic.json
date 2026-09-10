@@ -1,0 +1,11 @@
+{
+  "name": "zeta-dynamic",
+  "planner_type": "http",
+  "planner_url": "http://planner:9100/dynamic",
+  "fetch_base_url": "http://orchestrator:8080",
+  "step_timeout_seconds": 300,
+  "step_max_attempts": 3,
+  "step_retry_delay_seconds": 0,
+  "planner_timeout_seconds": 30,
+  "planner_max_attempts": 3
+}
