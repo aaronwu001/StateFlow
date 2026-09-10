@@ -587,7 +587,7 @@ event and cannot drift.
 | `status` | TEXT | no | `RUNNING` \| `DONE` \| `DLQ` \| `CANCELLED` |
 | `decision` | JSON bytes | no | The StepSpec exactly as the planner returned it |
 | `attempt_count` | INT | no | Budget consumed. **Not** the number of `attempts` rows |
-| `output` | JSON bytes | yes | Set when `status = 'DONE'`: the worker's whole response body, verbatim |
+| `output` | JSON bytes | yes | Set when `status = 'DONE'`: the worker's output as §9.6 defines it for this step's mode, verbatim |
 | `created_at` | TIMESTAMPTZ | no | |
 | `completed_at` | TIMESTAMPTZ | yes | Set exactly when `status` leaves `RUNNING` |
 
@@ -603,8 +603,14 @@ legitimately differ. §5.7 zeroes it on cancellation and §14 resets it on repla
 `attempts` rows in place — so a step may hold three attempt rows and an `attempt_count` of 0.
 Deriving it would make cancellation and replay consume budget as a side effect.
 
-**Why the whole response body is stored:** Piton does not shape outputs. Selecting a field out of a
-worker's response is the planner's job, not the engine's.
+**Piton does not shape outputs. Selecting a field out of a worker's RESULT is the planner's job, not
+the engine's** — and unwrapping Piton's own envelope is not that. §9.6 draws the line per mode: in
+envelope mode the result is the response's `output` field, and in raw mode it is the entire response
+body, because a raw worker was never told about Piton and its whole reply is all there is.
+**Why the envelope is unwrapped rather than stored whole:** `status` and `output` are Piton's
+protocol, not the worker's data. A stored envelope would hand the next worker Piton's own wrapper as
+its `inputs` (§9.5), and would make every planner that reads an output strip a layer this system put
+there — a shape the operator did not choose and cannot see from the StepSpec.
 
 ### 6.4 `attempts`
 
@@ -619,7 +625,7 @@ worker's response is the planner's job, not the engine's.
 | `connection_mode` | TEXT | no | `sync` \| `async`, copied from the StepSpec |
 | `deadline_at` | TIMESTAMPTZ | no | When this attempt may be declared failed |
 | `dispatched_by` | TEXT | no | The `orchestrator_id` that dispatched it |
-| `output` | JSON bytes | yes | On success, the worker's response body verbatim |
+| `output` | JSON bytes | yes | On success, the worker's output as §9.6 defines it for this attempt's mode, verbatim |
 | `failure_reason` | TEXT | yes | §5.3 |
 | `error_text` | TEXT | yes | Diagnostic text, truncated to 4 KB |
 | `started_at` | TIMESTAMPTZ | no | |
@@ -1197,6 +1203,16 @@ becoming a top-level key of the raw body. `raw` does not interpret payload conte
 | **sync + envelope** | Response body `{"status":"success","output":{ }}` | Response body `{"status":"failure","error":"…"}` |
 | **sync + raw** | Any 2xx. **The entire response body verbatim is the output** | Any non-2xx. The truncated body is stored as error text |
 | **async + envelope** | `POST /callbacks/{attempt_id}` with `{"attempt_id":"…","status":"success","output":{ }}` | The same, with `{"status":"failure","error":"…"}` |
+
+**What is stored as the step's output, per mode.** In **envelope** mode it is the response's
+`output` field alone; in **raw** mode it is the entire response body. This is the definition
+`steps.output` and `attempts.output` refer to (§6.3, §6.4), and it is stated here rather than left
+to be inferred from the word *entire* in the table above.
+**Why the two differ:** `status` and `output` are Piton's protocol, not the worker's data, so
+storing the envelope whole would keep this system's wrapper inside the user's result — where §9.5
+would then hand it to the next worker as `inputs`, and every planner reading an output would have to
+strip it. A raw worker was never told about Piton, so its whole reply is the result and there is
+nothing to unwrap.
 
 **A transport-level failure is always a failure regardless of body** — non-2xx, connection refused,
 timeout. A business-level failure and a transport-level failure burn one attempt alike.
