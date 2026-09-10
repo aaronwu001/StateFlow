@@ -295,8 +295,13 @@ dlq_leg() {
   show "SELECT attempt_no, status, failure_reason,
                left(coalesce(error_text, ''), 60) AS error_text_60
           FROM attempts WHERE run_id = :'run' ORDER BY attempt_no;"
-  show "SELECT reason, step_id, replay_round, attempt_count
+  show "SELECT reason, step_id, replay_round
           FROM dead_letter_queue WHERE run_id = :'run';"
+  say "SPEC.md 6.5: the entry no longer copies the budget consumed. How much"
+  say "this round burned is a count of the attempts carrying its replay_round,"
+  say "read from the table that owns the number rather than from a copy."
+  show "SELECT a.replay_round, count(*) AS attempts_in_that_round
+          FROM attempts a WHERE a.run_id = :'run' GROUP BY 1 ORDER BY 1;"
 
   say ""
   say "Assertions (SPEC.md 18.2):"
@@ -325,9 +330,12 @@ dlq_leg() {
         "SELECT reason = 'worker_budget_exhausted'
                 AND step_id = (SELECT step_id FROM steps WHERE run_id = :'run' AND seq = 1)
            FROM dead_letter_queue WHERE run_id = :'run';"
-  check "the entry records replay_round = 0 and attempt_count = ${MAX_ATTEMPTS} (SPEC.md 6.5)" \
-        "SELECT replay_round = 0 AND attempt_count = ${MAX_ATTEMPTS}
-           FROM dead_letter_queue WHERE run_id = :'run';"
+  check "the entry records replay_round = 0 (SPEC.md 6.5)" \
+        "SELECT replay_round = 0 FROM dead_letter_queue WHERE run_id = :'run';"
+  check "that round burned ${MAX_ATTEMPTS} attempts, counted from the rows that carry it (SPEC.md 6.4, 6.5)" \
+        "SELECT count(*) = ${MAX_ATTEMPTS}
+           FROM attempts a JOIN dead_letter_queue d ON d.step_id = a.step_id
+          WHERE d.run_id = :'run' AND a.replay_round = d.replay_round;"
   check "the entry explains itself (SPEC.md 17: the database explains itself)" \
         "SELECT length(error_text) > 0 FROM dead_letter_queue WHERE run_id = :'run';"
   return 0
