@@ -109,11 +109,17 @@ recovery designs in one system.
 | **Run** | One execution of a workflow, with its own input. The unit of history and the unit of ownership |
 | **Step** | One decided unit of work inside a run, at a fixed position `seq`. It carries the planner's decision and, when successful, the output |
 | **Attempt** | One execution of a step. A step may have several attempts; each attempt is one dispatch to a worker and one outcome |
+| **Planner call** | One question put to a run's planner and the answer — or the failure — that came back. A run may make several at one decision point. It is the planner-side counterpart of an attempt, and exists for the same reason: **the outcome of one exchange with something outside Piton is a fact, and a fact is a row** |
 | **StepSpec** | The document the planner returns describing a step to be created — a worker URL, how to talk to it, and what to send. Defined field by field in §9.4 |
 | **Dead-letter entry** | An append-only historical record that a run stopped because a budget was exhausted or the planner refused to continue |
 
 Containment: a workflow has many runs; a run has zero or more steps ordered by `seq`; a step has one
-or more attempts; a run has zero or more dead-letter entries.
+or more attempts; a run has zero or more planner calls; a run has zero or more dead-letter entries.
+
+**Why an attempt belongs to a step and a planner call belongs to a run:** a planner is asked *which
+step should exist next*, so at the moment of the question there is no step to own the answer (§6.2).
+The two are otherwise the same kind of object and are deliberately described in the same vocabulary
+— §5.8 gives a planner call the failure reasons §5.3 gives an attempt, with identical meanings.
 
 ### 3.3 Identity and ordering
 
@@ -122,6 +128,7 @@ or more attempts; a run has zero or more dead-letter entries.
 | `run_id` | UUID | Assigned at run creation. **Never changes**, including across replay rounds |
 | `step_id` | UUID | The identity of a step |
 | `attempt_id` | UUID | The identity of an attempt. Also the address of the async callback endpoint |
+| `planner_call_id` | UUID | The identity of a planner call. It addresses nothing — a planner call is always synchronous (§9.2), so no callback can arrive for one |
 | `orchestrator_id` | UUID | Generated fresh at each process boot. Stored as a plain string with no foreign key |
 | `seq` | integer | The position of a step within its run, starting at 1, contiguous and unique per run |
 
@@ -201,7 +208,13 @@ loop for one owned run:
 | `continue` | Insert a step at `seq = last + 1` with status `RUNNING`, storing the StepSpec verbatim; reset the planner budget; then dispatch (below) |
 | `done` | `run → DONE` |
 | `fail` | Planner-side dead-letter: write a dead-letter entry and `run → DLQ` (§12.3) |
-| the call itself failed | Increment `runs.planner_attempt_count`; if it has reached `planner_max_attempts`, planner-side dead-letter as above; otherwise the loop retries the call |
+| the call itself failed | Increment `runs.planner_attempt_count`; if it has reached `planner_max_attempts`, planner-side dead-letter as above; otherwise wait `planner_retry_delay_seconds` (§11.1) and retry the call |
+
+**Every one of those four rows also writes the call itself into `planner_calls` (§6.8), in the same
+transaction** — the first three as `DONE` with `answer` set to what the planner said, the fourth as
+`FAILED` with its `failure_reason` (§5.8). A decision that changed the run's state and an exchange
+that produced no answer are both facts about what happened, and neither may exist only in the
+memory of the process that saw it.
 
 **Dispatching** is: insert an `attempts` row with status `RUNNING` and
 `deadline_at = now() + step_timeout_seconds`, increment `steps.attempt_count`, **commit**, and only
@@ -408,6 +421,49 @@ dispatch.
 Cancelling the run afterwards does not change what the step did, and L8 exists precisely to record
 both truths at once.
 
+### 5.8 Planner call states
+
+| State | Meaning |
+|---|---|
+| `DONE` | The planner answered. `answer` records which of §9.3's three answers it gave |
+| `FAILED` | The call produced no usable answer, for one of the reasons below |
+
+**There is no `RUNNING` state, and the row is written once, at the outcome.**
+**Why this differs from an attempt:** an attempt's row must exist *before* the work does, because a
+callback needs somewhere to land and a deadline must exist for a later orchestrator to expire it
+(§4.2). Neither is true here. A planner call is synchronous (§9.2) and lives entirely inside the
+driver that made it, nothing outside that process can complete it, and no other orchestrator can
+resolve it. A row written first would be a row nothing could ever finish.
+**The consequence, stated rather than hidden:** a process that dies mid-call leaves no planner-call
+row and no budget increment. That is the same published non-guarantee as §13.2 item 4 — the run is
+reclaimed and the planner is asked again.
+
+`failure_reason` on a `FAILED` planner call is **one of the same three values §5.3 gives an
+attempt**, with identical meanings:
+
+| `failure_reason` | Meaning |
+|---|---|
+| `transport_error` | The HTTP exchange did not produce a usable reply **before the deadline** — non-2xx, connection refused, DNS failure, connection reset |
+| `invalid_response` | A reply arrived, but §9.3 or §9.8 rejects it: an unparseable body, a `status` that is not one of the three, `continue` without a `step`, or an invalid StepSpec |
+| `timeout` | **`planner_timeout_seconds` passed** before any answer arrived |
+
+**§5.3's clock rule applies here unchanged:** an exchange is `timeout` **only** if the deadline
+passed; a connection refused at second 3 of a 30-second budget is `transport_error`.
+
+The three values §5.3 has and this table does not are absent for reasons, not by omission:
+
+- **`worker_error`** — the planner's way of saying *"this cannot be done"* is the `fail` answer of
+  §9.3, which is a **successful call** (§12.1). Giving it a failure reason would contradict that.
+- **`orphaned`** — that label exists to say an attempt was expired by an orchestrator other than the
+  one that dispatched it (§5.3). A planner call is never expired by anybody: it ends inside the
+  process that made it, or it leaves no row at all.
+- **`cancelled`** — §5.7's cancel transaction terminates a `RUNNING` attempt, and there is no
+  `RUNNING` planner call for it to terminate.
+
+**Why one vocabulary rather than two:** the operator asking *"what is killing my runs?"* is asking
+one question, and an answer split across two enumerations with different words for the same event
+would make him ask it twice and then reconcile the answers himself.
+
 ---
 
 ## 6. Data Model
@@ -433,12 +489,13 @@ the Postgres implementation's choices; another backend may choose differently fo
 | `step_retry_delay_seconds` | INT | no | §11.1 |
 | `planner_timeout_seconds` | INT | no | §11.1 |
 | `planner_max_attempts` | INT | no | §11.1 |
+| `planner_retry_delay_seconds` | INT | no | §11.1 |
 | `created_at` | TIMESTAMPTZ | no | |
 
 Invariants: `planner_url` and `fetch_base_url` are both present iff `planner_type = 'http'`, and
 `planner_static_steps` is present iff `planner_type = 'static'` — the two sides are never mixed and
-never both absent; all five numeric configuration columns are ≥ 1 except
-`step_retry_delay_seconds`, which is ≥ 0 (§11.1).
+never both absent; all six numeric configuration columns are ≥ 1 except the two
+`*_retry_delay_seconds`, which are ≥ 0 (§11.1).
 
 **Why `fetch_base_url` is a column of the workflow rather than a value in the orchestrator's
 configuration file (§4.4):** it is one half of a pair. `planner_url` says where the orchestrator
@@ -479,7 +536,6 @@ every sweep. Validating at submission makes that state unreachable.
 | `input` | JSON bytes | no | The operator-supplied workflow input, stored verbatim |
 | `planner_attempt_count` | INT | no | Failed planner calls at the *current* decision point. Reset to 0 by any successful planner call |
 | `replay_count` | INT | no | Number of completed replay rounds. Starts at 0 |
-| `last_planner_error` | TEXT | yes | Error text of the most recent failed planner call |
 | `owner_id` | TEXT | yes | **Coordination metadata.** `NULL` means unclaimed. A plain string; no foreign key |
 | `claimed_at` | TIMESTAMPTZ | yes | **Coordination metadata.** When the current owner claimed it |
 | `created_at` | TIMESTAMPTZ | no | |
@@ -495,9 +551,20 @@ in-memory planner budget resets on every restart, so an orchestrator that crashe
 broken gets a fresh budget each time and the run never converges to DLQ — the exact failure §12.2
 rules out. This column is what makes that sentence true, and it is §1 applied to a budget.
 
-**Why the planner's failures are recorded on the run rather than in `attempts`:** an `attempts` row
-belongs to a step, and a planner failure happens where there is no step. `last_planner_error` keeps
-the diagnosis in the database (§17.3); the full verdict lands in the dead-letter entry (§12.4).
+**Why the planner's failures get a table of their own (§6.8) rather than rows in `attempts`:** an
+`attempts` row belongs to a step, and a planner failure happens where there is no step. What it must
+not do is live nowhere: an outcome that exists only in the memory of the process that saw it is
+invisible to the operator (§17) and gone at the next crash.
+**Why the run carries no `last_planner_error` column:** it would be a copy of the newest
+`planner_calls` row for the run, maintained by hand in every transaction that writes one — the class
+of mistake §8.2 rejects, where one forgotten write leaves a column silently lying. The query that
+replaces it is an index seek (§7.2).
+
+**Why `planner_attempt_count` remains a stored counter even though the calls now have rows:** it is
+read by the budget check on the path that decides whether to call the planner again (§12.2), and
+`COUNT`ing rows would make that decision depend on correctly excluding the calls of earlier decision
+points and earlier replay rounds. The counter states the answer directly, and §14 and §4.2 each move
+it for reasons of their own — a derived value could not be reset by either.
 
 **Why `replay_count` is a stored counter:** the owner must be able to see, at a terminal, which
 round a given attempt belonged to. The alternative — bucketing attempts by timestamp against
@@ -546,7 +613,8 @@ worker's response is the planner's job, not the engine's.
 | `attempt_id` | UUID | no | Primary key. Also the address of the callback endpoint |
 | `step_id` | UUID | no | Owning step |
 | `run_id` | UUID | no | Denormalised copy of the step's run |
-| `attempt_no` | INT | no | 1-based ordering within the step |
+| `attempt_no` | INT | no | 1-based ordering within the step, **contiguous across replay rounds** — it orders the step's whole history, not one round of it |
+| `replay_round` | INT | no | The value of `runs.replay_count` when this attempt was dispatched |
 | `status` | TEXT | no | `RUNNING` \| `DONE` \| `FAILED` |
 | `connection_mode` | TEXT | no | `sync` \| `async`, copied from the StepSpec |
 | `deadline_at` | TIMESTAMPTZ | no | When this attempt may be declared failed |
@@ -574,6 +642,18 @@ for the operator — §17 promises the database explains itself — and a reason
 is a contradiction that a later reader will trust. Both are cheap to make impossible and expensive
 to notice.
 
+**Why `replay_round` is on the attempt.** §14 leaves every earlier `attempts` row in place and
+resets the step's counter, so after one replay a step holds the rows of two rounds with nothing on
+them saying which round is which. Reconstructing it from timestamps against the dead-letter entries
+is possible and is exactly what §6.2 refuses elsewhere — *"reconstructable but not inspectable by
+eye"*. One small integer, written from `runs.replay_count` in the same transaction that inserts the
+row (§4.2), answers it directly.
+**What it makes unnecessary:** the dead-letter entry no longer needs to carry a copy of the budget
+consumed, because *"how much budget did round 0 burn"* becomes a count of this table (§6.5).
+**Why `attempt_no` stays contiguous instead of restarting each round:** it is the step's ordering,
+and an ordering that restarts is not one — a step would hold two rows numbered 1. `replay_round` is
+what separates the rounds; `attempt_no` is what orders them.
+
 **Why the attempt carries `output` as well as the step:** the only write a non-owner is permitted to
 make is to this table (§8.4). A successful async callback landing on a non-owner must be able to
 deposit the result somewhere; the owner promotes it to `steps.output` on its next poll.
@@ -597,27 +677,43 @@ an async attempt's callback can still arrive and must be honoured.
 | `dlq_id` | UUID | no | Primary key |
 | `run_id` | UUID | no | The run that stopped |
 | `step_id` | UUID | yes | The step that exhausted its budget; `NULL` for a planner-side entry |
-| `reason` | TEXT | no | One of the five values below |
+| `reason` | TEXT | no | One of the three values below |
 | `replay_round` | INT | no | The value of `runs.replay_count` when this entry was written |
-| `attempt_count` | INT | no | The budget consumed at the moment of the verdict — `steps.attempt_count` for a worker-side entry, `runs.planner_attempt_count` for a planner-side one |
 | `error_text` | TEXT | no | Why it stopped. Truncated to 4 KB, as in §6.4 |
 | `created_at` | TIMESTAMPTZ | no | |
 
 | `reason` | Side | Meaning |
 |---|---|---|
 | `worker_budget_exhausted` | worker | The step used `step_max_attempts` without succeeding |
-| `planner_unreachable` | planner | The planner could not be called: connection refused, timeout, non-2xx |
-| `planner_invalid_response` | planner | The planner replied with something §9.3 / §9.8 rejects |
-| `planner_budget_exhausted` | planner | `planner_max_attempts` reached. Set instead of the two above when the round's failures were not all of one kind |
-| `planner_declared_fail` | planner | The planner answered `fail`. **Not a failure** — a valid answer (§12.1) |
+| `planner_budget_exhausted` | planner | The run used `planner_max_attempts` at one decision point without obtaining a usable answer |
+| `planner_declared_fail` | planner | The planner answered `fail`. **Not a failure** — a valid answer, and the only entry here that costs no budget (§12.1) |
 
 `step_id IS NULL` already distinguishes the two sides, so no separate column records it.
 
-**Why `reason` is an enumerated column rather than free text inside `error_text`:** the three planner
-causes call for three different responses from the operator — fix the network, fix the planner, or
-accept the planner's judgement — and only a column lets him ask which one his runs are dying of.
-`dead_letter_queue` is append-only (§6.7), so a column added after rows exist is permanently blank
-for the history that mattered most; by the §3 admission test this had to be settled now.
+**`reason` says which of three situations stopped the run. It does not say why any individual
+exchange failed** — that is on the row of the exchange itself: `attempts.failure_reason` (§5.3) for
+the worker side, `planner_calls.failure_reason` (§5.8) for the planner side, both drawn from one
+vocabulary.
+**Why it was cut down to three from a longer enumeration:** the earlier form gave the planner side
+one value per kind of failure, which forced the entry to summarise a set of failures with a single
+word — and made a rule necessary for what to call a set containing more than one kind. That rule
+could not be honoured from stored state, because no column recorded the kind of each call; the
+implementation had to remember them for the length of a decision point, and a crash lost them.
+Giving each call a row (§6.8) removes the summary and the rule together: the operator asks the
+question of the rows, where the answer is a fact rather than a reconstruction, and gets a finer
+answer than the enumeration could ever have given — *"how many of my runs died of timeouts"* rather
+than *"how many died on the planner side"*.
+**Why the entry no longer records the budget consumed:** it used to be the only surviving record of
+`steps.attempt_count` before §14 reset it. `replay_round` on every attempt and every planner call
+now carries that history on the rows themselves, so the number is a count rather than a copy — and a
+copy of a counter is one more thing that can disagree with the rows it summarises.
+
+**Why `reason` is an enumerated column rather than free text inside `error_text`:** the three
+situations call for three different responses from the operator — the worker is broken, the planner
+is broken, or the planner has made a judgement to be accepted — and only a column lets him ask which
+one his runs are dying of. `dead_letter_queue` is append-only (§6.7), so a column added after rows
+exist is permanently blank for the history that mattered most; by the §3 admission test this had to
+be settled now.
 
 ### 6.6 `orchestrators`
 
@@ -636,12 +732,62 @@ performance concern.
 | Table | Discipline |
 |---|---|
 | `workflows`, `runs`, `steps`, `attempts`, `orchestrators` | **Current state.** One row per entity, mutated in place |
-| `dead_letter_queue` | **Append-only history.** A row is never updated or deleted, and one run may accumulate many rows across replay rounds |
+| `dead_letter_queue`, `planner_calls` | **Append-only history.** A row is never updated or deleted, and one run may accumulate many rows across replay rounds |
 
 **Why:** these are two different questions — *"what is true now?"* and *"what happened?"* — and the
 previous project's confusion came from asking the second question of a table that only answered the
 first. Replay acts on the run's current state; the dead-letter entries are the record of the rounds
 that came before.
+
+### 6.8 `planner_calls`
+
+One row per question put to a run's planner (§3.2), written once at the outcome (§5.8). It is to a
+planner call what `attempts` is to a step's dispatch.
+
+| Column | Type | Null | Meaning |
+|---|---|---|---|
+| `planner_call_id` | UUID | no | Primary key |
+| `run_id` | UUID | no | The run whose planner was asked |
+| `call_no` | INT | no | 1-based ordering within the run, **contiguous across decision points and replay rounds** — it orders the run's whole conversation with its planner |
+| `replay_round` | INT | no | The value of `runs.replay_count` when the call was made |
+| `status` | TEXT | no | `DONE` \| `FAILED` (§5.8). There is no `RUNNING` |
+| `answer` | TEXT | yes | On success, which of §9.3's three answers came back: `continue` \| `done` \| `fail` |
+| `failure_reason` | TEXT | yes | §5.8 |
+| `error_text` | TEXT | yes | Diagnostic text, truncated to 4 KB, as in §6.4 |
+| `called_by` | TEXT | no | The `orchestrator_id` that made the call |
+| `started_at` | TIMESTAMPTZ | no | |
+| `finished_at` | TIMESTAMPTZ | no | Never `NULL`: the row is written at the outcome |
+
+Invariants, enforced by the backend rather than by the caller, mirroring §6.4's:
+
+1. `status = 'FAILED'` **⇒ `failure_reason` is present and `answer` is absent.**
+2. `status = 'DONE'` **⇒ `answer` is present and `failure_reason` is absent.**
+3. `error_text` is present whenever `status = 'FAILED'`, and whenever `answer = 'fail'` — a planner
+   that refuses must say why, and §9.3 makes `reason` part of that answer.
+
+**Why the row does not store the planner's response body.** The useful part of a `continue` is the
+StepSpec, and §6.3 already stores it verbatim on the step that call created; `done` carries nothing;
+a `fail` answer's reason is diagnostic text and belongs in `error_text`. Keeping a second copy of
+the StepSpec here would grow an append-only table with data it does not own, and two copies of one
+document can disagree.
+
+**Why there is no `step_id`.** The call is asked *before* the step exists — that is what makes it a
+planner call rather than an attempt. Linking the two afterwards would mean writing the step's
+identity back onto a row this document has just called append-only.
+
+**Why `call_no` is contiguous across decision points rather than restarting at each one:** it is the
+run's ordering of its own conversation, and an ordering that restarts is not one. `replay_round`
+separates the rounds; the decision point a call belonged to is visible in the steps that existed
+when it was made.
+
+**How many rows this can accumulate:** at most `planner_max_attempts` per decision point, and one
+decision point per step plus one final `done`. It is bounded by the run's own length, and §12.2's
+argument makes that length finite.
+
+**Why this table exists at all, in one sentence:** the outcome of an exchange with something outside
+Piton is a fact about what happened, §17.1 makes database truth the interface, and a fact that lives
+only in the memory of the process that observed it is invisible to the operator and lost at the next
+crash.
 
 ---
 
@@ -672,6 +818,7 @@ document depends on each of them.
 | `steps(run_id, seq)` unique | Deriving `last_step` (§5.4); assigning the next `seq` |
 | `attempts(step_id, attempt_no)` unique | Resolving the outstanding attempt (§4.2) |
 | `attempts(deadline_at)`, **partial: `WHERE status = 'RUNNING'`** | Expiring overdue attempts |
+| `planner_calls(run_id, call_no)` unique | Ordering a run's planner conversation (§6.8); assigning the next `call_no`; reading the newest call in place of the column §6.2 removed |
 | `dead_letter_queue(run_id, created_at)` | `GET /runs/{run_id}/dlq` |
 
 **Why the partial index on running runs is called out:** it is what makes the sweep's cost
@@ -1206,6 +1353,7 @@ has already done.
 | `step_retry_delay_seconds` | 0 | ≥ 0 | Wait between a failure verdict and the next attempt |
 | `planner_timeout_seconds` | 30 | ≥ 1 | Upper bound on one planner call |
 | `planner_max_attempts` | 3 | ≥ 1 | **Total** planner call attempts at one decision point before the run goes to DLQ |
+| `planner_retry_delay_seconds` | 0 | ≥ 0 | Wait between a failed planner call and the next one at the same decision point |
 
 **`step_max_attempts` is a total attempt count, not a retry count.** `step_max_attempts = 1` means
 one dispatch and no retry.
@@ -1218,16 +1366,26 @@ hard-coded 30-second value, and nobody could tell which governed what. The symme
 never executed has no useful semantics — and it follows §16's principle of deciding at submission
 time what can be decided at submission time.
 
-`step_retry_delay_seconds` is enforced in memory by the driver. It is **not** a guarantee across a
-crash: if the process dies during the wait, the next owner re-dispatches as soon as it claims the
-run, and the remainder of the delay is discarded.
-**Why this is acceptable:** the delay is a courtesy to the worker, not a correctness property, and
-per §1 an in-memory mechanism may never be load-bearing. The default is 0, so nothing in the early
-milestones depends on it.
+**The two families are symmetric on purpose, and the symmetry is now complete:** each names an upper
+bound on one exchange, a total number of exchanges, and a wait between them. The governing actor is
+visible in the prefix, and neither family may be collapsed into the other — a sensible upper bound
+for one call to an LLM planner and a sensible upper bound for one OCR job are not the same number,
+and a single setting would force the operator to pick the larger and lose the smaller.
+
+Both `*_retry_delay_seconds` fields are enforced in memory by the driver. Neither is **a guarantee
+across a crash**: if the process dies during the wait, the next owner proceeds as soon as it claims
+the run, and the remainder of the delay is discarded.
+**Why this is acceptable:** the delay is a courtesy to the worker or the planner, not a correctness
+property, and per §1 an in-memory mechanism may never be load-bearing. What makes a run converge is
+the budget (§12.2), never the wait. Both defaults are 0, so nothing in the early milestones depends
+on either.
 **The cost, stated plainly:** if the delay existed because a worker was rate-limiting, a crash
 removes the backoff exactly when the worker can least afford it. The remedy, should it ever be
 needed, is a `steps.next_attempt_at` column — a nullable addition where `NULL` means "dispatchable
 now", so it can be introduced later with no backfill and no change of meaning to any existing row.
+**A hard-coded pause is not a substitute for either field.** An implementation that waits a fixed
+interval of its own between planner calls has invented a value the operator cannot see, cannot
+change, and will not find in this document.
 
 ### 11.2 Layering
 
@@ -1259,10 +1417,14 @@ of an operator reading the schema.
 For a **worker attempt**: any of the `failure_reason` values in §5.3. Business failure, transport
 failure, unparseable response and timeout are all failures and all burn one attempt.
 
-For a **planner call**: an unreachable planner, a timeout, a non-2xx response, an unparseable body,
-a `status` that is not one of the three, or an invalid StepSpec (§9.8). A `fail` response is **not**
-a planner failure — it is a valid answer, and it sends the run to DLQ immediately without consuming
-budget.
+For a **planner call**: any of the `failure_reason` values in §5.8 — `transport_error` (an
+unreachable planner, a connection refused, a non-2xx response), `timeout`, or `invalid_response` (an
+unparseable body, a `status` that is not one of the three, `continue` without a `step`, or an invalid
+StepSpec, §9.8). Each is written as a `FAILED` row in `planner_calls` (§6.8) and burns one call of
+the budget.
+
+A `fail` response is **not** a planner failure — it is a valid answer. It is written as a `DONE` row
+whose `answer` is `fail`, and it sends the run to DLQ immediately without consuming budget.
 
 **These rules apply to every planner, including the built-in static one, with no exemption.** The
 static planner simply cannot fail at run time: §6.1 validates its steps at submission, and it holds
@@ -1277,7 +1439,8 @@ that branch will outlive the reason for it.
 step:    attempt dispatched → steps.attempt_count += 1     (§4.2, at dispatch, not at the outcome)
          attempt fails      → attempt_count < step_max_attempts ? dispatch again
                                                                 : step → DLQ, run → DLQ
-planner: call fails         → runs.planner_attempt_count += 1
+planner: call fails         → write the FAILED planner_calls row (§6.8)
+                            → runs.planner_attempt_count += 1        (same transaction)
                             → count < planner_max_attempts ? call again : run → DLQ
 ```
 
@@ -1289,9 +1452,15 @@ planner: call fails         → runs.planner_attempt_count += 1
 it, and every in-flight step converges monotonically towards DLQ. A crash loop cannot spin forever;
 it burns budget on each pass and stops.
 
-The two counters are incremented at different moments, and the asymmetry is not an oversight: a
-worker attempt has a dispatch to hang the increment on, and a planner call does not — there is no
-row and no step, so the failure itself is the only event there is (§6.2).
+The two counters are incremented at different moments, and the asymmetry is not an oversight. A
+worker attempt has a **dispatch** to hang the increment on, and its row must exist before the work
+does (§4.2). A planner call has no such moment: §5.8 writes its row at the outcome, because a row
+written first is one that no other process could ever resolve. So the failure itself is the only
+event there is, and the increment and the row are written together.
+**What this costs, stated rather than hidden:** a process that dies mid-call burns nothing and
+records nothing, and the run is asked again after it is reclaimed — the published non-guarantee of
+§13.2 item 4. Convergence is unaffected: every *completed* failure burns budget, and a planner that
+is broken rather than unlucky produces completed failures.
 
 ### 12.3 Worker-side versus planner-side DLQ
 
@@ -1299,7 +1468,8 @@ row and no step, so the failure itself is the only event there is (§6.2).
 |---|---|---|
 | Cause | A step exhausted `step_max_attempts` | The planner answered `fail`, or exhausted `planner_max_attempts` |
 | Combination reached | **L4** — `run=DLQ, last_step=DLQ` | **L5** — `run=DLQ, last_step=DONE` |
-| `dead_letter_queue.reason` | `worker_budget_exhausted` | One of the four `planner_*` values (§6.5) |
+| `dead_letter_queue.reason` | `worker_budget_exhausted` | `planner_budget_exhausted`, or `planner_declared_fail` when the planner answered `fail` (§6.5) |
+| Where the individual failures are recorded | `attempts` rows, each with its own `failure_reason` (§5.3) | `planner_calls` rows, each with its own `failure_reason` (§5.8) |
 | `dead_letter_queue.step_id` | The failed step | `NULL` |
 | What replay resumes | Re-dispatching that step | Asking the planner again |
 
@@ -1309,13 +1479,15 @@ replay targets the run (§14).
 
 ### 12.4 What a dead-letter entry records
 
-`run_id`, `step_id` (or `NULL`), `reason`, `replay_round`, `attempt_count`, `error_text`,
-`created_at` — see §6.5. It is written once and never modified. A run accumulates one entry per
-round it lands in DLQ.
+`run_id`, `step_id` (or `NULL`), `reason`, `replay_round`, `error_text`, `created_at` — see §6.5. It
+is written once and never modified. A run accumulates one entry per replay round in which it lands
+in DLQ.
 
-`error_text` records the **most recent** failure, not every failure of the round. The per-attempt
-history is already in `attempts` for a worker-side entry, and in `runs.last_planner_error` for a
-planner-side one; duplicating it here would make an append-only table grow with data it does not own.
+`error_text` records the **most recent** failure, not every failure that led to the entry. The full
+history is already on the rows of the exchanges themselves — `attempts` for a worker-side entry
+(§6.4), `planner_calls` for a planner-side one (§6.8) — and both carry `replay_round`, so the
+failures behind any entry are the rows of that run, that step or that planner, bearing that same
+round. Copying them here would make an append-only table grow with data it does not own.
 
 ---
 
@@ -1403,9 +1575,19 @@ step 1 and round 2 fails at step 2, replay resumes from step 2 and never revisit
 **Why it is accepted:** it is unambiguous, and it means "round 2 fails earlier than round 1" cannot
 arise, so no frontier truncation is needed. This is a scope decision, not a principle.
 
-**Every replay round must leave an inspectable record.** `runs.replay_count` and
-`dead_letter_queue.replay_round` together let the operator see, from a terminal, which round any
-given entry belonged to.
+**Every replay round must leave an inspectable record.** `runs.replay_count` says which round the
+run is in now; `dead_letter_queue.replay_round` (§6.5), `attempts.replay_round` (§6.4) and
+`planner_calls.replay_round` (§6.8) each say which round that row belonged to. Together they let the
+operator see, from a terminal and without arithmetic on timestamps, what happened in each round.
+
+Because `replay_count` is incremented **first**, inside the same transaction, every attempt
+dispatched and every planner call made afterwards carries the new number. The rows of the round that
+failed keep the old one, unchanged — §6.7 makes both tables append-only history, and §14 rewrites no
+history.
+**What this replaces:** the dead-letter entry used to carry a copy of the budget consumed, because
+resetting `steps.attempt_count` and `runs.planner_attempt_count` destroyed the only record of it.
+Now the record is the rows themselves: how much budget round *n* burned is how many of that step's
+attempts, or that run's failed planner calls, carry `replay_round = n`.
 
 ---
 
@@ -1460,7 +1642,7 @@ produces dead-letter entries and wastes triage.
 4. Any unknown key. A silently ignored `retrylimit` makes the user believe a setting took effect.
 5. Any configuration field of the wrong JSON type — `"3"` is not `3`, and must not be coerced.
 6. Any `*_max_attempts` below 1, or any `*_timeout_seconds` below 1, or a negative
-   `step_retry_delay_seconds` (§11.1).
+   `*_retry_delay_seconds` (§11.1).
 
 `POST /workflows/{id}/runs` returns 400 for a non-empty `overrides` (§11.2), a missing `input`, or
 an unknown key. `overrides` may be `{}`, `null`, or omitted; all three mean "no overrides".
@@ -1480,8 +1662,10 @@ terminal.** There is no UI. Anything whose state is visible only through the aut
 has failed this requirement.
 
 1. **Database truth is the interface.** Every fact that matters is a row: the run's status, each
-   step's decision and output, each attempt's deadline, failure reason and error text, each
-   dead-letter entry, each orchestrator's last heartbeat.
+   step's decision and output, each attempt's deadline, failure reason and error text, **each
+   planner call's answer or failure reason (§6.8)**, each dead-letter entry, each orchestrator's
+   last heartbeat. Every one of those rows that belongs to a round of a replayed run says which
+   round it belonged to, so the operator never has to date them against each other.
 2. **The read API (§10.2) is the second interface**, and it is the same one the planner uses.
 3. **Error text is kept in the database**, not only in logs. Standard output stays minimal.
 4. **Automated tests exist to guarantee that what the owner saw by hand stays true.** A green suite
@@ -1631,15 +1815,17 @@ SELECT status, owner_id, claimed_at FROM runs WHERE run_id = :run;
 SELECT status, attempt_count FROM steps WHERE run_id = :run ORDER BY seq;
 -- the failing step DLQ with attempt_count = 3;  no step created after it
 
-SELECT attempt_no, status, failure_reason FROM attempts
+SELECT attempt_no, replay_round, status, failure_reason FROM attempts
  WHERE run_id = :run ORDER BY attempt_no;
--- three rows, all FAILED, all carrying the leg's reason:
+-- three rows, all replay_round = 0, all FAILED, all carrying the leg's reason:
 --   leg 2  worker_error       leg 3  transport_error       leg 4  transport_error
 
-SELECT reason, step_id, replay_round, attempt_count FROM dead_letter_queue
- WHERE run_id = :run;
+SELECT reason, step_id, replay_round FROM dead_letter_queue WHERE run_id = :run;
 -- exactly one row: worker_budget_exhausted, step_id = the failing step,
--- replay_round = 0, attempt_count = 3   (§6.5, §12.4)
+-- replay_round = 0   (§6.5, §12.4)
+--
+-- How much budget that round burned is a count of the rows above, not a column
+-- here: three attempts of this step carrying replay_round = 0 (§6.4, §6.5)
 ```
 
 Leg 4 is where §5.3's clock rule is visible: the connection is refused immediately, well inside
@@ -1885,10 +2071,13 @@ nothing.
 | Owner / ownership | §4.3 |
 | `params` | §9.4 |
 | Planner | §3.1 |
+| Planner call | §3.2, §5.8, §6.8 |
+| `planner_call_id` | §3.3 |
 | Planner-side DLQ | §12.3 |
 | Raw (dispatch style) | §9.5 |
 | Release | §8.7 |
 | Replay | §14 |
+| `replay_round` (on a row) | §6.4, §6.5, §6.8, §14 |
 | Run | §3.2 |
 | `run_id` | §3.3 |
 | `seq` | §3.3 |
