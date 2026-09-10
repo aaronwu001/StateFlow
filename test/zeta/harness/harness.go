@@ -267,7 +267,7 @@ const StepDigest = `SELECT s.status || '|' || s.attempt_count || '|' || coalesce
 // DLQDigest covers only the dead-letter history of a run, for the assertions
 // that are about SPEC.md 6.7's append-only rule alone.
 const DLQDigest = `SELECT coalesce(md5(string_agg(d.dlq_id::text || ':' || d.reason || ':' ||
-                                                  d.replay_round || ':' || d.attempt_count || ':' ||
+                                                  d.replay_round || ':' ||
                                                   md5(d.error_text) || ':' ||
                                                   coalesce(d.step_id::text, 'NULL') || ':' ||
                                                   d.created_at::text,

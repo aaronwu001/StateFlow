@@ -133,10 +133,16 @@ func insertAttempt(ctx context.Context, tx *sql.Tx, in storage.BeginAttemptInput
 	}
 
 	d := &storage.Dispatch{StepID: in.StepID, AttemptID: model.NewID(), AttemptNo: attemptNo}
+	// SPEC.md 6.4: replay_round is "the value of runs.replay_count when this
+	// attempt was dispatched". It is read from the run inside this transaction
+	// rather than passed in, so it cannot be a number the caller read before
+	// SPEC.md 14 changed it.
 	const q = `
-INSERT INTO attempts (attempt_id, step_id, run_id, attempt_no, status, connection_mode,
-                      deadline_at, dispatched_by)
-VALUES ($1, $2, $3, $4, 'RUNNING', $5, now() + make_interval(secs => $6), $7)
+INSERT INTO attempts (attempt_id, step_id, run_id, attempt_no, replay_round, status,
+                      connection_mode, deadline_at, dispatched_by)
+SELECT $1, $2, $3, $4, r.replay_count, 'RUNNING', $5,
+       now() + make_interval(secs => $6), $7
+  FROM runs r WHERE r.run_id = $3
 RETURNING deadline_at;`
 	if err := tx.QueryRowContext(ctx, q,
 		d.AttemptID, in.StepID, in.RunID, attemptNo, in.ConnectionMode,
@@ -180,10 +186,17 @@ VALUES ($1, $2, $3, $4, 'RUNNING', $5, 0);`
 			return fmt.Errorf("postgres: cannot create the step: %w", err)
 		}
 
+		// SPEC.md 4.2: "every one of those four rows also writes the call
+		// itself into planner_calls, in the same transaction". This one is the
+		// `continue` that produced the step above.
+		if err := insertPlannerCall(ctx, tx, in.RunID, orchestratorID, in.Call); err != nil {
+			return err
+		}
+
 		// SPEC.md 6.2: planner_attempt_count is "reset to 0 by any successful
 		// planner call". This transaction is the record of one.
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE runs SET planner_attempt_count = 0, last_planner_error = NULL WHERE run_id = $1;`,
+			`UPDATE runs SET planner_attempt_count = 0 WHERE run_id = $1;`,
 			in.RunID); err != nil {
 			return fmt.Errorf("postgres: cannot reset the planner budget: %w", err)
 		}
@@ -238,10 +251,18 @@ func (s *Store) BeginAttempt(ctx context.Context, orchestratorID string, in stor
 // status change, the invariant cannot be violated even for an instant" — and
 // what it buys: the driver's next fence on this run returns zero rows and it
 // stops silently, exactly as SPEC.md 4.2 step 1 prescribes.
-func (s *Store) CompleteRun(ctx context.Context, orchestratorID, runID string) error {
+func (s *Store) CompleteRun(ctx context.Context, orchestratorID, runID string, call storage.PlannerCallRecord) error {
 	return s.withFence(ctx, orchestratorID, runID, func(tx *sql.Tx) error {
+		// SPEC.md 4.2: the `done` that ended the run is a call like any other,
+		// and lands in the same transaction as its effect (SPEC.md 6.8).
+		if err := insertPlannerCall(ctx, tx, runID, orchestratorID, call); err != nil {
+			return err
+		}
+		// SPEC.md 6.2: any successful planner call resets the budget, and this
+		// is one. The run is terminal either way; the column is left honest
+		// rather than left holding the last failure's count.
 		res, err := tx.ExecContext(ctx, `
-UPDATE runs SET status = 'DONE', owner_id = NULL, claimed_at = NULL
+UPDATE runs SET status = 'DONE', planner_attempt_count = 0, owner_id = NULL, claimed_at = NULL
 WHERE run_id = $1 AND owner_id = $2 AND status = 'RUNNING';`, runID, orchestratorID)
 		if err != nil {
 			return fmt.Errorf("postgres: cannot complete the run: %w", err)
@@ -355,14 +376,16 @@ WHERE step_id = $1 AND run_id = $2 AND status = 'RUNNING';`, in.StepID, in.RunID
 			return err
 		}
 
-		// SPEC.md 6.5: attempt_count is "the budget consumed at the moment of
-		// the verdict — steps.attempt_count for a worker-side entry", and
-		// replay_round is "the value of runs.replay_count when this entry was
-		// written". Both are read inside this transaction rather than passed
-		// in, so the entry cannot record a number that was already stale.
+		// SPEC.md 6.5: replay_round is "the value of runs.replay_count when
+		// this entry was written", read inside this transaction rather than
+		// passed in, so the entry cannot record a number that was already
+		// stale. The budget consumed is deliberately NOT copied here — it is a
+		// count of the attempts carrying that replay_round (SPEC.md 6.4), and
+		// "a copy of a counter is one more thing that can disagree with the
+		// rows it summarises".
 		const insertEntry = `
-INSERT INTO dead_letter_queue (dlq_id, run_id, step_id, reason, replay_round, attempt_count, error_text)
-SELECT $1, r.run_id, s.step_id, 'worker_budget_exhausted', r.replay_count, s.attempt_count, $4::text
+INSERT INTO dead_letter_queue (dlq_id, run_id, step_id, reason, replay_round, error_text)
+SELECT $1, r.run_id, s.step_id, 'worker_budget_exhausted', r.replay_count, $4::text
   FROM runs r JOIN steps s ON s.step_id = $3
  WHERE r.run_id = $2;`
 		if _, err := tx.ExecContext(ctx, insertEntry,
@@ -396,7 +419,14 @@ WHERE run_id = $1 AND owner_id = $2 AND status = 'RUNNING';`, in.RunID, orchestr
 func (s *Store) RecordPlannerFailure(ctx context.Context, orchestratorID string, in storage.PlannerFailureInput) (bool, error) {
 	deadLettered := false
 	err := s.withFence(ctx, orchestratorID, in.RunID, func(tx *sql.Tx) error {
-		errText := model.TruncateError(in.ErrorText)
+		errText := model.TruncateError(in.Call.ErrorText)
+
+		// SPEC.md 12.2: "write the FAILED planner_calls row →
+		// runs.planner_attempt_count += 1 (same transaction)". The row is the
+		// record of what happened; the counter is what makes the run converge.
+		if err := insertPlannerCall(ctx, tx, in.RunID, orchestratorID, in.Call); err != nil {
+			return err
+		}
 
 		var budget int
 		if err := tx.QueryRowContext(ctx, `
@@ -407,10 +437,10 @@ SELECT w.planner_max_attempts FROM runs r JOIN workflows w ON w.workflow_id = r.
 
 		var count int
 		if err := tx.QueryRowContext(ctx, `
-UPDATE runs SET planner_attempt_count = planner_attempt_count + 1, last_planner_error = $2::text
-WHERE run_id = $1 AND owner_id = $3 AND status = 'RUNNING'
+UPDATE runs SET planner_attempt_count = planner_attempt_count + 1
+WHERE run_id = $1 AND owner_id = $2 AND status = 'RUNNING'
 RETURNING planner_attempt_count;`,
-			in.RunID, errText, orchestratorID).Scan(&count); err != nil {
+			in.RunID, orchestratorID).Scan(&count); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return storage.ErrNotOwner
 			}
@@ -420,14 +450,15 @@ RETURNING planner_attempt_count;`,
 			return nil
 		}
 
-		// SPEC.md 6.5: for a planner-side entry step_id is NULL and
-		// attempt_count is runs.planner_attempt_count.
+		// SPEC.md 6.5: for a planner-side entry step_id is NULL, and there is
+		// no reason to choose — a budget that ran out has exactly one, because
+		// the KIND of each failure is on the call's own row (SPEC.md 6.8).
 		const insertEntry = `
-INSERT INTO dead_letter_queue (dlq_id, run_id, step_id, reason, replay_round, attempt_count, error_text)
-SELECT $1, r.run_id, NULL, $3::text, r.replay_count, r.planner_attempt_count, $4::text
+INSERT INTO dead_letter_queue (dlq_id, run_id, step_id, reason, replay_round, error_text)
+SELECT $1, r.run_id, NULL, 'planner_budget_exhausted', r.replay_count, $3::text
   FROM runs r WHERE r.run_id = $2;`
 		if _, err := tx.ExecContext(ctx, insertEntry,
-			model.NewID(), in.RunID, in.Reason, errText); err != nil {
+			model.NewID(), in.RunID, errText); err != nil {
 			return fmt.Errorf("postgres: cannot write the dead-letter entry: %w", err)
 		}
 
@@ -461,4 +492,87 @@ func requireOneRow(res sql.Result, zeroRows error) error {
 		return zeroRows
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// The planner call (SPEC.md 6.8)
+// ---------------------------------------------------------------------------
+
+// insertPlannerCall writes one row of SPEC.md 6.8 inside the caller's
+// transaction, which is the whole point of it being a helper rather than a
+// method: SPEC.md 4.2 requires the call and the effect it produced to land
+// together, so there is no path here that opens a transaction of its own.
+//
+// call_no and replay_round are read from the database rather than passed in.
+// SPEC.md 6.8 makes call_no the run's own ordering, "contiguous across decision
+// points and replay rounds", which only one writer may assign; and replay_round
+// is "the value of runs.replay_count when the call was made", which SPEC.md 14
+// can have changed since the caller last looked at the run.
+//
+// SPEC.md 5.8: there is no RUNNING row and no update. The row is written once,
+// at the outcome, because "a row written first would be a row nothing could
+// ever finish".
+func insertPlannerCall(ctx context.Context, tx *sql.Tx, runID, orchestratorID string,
+	call storage.PlannerCallRecord) error {
+
+	status := model.PlannerCallDone
+	if call.Failed() {
+		status = model.PlannerCallFailed
+	}
+
+	const q = `
+INSERT INTO planner_calls (planner_call_id, run_id, call_no, replay_round, status,
+                           answer, failure_reason, error_text, called_by,
+                           started_at, finished_at)
+SELECT $1, r.run_id,
+       coalesce((SELECT max(c.call_no) FROM planner_calls c WHERE c.run_id = r.run_id), 0) + 1,
+       r.replay_count, $3::text, $4::text, $5::text, $6::text, $7::text, $8, $9
+  FROM runs r WHERE r.run_id = $2;`
+	if _, err := tx.ExecContext(ctx, q,
+		model.NewID(), runID, status,
+		nullString(call.Answer), nullString(call.FailureReason),
+		nullString(model.TruncateError(call.ErrorText)),
+		orchestratorID, call.StartedAt, call.FinishedAt,
+	); err != nil {
+		return fmt.Errorf("postgres: cannot record the planner call: %w", err)
+	}
+	return nil
+}
+
+// DeadLetterPlannerFail is SPEC.md 9.3's `fail` answer, which SPEC.md 12.1 is
+// emphatic is not a failure: "it is a valid answer, and it sends the run to DLQ
+// immediately without consuming budget".
+//
+// So this transaction writes a DONE call whose answer is fail, the dead-letter
+// entry and run → DLQ, and touches planner_attempt_count nowhere. A run that
+// stopped this way reads 0 there, and that zero is the difference between a
+// planner that broke and a planner that decided.
+func (s *Store) DeadLetterPlannerFail(ctx context.Context, orchestratorID string,
+	in storage.PlannerDeclaredFailInput) error {
+
+	return s.withFence(ctx, orchestratorID, in.RunID, func(tx *sql.Tx) error {
+		if err := insertPlannerCall(ctx, tx, in.RunID, orchestratorID, in.Call); err != nil {
+			return err
+		}
+
+		// SPEC.md 6.5: a planner-side entry names no step. SPEC.md 12.4: the
+		// entry says why the run stopped, which here is the planner's own
+		// `reason` (SPEC.md 9.3).
+		const insertEntry = `
+INSERT INTO dead_letter_queue (dlq_id, run_id, step_id, reason, replay_round, error_text)
+SELECT $1, r.run_id, NULL, 'planner_declared_fail', r.replay_count, $3::text
+  FROM runs r WHERE r.run_id = $2;`
+		if _, err := tx.ExecContext(ctx, insertEntry,
+			model.NewID(), in.RunID, model.TruncateError(in.ErrorText)); err != nil {
+			return fmt.Errorf("postgres: cannot write the dead-letter entry: %w", err)
+		}
+
+		res, err := tx.ExecContext(ctx, `
+UPDATE runs SET status = 'DLQ', owner_id = NULL, claimed_at = NULL
+WHERE run_id = $1 AND owner_id = $2 AND status = 'RUNNING';`, in.RunID, orchestratorID)
+		if err != nil {
+			return fmt.Errorf("postgres: cannot dead-letter the run: %w", err)
+		}
+		return requireOneRow(res, storage.ErrNotOwner)
+	})
 }

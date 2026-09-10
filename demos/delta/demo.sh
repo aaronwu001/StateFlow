@@ -263,7 +263,7 @@ show "SPEC.md 6.5: the dead-letter entry, and the round it belonged to" \
      FROM dead_letter_queue WHERE run_id = :'run';" "run=$RUN1"
 
 STEPS_BEFORE="$(psql_q "SELECT count(*) FROM steps WHERE run_id = :'run';" "run=$RUN1")"
-DLQ_BEFORE="$(psql_q "SELECT md5(string_agg(dlq_id::text || reason || replay_round || attempt_count ||
+DLQ_BEFORE="$(psql_q "SELECT md5(string_agg(dlq_id::text || reason || replay_round ||
                                             error_text || created_at::text, ',' ORDER BY dlq_id))
                         FROM dead_letter_queue WHERE run_id = :'run';" "run=$RUN1")"
 
@@ -304,7 +304,7 @@ assert_true "SPEC.md 4.2: the planner was asked again, so both static steps now 
   "SELECT count(*) = 2 AND bool_and(status = 'DONE') FROM steps WHERE run_id = :'run';" "run=$RUN1"
 assert_eq "SPEC.md 6.7, 12.4: the dead-letter entry is byte-identical after the replay" \
   "$DLQ_BEFORE" \
-  "$(psql_q "SELECT md5(string_agg(dlq_id::text || reason || replay_round || attempt_count ||
+  "$(psql_q "SELECT md5(string_agg(dlq_id::text || reason || replay_round ||
                                    error_text || created_at::text, ',' ORDER BY dlq_id))
                FROM dead_letter_queue WHERE run_id = :'run';" "run=$RUN1")"
 
@@ -337,7 +337,9 @@ FIRST_BEFORE="$(psql_q "SELECT s.status || '|' || s.attempt_count || '|' || coal
                           FROM steps s WHERE s.run_id = :'run' AND s.step_name = 'first';" "run=$RUN2")"
 
 show "SPEC.md 6.5: two rounds, two entries, and which step each one names" \
-  "SELECT d.replay_round, s.seq, s.step_name, d.reason, d.attempt_count
+  "SELECT d.replay_round, s.seq, s.step_name, d.reason,
+          (SELECT count(*) FROM attempts a
+            WHERE a.step_id = d.step_id AND a.replay_round = d.replay_round) AS attempts_that_round
      FROM dead_letter_queue d JOIN steps s ON s.step_id = d.step_id
     WHERE d.run_id = :'run' ORDER BY d.replay_round;" "run=$RUN2"
 

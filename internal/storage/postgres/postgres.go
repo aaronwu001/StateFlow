@@ -96,16 +96,19 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 func (s *Store) CreateWorkflow(ctx context.Context, wf *model.Workflow) error {
 	const q = `
-INSERT INTO workflows (workflow_id, name, planner_type, planner_url, planner_static_steps,
+INSERT INTO workflows (workflow_id, name, planner_type, planner_url, fetch_base_url,
+                       planner_static_steps,
                        step_timeout_seconds, step_max_attempts, step_retry_delay_seconds,
-                       planner_timeout_seconds, planner_max_attempts)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                       planner_timeout_seconds, planner_max_attempts,
+                       planner_retry_delay_seconds)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING created_at;`
 	err := s.db.QueryRowContext(ctx, q,
 		wf.WorkflowID, wf.Name, wf.PlannerType,
-		nullString(wf.PlannerURL), jsonParam(wf.PlannerStaticSteps),
+		nullString(wf.PlannerURL), nullString(wf.FetchBaseURL),
+		jsonParam(wf.PlannerStaticSteps),
 		wf.StepTimeoutSeconds, wf.StepMaxAttempts, wf.StepRetryDelaySeconds,
-		wf.PlannerTimeoutSeconds, wf.PlannerMaxAttempts,
+		wf.PlannerTimeoutSeconds, wf.PlannerMaxAttempts, wf.PlannerRetryDelaySeconds,
 	).Scan(&wf.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("postgres: cannot create workflow: %w", err)
@@ -113,23 +116,29 @@ RETURNING created_at;`
 	return nil
 }
 
-const workflowColumns = `workflow_id, name, planner_type, planner_url, planner_static_steps,
+const workflowColumns = `workflow_id, name, planner_type, planner_url, fetch_base_url,
+       planner_static_steps,
        step_timeout_seconds, step_max_attempts, step_retry_delay_seconds,
-       planner_timeout_seconds, planner_max_attempts, created_at`
+       planner_timeout_seconds, planner_max_attempts, planner_retry_delay_seconds, created_at`
 
 func scanWorkflow(row interface{ Scan(...any) error }) (*model.Workflow, error) {
 	var (
 		wf    model.Workflow
 		url   sql.NullString
+		fetch sql.NullString
 		steps []byte
 	)
-	err := row.Scan(&wf.WorkflowID, &wf.Name, &wf.PlannerType, &url, &steps,
+	err := row.Scan(&wf.WorkflowID, &wf.Name, &wf.PlannerType, &url, &fetch, &steps,
 		&wf.StepTimeoutSeconds, &wf.StepMaxAttempts, &wf.StepRetryDelaySeconds,
-		&wf.PlannerTimeoutSeconds, &wf.PlannerMaxAttempts, &wf.CreatedAt)
+		&wf.PlannerTimeoutSeconds, &wf.PlannerMaxAttempts, &wf.PlannerRetryDelaySeconds,
+		&wf.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
+	// SPEC.md 6.1: both are NULL for a static workflow and both present for an
+	// http one, so the zero value carries the same meaning the column does.
 	wf.PlannerURL = url.String
+	wf.FetchBaseURL = fetch.String
 	wf.PlannerStaticSteps = steps
 	return &wf, nil
 }
@@ -167,22 +176,18 @@ RETURNING created_at;`
 }
 
 const runColumns = `run_id, workflow_id, status, input, planner_attempt_count, replay_count,
-       last_planner_error, owner_id, claimed_at, created_at`
+       owner_id, claimed_at, created_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*model.Run, error) {
 	var (
 		run       model.Run
-		lastErr   sql.NullString
 		ownerID   sql.NullString
 		claimedAt sql.NullTime
 	)
 	err := row.Scan(&run.RunID, &run.WorkflowID, &run.Status, &run.Input,
-		&run.PlannerAttemptCount, &run.ReplayCount, &lastErr, &ownerID, &claimedAt, &run.CreatedAt)
+		&run.PlannerAttemptCount, &run.ReplayCount, &ownerID, &claimedAt, &run.CreatedAt)
 	if err != nil {
 		return nil, err
-	}
-	if lastErr.Valid {
-		run.LastPlannerError = &lastErr.String
 	}
 	if ownerID.Valid {
 		run.OwnerID = &ownerID.String
@@ -253,8 +258,9 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]*model.Step, err
 	return out, rows.Err()
 }
 
-const attemptColumns = `attempt_id, step_id, run_id, attempt_no, status, connection_mode,
-       deadline_at, dispatched_by, output, failure_reason, error_text, started_at, finished_at`
+const attemptColumns = `attempt_id, step_id, run_id, attempt_no, replay_round, status,
+       connection_mode, deadline_at, dispatched_by, output, failure_reason, error_text,
+       started_at, finished_at`
 
 func scanAttempt(row interface{ Scan(...any) error }) (*model.Attempt, error) {
 	var (
@@ -263,8 +269,8 @@ func scanAttempt(row interface{ Scan(...any) error }) (*model.Attempt, error) {
 		errText    sql.NullString
 		finishedAt sql.NullTime
 	)
-	err := row.Scan(&at.AttemptID, &at.StepID, &at.RunID, &at.AttemptNo, &at.Status,
-		&at.ConnectionMode, &at.DeadlineAt, &at.DispatchedBy, &at.Output,
+	err := row.Scan(&at.AttemptID, &at.StepID, &at.RunID, &at.AttemptNo, &at.ReplayRound,
+		&at.Status, &at.ConnectionMode, &at.DeadlineAt, &at.DispatchedBy, &at.Output,
 		&reason, &errText, &at.StartedAt, &finishedAt)
 	if err != nil {
 		return nil, err
@@ -463,6 +469,29 @@ func (s *Store) StepOutputByID(ctx context.Context, runID, stepID string) ([]byt
 	return output, nil
 }
 
+// GetStep reads one step by its own identity, for SPEC.md 10.2's
+// GET /steps/{step_id}/output.
+//
+// SPEC.md 10.2 requires that endpoint early rather than late, and says why: "a
+// planner must be able to fetch what SPEC.md 9.2's catalogue cap omits", and
+// the catalogue omits every output by design.
+func (s *Store) GetStep(ctx context.Context, stepID string) (*model.Step, error) {
+	if !isUUID(stepID) {
+		// SPEC.md 10.5's 404 is "no such entity". A malformed identifier names
+		// none, and letting it reach Postgres would turn it into a type error.
+		return nil, storage.ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT `+stepColumns+` FROM steps WHERE step_id = $1;`, stepID)
+	st, err := scanStep(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot read the step: %w", err)
+	}
+	return st, nil
+}
+
 // ---------------------------------------------------------------------------
 // Coordination metadata (SPEC.md 3.4, 8.5, 8.7)
 // ---------------------------------------------------------------------------
@@ -608,4 +637,49 @@ func isUUID(s string) bool {
 		}
 	}
 	return true
+}
+
+// PlannerHistory is SPEC.md 9.2's catalogue: the run's completed steps, oldest
+// first, capped at storage.PlannerHistoryLimit and keeping the MOST RECENT.
+//
+// SPEC.md 9.2 carries output_bytes and never the output itself — "history is a
+// catalogue only ... a planner that wants an output fetches it from the read
+// API" — which is also why the cap is safe to apply: the rows are small and
+// bounded, and the read API of SPEC.md 10.2 is how a planner reaches anything
+// the cap left out.
+func (s *Store) PlannerHistory(ctx context.Context, runID string) ([]storage.HistoryStep, error) {
+	const q = `
+SELECT step_id, step_name, seq, status,
+       coalesce(octet_length(output::text), 0), attempt_count, completed_at
+  FROM (SELECT * FROM steps
+         WHERE run_id = $1 AND status = 'DONE'
+         ORDER BY seq DESC
+         LIMIT $2) recent
+ ORDER BY seq;`
+	rows, err := s.db.QueryContext(ctx, q, runID, storage.PlannerHistoryLimit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot read the planner history: %w", err)
+	}
+	defer rows.Close()
+
+	out := []storage.HistoryStep{}
+	for rows.Next() {
+		var (
+			h           storage.HistoryStep
+			name        sql.NullString
+			completedAt sql.NullTime
+		)
+		if err := rows.Scan(&h.StepID, &name, &h.Seq, &h.Status,
+			&h.OutputBytes, &h.AttemptCount, &completedAt); err != nil {
+			return nil, fmt.Errorf("postgres: cannot read a history step: %w", err)
+		}
+		if name.Valid {
+			h.StepName = &name.String
+		}
+		if completedAt.Valid {
+			h.CompletedAt = &completedAt.Time
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }

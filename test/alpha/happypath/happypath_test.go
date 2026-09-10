@@ -30,8 +30,36 @@ func TestRunCountersAreZero(t *testing.T) {
 		"SELECT count(*) = 1 FROM runs WHERE run_id = :'run' AND replay_count = 0;", rv())
 	harness.Bool(t, "SPEC.md 18.1, 12.1: planner_attempt_count = 0 - the static planner cannot fail",
 		"SELECT count(*) = 1 FROM runs WHERE run_id = :'run' AND planner_attempt_count = 0;", rv())
-	harness.Bool(t, "SPEC.md 6.2: last_planner_error is absent, there having been no planner failure",
-		"SELECT last_planner_error IS NULL FROM runs WHERE run_id = :'run';", rv())
+	// SPEC.md 6.2 no longer keeps a last_planner_error column: the planner's
+	// own rows carry the diagnosis (SPEC.md 6.8). The claim is therefore about
+	// the calls themselves - and it is a stronger one than the column allowed,
+	// because SPEC.md 12.1 exempts no planner from the path: "these rules apply
+	// to every planner, including the built-in static one, with no exemption",
+	// so the static planner's answers are rows like any other's.
+	//
+	// A run with n steps that reached DONE was asked n + 1 times: once at each
+	// decision point that produced a step, and once more for the `done` that
+	// ended it (SPEC.md 4.2's L1).
+	steps, err := harness.StaticSteps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.Bool(t, fmt.Sprintf("SPEC.md 4.2, 6.8: the planner was asked %d times and answered every time",
+		len(steps)+1),
+		fmt.Sprintf(`SELECT count(*) = %d
+                          AND count(*) FILTER (WHERE status = 'DONE') = %d
+                          AND count(*) FILTER (WHERE answer = 'continue') = %d
+                          AND count(*) FILTER (WHERE answer = 'done') = 1
+                       FROM planner_calls WHERE run_id = :'run';`,
+			len(steps)+1, len(steps)+1, len(steps)),
+		rv())
+	harness.Bool(t, "SPEC.md 12.1: the static planner cannot fail, so no call is FAILED",
+		"SELECT count(*) = 0 FROM planner_calls WHERE run_id = :'run' AND status = 'FAILED';", rv())
+	harness.Bool(t, "SPEC.md 6.8: call_no is 1-based and contiguous within the run",
+		`SELECT count(*) = 0 FROM (
+             SELECT call_no, row_number() OVER (ORDER BY call_no) AS expected
+               FROM planner_calls WHERE run_id = :'run') t
+          WHERE t.call_no <> t.expected;`, rv())
 }
 
 // SPEC.md 6.2 stores the operator-supplied workflow input "verbatim".

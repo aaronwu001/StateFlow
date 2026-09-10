@@ -246,7 +246,7 @@ RUN_DIGEST="SELECT md5(
                 coalesce(a.finished_at::text, '') || a.dispatched_by AS x
            FROM attempts a WHERE a.run_id = :'run') t3)
    || (SELECT coalesce(string_agg(x, '|' ORDER BY x), '') FROM (
-         SELECT d.dlq_id::text || d.reason || d.replay_round || d.attempt_count ||
+         SELECT d.dlq_id::text || d.reason || d.replay_round ||
                 coalesce(d.step_id::text, '') AS x
            FROM dead_letter_queue d WHERE d.run_id = :'run') t4));"
 
@@ -295,7 +295,7 @@ say "  run reached: $state"
 [ "$state" = "DLQ" ] || { say "FAILED: this leg needs a DLQ'd run; it reached $state"; exit 1; }
 
 show "SELECT s.step_name, s.status, s.attempt_count FROM steps s WHERE s.run_id = :'run';"
-show "SELECT reason, attempt_count FROM dead_letter_queue WHERE run_id = :'run';"
+show "SELECT reason, replay_round FROM dead_letter_queue WHERE run_id = :'run';"
 
 DLQ_BEFORE=$(qraw "$RUN_DIGEST")
 say ""
@@ -489,7 +489,11 @@ say "  run reached: $state"
 
 show "SELECT attempt_no, status, failure_reason, dispatched_by
         FROM attempts WHERE run_id = :'run' ORDER BY attempt_no;"
-show "SELECT reason, attempt_count, replay_round FROM dead_letter_queue WHERE run_id = :'run';"
+show "SELECT reason, replay_round FROM dead_letter_queue WHERE run_id = :'run';"
+say "SPEC.md 6.5: how much budget that round burned is a count of the attempts"
+say "carrying that replay_round, not a column on the entry."
+show "SELECT a.replay_round, count(*) AS attempts_in_that_round
+        FROM attempts a WHERE a.run_id = :'run' GROUP BY 1 ORDER BY 1;"
 
 say ""
 say "Assertions (SPEC.md 13.1.4, 12.2):"

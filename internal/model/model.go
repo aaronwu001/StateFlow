@@ -24,6 +24,13 @@ const (
 
 // Failure reasons (SPEC.md 5.3). Each is "a diagnostic label, not a distinct
 // mechanism"; every value below burns one unit of budget except Cancelled.
+//
+// SPEC.md 5.8 gives a planner call three of these six, with identical meanings
+// — TransportError, InvalidResponse and Timeout — and says why the other three
+// have no planner-side form. They are deliberately the same constants and not a
+// parallel set: "the operator asking what is killing my runs is asking one
+// question, and an answer split across two enumerations with different words
+// for the same event would make him ask it twice".
 const (
 	FailureWorkerError     = "worker_error"
 	FailureTransportError  = "transport_error"
@@ -33,13 +40,29 @@ const (
 	FailureCancelled       = "cancelled"
 )
 
-// Dead-letter reasons (SPEC.md 6.5).
+// Dead-letter reasons (SPEC.md 6.5). Three values, and each names a SITUATION
+// that stopped a run rather than the kind of any one failure — the kind lives
+// on the attempt (SPEC.md 5.3) or on the planner call (SPEC.md 5.8) that had
+// it.
 const (
 	DLQWorkerBudgetExhausted  = "worker_budget_exhausted"
-	DLQPlannerUnreachable     = "planner_unreachable"
-	DLQPlannerInvalidResponse = "planner_invalid_response"
 	DLQPlannerBudgetExhausted = "planner_budget_exhausted"
 	DLQPlannerDeclaredFail    = "planner_declared_fail"
+)
+
+// Planner call states (SPEC.md 5.8). There is no RUNNING: the row is written
+// once, at the outcome.
+const (
+	PlannerCallDone   = StatusDone
+	PlannerCallFailed = StatusFailed
+)
+
+// The three answers of SPEC.md 9.3, as they are recorded in
+// planner_calls.answer (SPEC.md 6.8).
+const (
+	AnswerContinue = "continue"
+	AnswerDone     = "done"
+	AnswerFail     = "fail"
 )
 
 // Planner types (SPEC.md 6.1).
@@ -84,16 +107,22 @@ type Workflow struct {
 	Name       string
 
 	PlannerType string
-	// PlannerURL is present iff PlannerType is http; PlannerStaticSteps is
-	// present iff it is static (SPEC.md 6.1's invariant).
+	// PlannerURL and FetchBaseURL are both present iff PlannerType is http;
+	// PlannerStaticSteps is present iff it is static (SPEC.md 6.1's invariant).
+	//
+	// SPEC.md 6.1: the two URLs are "one relationship, two directions" —
+	// PlannerURL is where the orchestrator calls this workflow's planner, and
+	// FetchBaseURL is where that same planner reads back (SPEC.md 9.2, 10.2).
 	PlannerURL         string
+	FetchBaseURL       string
 	PlannerStaticSteps []byte
 
-	StepTimeoutSeconds    int
-	StepMaxAttempts       int
-	StepRetryDelaySeconds int
-	PlannerTimeoutSeconds int
-	PlannerMaxAttempts    int
+	StepTimeoutSeconds       int
+	StepMaxAttempts          int
+	StepRetryDelaySeconds    int
+	PlannerTimeoutSeconds    int
+	PlannerMaxAttempts       int
+	PlannerRetryDelaySeconds int
 
 	CreatedAt time.Time
 }
@@ -106,9 +135,13 @@ type Run struct {
 	Status     string
 	Input      []byte
 
+	// PlannerAttemptCount is SPEC.md 6.2's budget counter. It remains a stored
+	// column even though every call now has a row (SPEC.md 6.8): it is read on
+	// the path that decides whether to call the planner again, and counting
+	// rows would make that decision depend on correctly excluding the calls of
+	// earlier decision points and earlier replay rounds.
 	PlannerAttemptCount int
 	ReplayCount         int
-	LastPlannerError    *string
 
 	// OwnerID and ClaimedAt are coordination metadata (SPEC.md 3.4), non-NULL
 	// only while Status is RUNNING and always written and cleared as a pair
@@ -142,10 +175,15 @@ type Step struct {
 // Attempt is SPEC.md 6.4: one execution of a step, one dispatch and one
 // outcome.
 type Attempt struct {
-	AttemptID      string
-	StepID         string
-	RunID          string
-	AttemptNo      int
+	AttemptID string
+	StepID    string
+	RunID     string
+	AttemptNo int
+	// ReplayRound is SPEC.md 6.4: "the value of runs.replay_count when this
+	// attempt was dispatched". SPEC.md 14 leaves earlier attempts in place, so
+	// without it a step that has been replayed holds the rows of two rounds
+	// with nothing on them saying which round is which.
+	ReplayRound    int
 	Status         string
 	ConnectionMode string
 	DeadlineAt     time.Time
@@ -160,14 +198,39 @@ type Attempt struct {
 // DeadLetterEntry is SPEC.md 6.5: an append-only historical record that a run
 // stopped because a budget was exhausted or the planner refused to continue.
 type DeadLetterEntry struct {
-	DLQID        string
-	RunID        string
-	StepID       *string
-	Reason       string
-	ReplayRound  int
-	AttemptCount int
-	ErrorText    string
-	CreatedAt    time.Time
+	DLQID       string
+	RunID       string
+	StepID      *string
+	Reason      string
+	ReplayRound int
+	ErrorText   string
+	CreatedAt   time.Time
+}
+
+// PlannerCall is SPEC.md 6.8: one question put to a run's planner and the
+// answer — or the failure — that came back. It is the planner-side counterpart
+// of an Attempt (SPEC.md 3.2), and like a dead-letter entry it is append-only
+// history (SPEC.md 6.7): written once, at the outcome, and never modified.
+type PlannerCall struct {
+	PlannerCallID string
+	RunID         string
+
+	// CallNo orders the run's whole conversation with its planner, contiguous
+	// across decision points and replay rounds (SPEC.md 6.8). ReplayRound is
+	// the value of runs.replay_count when the call was made.
+	CallNo      int
+	ReplayRound int
+
+	// Status is PlannerCallDone or PlannerCallFailed. Exactly one of Answer
+	// and FailureReason is set, which is SPEC.md 6.8's invariants 1 and 2.
+	Status        string
+	Answer        *string
+	FailureReason *string
+	ErrorText     *string
+
+	CalledBy   string
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 // Orchestrator is SPEC.md 6.6: one row per process boot, whose last_seen_at is

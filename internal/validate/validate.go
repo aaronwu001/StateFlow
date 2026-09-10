@@ -50,22 +50,25 @@ type WorkflowRequest struct {
 	Name               *string            `json:"name"`
 	PlannerType        *string            `json:"planner_type"`
 	PlannerURL         *string            `json:"planner_url"`
+	FetchBaseURL       *string            `json:"fetch_base_url"`
 	PlannerStaticSteps *[]json.RawMessage `json:"planner_static_steps"`
 
-	StepTimeoutSeconds    *int `json:"step_timeout_seconds"`
-	StepMaxAttempts       *int `json:"step_max_attempts"`
-	StepRetryDelaySeconds *int `json:"step_retry_delay_seconds"`
-	PlannerTimeoutSeconds *int `json:"planner_timeout_seconds"`
-	PlannerMaxAttempts    *int `json:"planner_max_attempts"`
+	StepTimeoutSeconds       *int `json:"step_timeout_seconds"`
+	StepMaxAttempts          *int `json:"step_max_attempts"`
+	StepRetryDelaySeconds    *int `json:"step_retry_delay_seconds"`
+	PlannerTimeoutSeconds    *int `json:"planner_timeout_seconds"`
+	PlannerMaxAttempts       *int `json:"planner_max_attempts"`
+	PlannerRetryDelaySeconds *int `json:"planner_retry_delay_seconds"`
 }
 
 // SPEC.md 11.1's defaults, applied to a key the request omits.
 const (
-	DefaultStepTimeoutSeconds    = 300
-	DefaultStepMaxAttempts       = 3
-	DefaultStepRetryDelaySeconds = 0
-	DefaultPlannerTimeoutSeconds = 30
-	DefaultPlannerMaxAttempts    = 3
+	DefaultStepTimeoutSeconds       = 300
+	DefaultStepMaxAttempts          = 3
+	DefaultStepRetryDelaySeconds    = 0
+	DefaultPlannerTimeoutSeconds    = 30
+	DefaultPlannerMaxAttempts       = 3
+	DefaultPlannerRetryDelaySeconds = 0
 )
 
 // Workflow parses and validates a POST /workflows body and returns the
@@ -98,20 +101,28 @@ func Workflow(body []byte) (*model.Workflow, *Rejection) {
 	}
 
 	wf := &model.Workflow{
-		PlannerType:           *req.PlannerType,
-		StepTimeoutSeconds:    DefaultStepTimeoutSeconds,
-		StepMaxAttempts:       DefaultStepMaxAttempts,
-		StepRetryDelaySeconds: DefaultStepRetryDelaySeconds,
-		PlannerTimeoutSeconds: DefaultPlannerTimeoutSeconds,
-		PlannerMaxAttempts:    DefaultPlannerMaxAttempts,
+		PlannerType:              *req.PlannerType,
+		StepTimeoutSeconds:       DefaultStepTimeoutSeconds,
+		StepMaxAttempts:          DefaultStepMaxAttempts,
+		StepRetryDelaySeconds:    DefaultStepRetryDelaySeconds,
+		PlannerTimeoutSeconds:    DefaultPlannerTimeoutSeconds,
+		PlannerMaxAttempts:       DefaultPlannerMaxAttempts,
+		PlannerRetryDelaySeconds: DefaultPlannerRetryDelaySeconds,
 	}
 	if req.Name != nil {
 		wf.Name = *req.Name
 	}
 
-	// SPEC.md 6.1's invariant: "exactly one of planner_url /
-	// planner_static_steps is present, determined by planner_type". SPEC.md 16
-	// rules 2 and 3 are the two halves of enforcing it.
+	// SPEC.md 6.1's invariant: "planner_url and fetch_base_url are both present
+	// iff planner_type = 'http', and planner_static_steps is present iff it is
+	// 'static' - the two sides are never mixed and never both absent". SPEC.md
+	// 16 rules 2 and 3 are the two halves of enforcing it.
+	//
+	// SPEC.md 6.1 says why the two URLs travel together: "planner_url says
+	// where the orchestrator calls this workflow's planner, and fetch_base_url
+	// says where that same planner reads back - one relationship, two
+	// directions, so both are settled at the same moment, live in the same row
+	// and expire together."
 	switch wf.PlannerType {
 	case model.PlannerHTTP:
 		if req.PlannerURL == nil {
@@ -121,11 +132,19 @@ func Workflow(body []byte) (*model.Workflow, *Rejection) {
 			return nil, reject("planner_url %q is not a valid absolute HTTP(S) URL (SPEC.md 16 rule 2)",
 				*req.PlannerURL)
 		}
+		if req.FetchBaseURL == nil {
+			return nil, reject("planner_type %q requires fetch_base_url (SPEC.md 16 rule 2)", model.PlannerHTTP)
+		}
+		if !absoluteHTTPURL(*req.FetchBaseURL) {
+			return nil, reject("fetch_base_url %q is not a valid absolute HTTP(S) URL (SPEC.md 16 rule 2)",
+				*req.FetchBaseURL)
+		}
 		if req.PlannerStaticSteps != nil {
 			return nil, reject("planner_type %q must not carry planner_static_steps (SPEC.md 6.1)",
 				model.PlannerHTTP)
 		}
 		wf.PlannerURL = *req.PlannerURL
+		wf.FetchBaseURL = *req.FetchBaseURL
 
 	case model.PlannerStatic:
 		if req.PlannerStaticSteps == nil {
@@ -137,6 +156,12 @@ func Workflow(body []byte) (*model.Workflow, *Rejection) {
 		}
 		if req.PlannerURL != nil {
 			return nil, reject("planner_type %q must not carry planner_url (SPEC.md 6.1)", model.PlannerStatic)
+		}
+		// SPEC.md 16 rule 3: a static workflow carrying fetch_base_url, "which
+		// belongs to http alone".
+		if req.FetchBaseURL != nil {
+			return nil, reject("planner_type %q must not carry fetch_base_url (SPEC.md 16 rule 3)",
+				model.PlannerStatic)
 		}
 		// SPEC.md 6.1: "Every element of planner_static_steps is a StepSpec,
 		// and is validated as one — by 9.4 and 9.8 — at POST /workflows,
@@ -156,7 +181,8 @@ func Workflow(body []byte) (*model.Workflow, *Rejection) {
 	}
 
 	// SPEC.md 16 rule 6 and SPEC.md 11.1: any *_max_attempts below 1, any
-	// *_timeout_seconds below 1, or a negative step_retry_delay_seconds.
+	// *_timeout_seconds below 1, or a negative *_retry_delay_seconds. The two
+	// families are symmetric (SPEC.md 11.1), and so is this table.
 	fields := []struct {
 		name  string
 		value *int
@@ -168,6 +194,7 @@ func Workflow(body []byte) (*model.Workflow, *Rejection) {
 		{"step_retry_delay_seconds", req.StepRetryDelaySeconds, 0, &wf.StepRetryDelaySeconds},
 		{"planner_timeout_seconds", req.PlannerTimeoutSeconds, 1, &wf.PlannerTimeoutSeconds},
 		{"planner_max_attempts", req.PlannerMaxAttempts, 1, &wf.PlannerMaxAttempts},
+		{"planner_retry_delay_seconds", req.PlannerRetryDelaySeconds, 0, &wf.PlannerRetryDelaySeconds},
 	}
 	for _, f := range fields {
 		if f.value == nil {

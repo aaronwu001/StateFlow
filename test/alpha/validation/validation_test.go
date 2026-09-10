@@ -151,19 +151,27 @@ func TestRejectsUnknownPlannerType(t *testing.T) {
 // SPEC.md 16 rule 2: planner_type = "http" with no planner_url, or a
 // planner_url that is not a valid absolute HTTP(S) URL.
 //
-// planner_static_steps is removed in both cases: SPEC.md 6.1's invariant is
-// that exactly one of planner_url / planner_static_steps is present, so leaving
-// it in would make the body invalid for a second reason as well.
+// Each body below must be wrong in exactly ONE respect, or the rejection it
+// produces says nothing about the rule it names.
+//
+// planner_static_steps is removed and fetch_base_url is supplied: SPEC.md 6.1's
+// invariant is that planner_url and fetch_base_url are both present iff
+// planner_type is 'http', and planner_static_steps iff it is 'static'. Leaving
+// the array in, or omitting fetch_base_url, would make the body invalid for a
+// second reason - and a test that passes because of a defect it did not intend
+// would keep passing after the defect it did intend was fixed.
 func TestRejectsHTTPPlannerWithoutUsableURL(t *testing.T) {
 	rejectWorkflow(t, "SPEC.md 16 rule 2: planner_type 'http' with no planner_url",
 		workflowBody(t, func(wf map[string]any) {
 			wf["planner_type"] = "http"
 			delete(wf, "planner_static_steps")
+			wf["fetch_base_url"] = "http://orchestrator:8080"
 		}))
 	rejectWorkflow(t, "SPEC.md 16 rule 2: planner_url is not a valid absolute HTTP(S) URL",
 		workflowBody(t, func(wf map[string]any) {
 			wf["planner_type"] = "http"
 			delete(wf, "planner_static_steps")
+			wf["fetch_base_url"] = "http://orchestrator:8080"
 			wf["planner_url"] = "planner:9000/decide"
 		}))
 }

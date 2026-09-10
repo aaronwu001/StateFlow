@@ -33,15 +33,16 @@
 //
 //	SPEC.md 18.5 does not exist. CLAUDE.md 2 rule 1 forbids this agent from
 //	writing it unsolicited, so no assertion below cites a demo script: every one
-//	traces to a section that is already ratified - SPEC.md 4.2 (the driving
-//	loop's L1 rows), 5.4 (the last_step convention), 5.5 (the combination
-//	table), 5.6 (the impossible ones), 6.1 (planner_type, planner_url,
-//	fetch_base_url), 6.2 (planner_attempt_count, last_planner_error), 6.3
-//	(steps.decision), 6.5 (the dead-letter reasons), 6.7 (append-only), 9.2 (the
-//	request the planner receives), 9.3 (the three answers), 9.8 (rejected
-//	StepSpecs), 10.2 (the read API), 11.1 (the planner budget fields), 12.1
-//	(what counts as a planner failure), 12.2 (budget and the transition to DLQ),
-//	12.3 (the planner-side column), 14 (replay) and 16 (validation).
+//	traces to a section that is already ratified - SPEC.md 3.2 (the planner call
+//	as an entity), 4.2 (the driving loop's L1 rows), 5.4 (the last_step
+//	convention), 5.5 (the combination table), 5.6 (the impossible ones), 5.8
+//	(planner call states and failure reasons), 6.1 (planner_type, planner_url,
+//	fetch_base_url), 6.2 (planner_attempt_count), 6.3 (steps.decision), 6.5 (the
+//	three dead-letter reasons), 6.7 (append-only), 6.8 (the planner_calls
+//	table), 9.2 (the request the planner receives), 9.3 (the three answers), 9.8
+//	(rejected StepSpecs), 10.2 (the read API), 11.1 (the planner budget fields),
+//	12.1 (what counts as a planner failure), 12.2 (budget and the transition to
+//	DLQ), 12.3 (the planner-side column), 14 (replay) and 16 (validation).
 //
 //	Nothing here was derived by reading internal/ (CLAUDE.md 5.1). Where SPEC.md
 //	is silent the assertion is absent rather than invented (R34-m, R37-g): the

@@ -108,6 +108,10 @@ type BeginStepInput struct {
 
 	ConnectionMode string
 	TimeoutSeconds int
+
+	// Call is the `continue` that produced this step, written into
+	// planner_calls in the same transaction (SPEC.md 4.2, 6.8).
+	Call PlannerCallRecord
 }
 
 // BeginAttemptInput re-dispatches an existing RUNNING step whose budget check
@@ -155,19 +159,80 @@ type StepDeadLetterInput struct {
 	ErrorText string
 }
 
+// PlannerCallRecord is one row of SPEC.md 6.8, handed to whichever method
+// writes the effect that call produced, so that the two land in one
+// transaction. SPEC.md 4.2: "every one of those four rows also writes the call
+// itself into planner_calls, in the same transaction."
+//
+// The backend supplies call_no and replay_round: SPEC.md 6.8 defines the first
+// as the run's own ordering, which only one writer may assign, and the second
+// as "the value of runs.replay_count when the call was made", which is a column
+// the caller would otherwise have to have read and could have read stale.
+type PlannerCallRecord struct {
+	// Answer is one of model.Answer* on a DONE call, empty on a FAILED one;
+	// FailureReason is one of SPEC.md 5.8's three on a FAILED call, empty on a
+	// DONE one. Exactly one is set — SPEC.md 6.8's invariants 1 and 2.
+	Answer        string
+	FailureReason string
+
+	// ErrorText is required when the call FAILED and when the answer was fail
+	// (SPEC.md 6.8 invariant 3), and permitted otherwise.
+	ErrorText string
+
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+// Failed reports whether this record describes a failed call rather than an
+// answered one.
+func (c PlannerCallRecord) Failed() bool { return c.FailureReason != "" }
+
 // PlannerFailureInput is one failed planner call (SPEC.md 4.2, SPEC.md 12.2).
-// The backend increments runs.planner_attempt_count and, if that has reached
+// The backend writes the FAILED planner_calls row, increments
+// runs.planner_attempt_count in the same transaction and, if that has reached
 // the workflow's planner_max_attempts, writes the planner-side dead-letter
-// entry and takes the run to DLQ in the same transaction.
+// entry and takes the run to DLQ.
+//
+// There is no dead-letter reason to choose: SPEC.md 6.5 leaves the planner side
+// exactly one reason for a budget that ran out, because the KIND of each
+// failure is on the call's own row.
 type PlannerFailureInput struct {
 	RunID string
+	Call  PlannerCallRecord
+}
 
-	// Reason is the dead-letter reason to record if this failure exhausts the
-	// budget — one of SPEC.md 6.5's planner_* values.
-	Reason string
+// PlannerDeclaredFailInput is SPEC.md 9.3's `fail` answer: not a failure but a
+// valid answer (SPEC.md 12.1), so it writes a DONE call whose answer is fail,
+// the dead-letter entry and run → DLQ in one transaction, and burns no budget.
+type PlannerDeclaredFailInput struct {
+	RunID string
+	Call  PlannerCallRecord
 
+	// ErrorText is what the dead-letter entry records — SPEC.md 9.3 makes
+	// `reason` part of a fail answer, and SPEC.md 12.4 requires the entry to
+	// say why the run stopped.
 	ErrorText string
 }
+
+// HistoryStep is one row of SPEC.md 9.2's catalogue: "step_id, step_name, seq,
+// status, output_bytes, attempt_count, completed_at".
+//
+// It carries OutputBytes and never the output itself. SPEC.md 9.2: "history is
+// a catalogue only. It never carries outputs — that is what output_bytes is
+// for. A planner that wants an output fetches it from the read API."
+type HistoryStep struct {
+	StepID       string
+	StepName     *string
+	Seq          int
+	Status       string
+	OutputBytes  int
+	AttemptCount int
+	CompletedAt  *time.Time
+}
+
+// PlannerHistoryLimit is SPEC.md 9.2's cap: "history carries at most the most
+// recent 100 steps".
+const PlannerHistoryLimit = 100
 
 // Store is the whole storage contract.
 type Store interface {
@@ -221,6 +286,13 @@ type Store interface {
 	StepOutputAtSeq(ctx context.Context, runID string, seq int) (stepID string, output []byte, err error)
 	StepOutputByID(ctx context.Context, runID, stepID string) (output []byte, err error)
 
+	// GetStep serves SPEC.md 10.2's GET /steps/{step_id}/output, which
+	// addresses a step by its own identity and knows no run. It returns
+	// ErrNotFound when no such step exists (SPEC.md 10.5's 404); a step that
+	// exists but holds no output is a state for the caller to report, not an
+	// absence, so it comes back as a step whose Output is nil.
+	GetStep(ctx context.Context, stepID string) (*model.Step, error)
+
 	// --- coordination metadata (SPEC.md 3.4, 8.5, 8.7) ---------------------
 	//
 	// None of these is governed by the transaction rules of SPEC.md 8, which
@@ -242,8 +314,17 @@ type Store interface {
 	BeginAttempt(ctx context.Context, orchestratorID string, in BeginAttemptInput) (*Dispatch, error)
 
 	// CompleteRun is the planner's `done`: run → DONE with owner_id and
-	// claimed_at cleared in the same transaction (SPEC.md 8.7, fourth writer).
-	CompleteRun(ctx context.Context, orchestratorID, runID string) error
+	// claimed_at cleared, and the call that said so, in the same transaction
+	// (SPEC.md 8.7 fourth writer; SPEC.md 4.2's L1 table).
+	CompleteRun(ctx context.Context, orchestratorID, runID string, call PlannerCallRecord) error
+
+	// PlannerHistory is SPEC.md 9.2's catalogue for one run: every DONE step,
+	// oldest first, capped at PlannerHistoryLimit and keeping the most recent.
+	//
+	// SPEC.md 9.2 says every row has status DONE, and says why that is not an
+	// independent rule: "the planner is asked only in state L1, where
+	// last_step = DONE. This follows from SPEC.md 5.5."
+	PlannerHistory(ctx context.Context, runID string) ([]HistoryStep, error)
 
 	// RecordAttemptSuccess writes the attempt's outcome under SPEC.md 8.3 and
 	// promotes its output to the step (SPEC.md 4.2, L2 / DONE).
@@ -266,4 +347,8 @@ type Store interface {
 	// RecordPlannerFailure reports whether this failure exhausted the planner
 	// budget and sent the run to DLQ (SPEC.md 12.2).
 	RecordPlannerFailure(ctx context.Context, orchestratorID string, in PlannerFailureInput) (deadLettered bool, err error)
+
+	// DeadLetterPlannerFail is SPEC.md 9.3's `fail`: the run stops at once and
+	// no budget moves (SPEC.md 12.1).
+	DeadLetterPlannerFail(ctx context.Context, orchestratorID string, in PlannerDeclaredFailInput) error
 }

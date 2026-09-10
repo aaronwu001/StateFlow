@@ -10,6 +10,24 @@ import (
 // The assertions below are grouped by leg. Each one names the SPEC.md rule it
 // comes from, so a failure says which rule broke and not merely which query
 // returned false.
+//
+// WHAT CHANGED WHEN THE PLANNER CALL BECAME AN ENTITY
+//
+//	This suite was first written against a SPEC.md in which the dead-letter
+//	entry named the KIND of planner failure - one reason per kind, and a rule
+//	for what to call a set of failures that were not all of one kind. SPEC.md
+//	3.2, 5.8 and 6.8 replaced that with a row per call. So the assertions moved
+//	rather than weakened: the kind is now asserted on the call that had it, at
+//	the moment it had it, and the entry is asserted to say only which of three
+//	situations stopped the run (SPEC.md 6.5).
+//
+//	Two of them got sharper in the move. SPEC.md 5.8's clock rule can now be
+//	tested at all - a planner that answers 500 instantly and a planner that
+//	sleeps past its deadline used to produce one indistinguishable reason, and
+//	now produce transport_error and timeout on their own rows. And the mixed
+//	fixture, which existed only to trigger the rule that is now deleted, tests
+//	something real instead: two kinds of failure inside one decision point, each
+//	on its own row.
 
 // ---------------------------------------------------------------------------
 // Leg 1 - the planner decides from what a step actually produced
@@ -67,13 +85,15 @@ func TestIdenticalRunsTookDifferentPaths(t *testing.T) {
 // They are not - each run's second step is the one its FIRST step's stored
 // output names.
 //
-// SPEC.md 6.3 stores "the worker's whole response body, verbatim", so the kind
-// sits one level in, under SPEC.md 9.6's `output` key.
+// SPEC.md 9.6 fixes what is stored per mode: in envelope mode the step's output
+// is the response's `output` field alone, because "status and output are Piton's
+// protocol, not the worker's data". So the kind sits at the top of the stored
+// document, and a planner reading it strips nothing.
 func TestTheBranchFollowsWhatTheWorkerProduced(t *testing.T) {
 	for _, run := range []string{obs.dynamicRunA, obs.dynamicRunB} {
 		harness.Bool(t, "SPEC.md 9.2, 10.2: the second step is the one the first step's output names",
 			`SELECT (SELECT step_name FROM steps WHERE run_id = :'run' AND seq = 2)
-                  = 'extract-' || (SELECT output->'output'->>'kind' FROM steps
+                  = 'extract-' || (SELECT output->>'kind' FROM steps
                                     WHERE run_id = :'run' AND seq = 1);`, harness.Var(run))
 	}
 }
@@ -94,15 +114,42 @@ func TestThePlannerReadTheOutputThroughTheReadAPI(t *testing.T) {
 	}
 }
 
+// TestEveryDecisionIsOnTheRecord is SPEC.md 4.2's new closing rule: "every one
+// of those four rows also writes the call itself into planner_calls, in the
+// same transaction - the first three as DONE with answer set to what the
+// planner said".
+//
+// A run with two steps that reached DONE was asked three times: twice for the
+// steps, once more for the `done` that ended it.
+func TestEveryDecisionIsOnTheRecord(t *testing.T) {
+	for _, run := range []string{obs.dynamicRunA, obs.dynamicRunB} {
+		harness.Bool(t, "SPEC.md 4.2, 6.8: three calls, all DONE - continue, continue, done",
+			`SELECT count(*) = 3
+                    AND count(*) FILTER (WHERE status = 'DONE') = 3
+                    AND count(*) FILTER (WHERE answer = 'continue') = 2
+                    AND count(*) FILTER (WHERE answer = 'done') = 1
+               FROM planner_calls WHERE run_id = :'run';`, harness.Var(run))
+		harness.Bool(t, "SPEC.md 6.8: call_no is 1-based and contiguous within the run",
+			`SELECT count(*) = 0 FROM (
+                 SELECT call_no, row_number() OVER (ORDER BY call_no) AS expected
+                   FROM planner_calls WHERE run_id = :'run') t
+              WHERE t.call_no <> t.expected;`, harness.Var(run))
+		harness.Bool(t, "SPEC.md 6.8: a run that was never replayed has every call in round 0",
+			"SELECT bool_and(replay_round = 0) FROM planner_calls WHERE run_id = :'run';",
+			harness.Var(run))
+	}
+}
+
 // TestSuccessfulPlannerCallsBurnNoBudget: SPEC.md 6.2 makes
 // planner_attempt_count "failed planner calls at the current decision point.
 // Reset to 0 by any successful planner call", and SPEC.md 4.2's `continue` row
 // resets the planner budget in the same transaction that inserts the step.
 func TestSuccessfulPlannerCallsBurnNoBudget(t *testing.T) {
 	for _, run := range []string{obs.dynamicRunA, obs.dynamicRunB} {
-		harness.Bool(t, "SPEC.md 6.2, 4.2: a run whose planner never failed carries no burnt budget "+
-			"and no diagnosis",
-			"SELECT planner_attempt_count = 0 AND last_planner_error IS NULL FROM runs WHERE run_id = :'run';",
+		harness.Bool(t, "SPEC.md 6.2: a run whose planner never failed carries no burnt budget",
+			"SELECT planner_attempt_count = 0 FROM runs WHERE run_id = :'run';", harness.Var(run))
+		harness.Bool(t, "SPEC.md 6.8: and no call of it is FAILED",
+			"SELECT count(*) = 0 FROM planner_calls WHERE run_id = :'run' AND status = 'FAILED';",
 			harness.Var(run))
 	}
 }
@@ -143,23 +190,30 @@ func TestAStaticWorkflowRunsBesideAnHTTPOne(t *testing.T) {
 		"SELECT count(*) = 2 FROM steps WHERE run_id = :'run';", harness.Var(obs.staticRun))
 }
 
-// TestTheStaticPlannerNeverBurnsBudget is SPEC.md 12.1 stated as a measurement:
-// "the static planner simply cannot fail at run time ... so
-// planner_attempt_count never leaves 0". SPEC.md 12.1 asks for exactly this -
-// that the rule be relied on rather than special-cased - so the run is driven
-// through the same budget path as every other and the counter is read
-// afterwards.
-func TestTheStaticPlannerNeverBurnsBudget(t *testing.T) {
-	harness.Bool(t, "SPEC.md 12.1: the static planner makes no network call and cannot fail",
-		"SELECT planner_attempt_count = 0 AND last_planner_error IS NULL FROM runs WHERE run_id = :'run';",
-		harness.Var(obs.staticRun))
+// TestTheStaticPlannerIsOnTheRecordToo is SPEC.md 12.1's no-exemption rule made
+// visible: "these rules apply to every planner, including the built-in static
+// one, with no exemption ... an implementation that special-cases the static
+// planner out of the budget path has added a branch to work around a situation
+// that cannot occur, and that branch will outlive the reason for it."
+//
+// So the static planner's answers are rows like any other planner's - three of
+// them for a two-step workflow - and none of them can be FAILED, because
+// SPEC.md 12.1 also says it "holds no state and makes no network call".
+func TestTheStaticPlannerIsOnTheRecordToo(t *testing.T) {
+	harness.Bool(t, "SPEC.md 4.2, 12.1: the static planner was asked three times and answered every time",
+		`SELECT count(*) = 3
+                AND count(*) FILTER (WHERE status = 'FAILED') = 0
+                AND count(*) FILTER (WHERE answer = 'continue') = 2
+                AND count(*) FILTER (WHERE answer = 'done') = 1
+           FROM planner_calls WHERE run_id = :'run';`, harness.Var(obs.staticRun))
+	harness.Bool(t, "SPEC.md 12.1: and its budget never left 0",
+		"SELECT planner_attempt_count = 0 FROM runs WHERE run_id = :'run';", harness.Var(obs.staticRun))
 }
 
 // TestThePlannerChoiceIsFixedAtCreation asserts SPEC.md 6.1's invariant on the
 // two rows the previous legs created: the http workflow carries planner_url and
 // fetch_base_url and no static steps; the static workflow carries the array and
-// neither URL. The amendment that added fetch_base_url put both http columns on
-// the same side of that invariant.
+// neither URL.
 func TestThePlannerChoiceIsFixedAtCreation(t *testing.T) {
 	harness.Bool(t, "SPEC.md 6.1: an http workflow carries planner_url and fetch_base_url, and no array",
 		`SELECT planner_type = 'http' AND planner_url IS NOT NULL AND fetch_base_url IS NOT NULL
@@ -194,12 +248,23 @@ func TestEveryPlannerFailureLandsAtL5(t *testing.T) {
 	}
 }
 
-// TestEveryPlannerSideEntryNamesNoStep: SPEC.md 12.3 gives the planner-side
-// column dead_letter_queue.step_id = NULL, and SPEC.md 6.5 says "step_id IS
-// NULL already distinguishes the two sides, so no separate column records it".
-func TestEveryPlannerSideEntryNamesNoStep(t *testing.T) {
+// TestTheEntrySaysWhichSituationStoppedTheRun is SPEC.md 6.5 after the
+// amendment: "reason says which of three situations stopped the run. It does
+// not say why any individual exchange failed."
+//
+// Six of these seven fixtures fail their calls in different ways and all reach
+// the same entry, which is the point: the entry is about the RUN, and the kind
+// of failure is a fact about a CALL.
+func TestTheEntrySaysWhichSituationStoppedTheRun(t *testing.T) {
 	for _, file := range dlqFiles {
+		want := "planner_budget_exhausted"
+		if file == fileFail {
+			want = "planner_declared_fail"
+		}
 		t.Run(file, func(t *testing.T) {
+			harness.Bool(t, fmt.Sprintf("SPEC.md 6.5: reason is %s", want),
+				fmt.Sprintf("SELECT reason = '%s' FROM dead_letter_queue WHERE run_id = :'run';", want),
+				harness.Var(obs.dlqRun[file]))
 			harness.Bool(t, "SPEC.md 12.3, 6.5: exactly one entry, and it names no step",
 				`SELECT count(*) = 1 AND count(*) FILTER (WHERE step_id IS NULL) = 1
                    FROM dead_letter_queue WHERE run_id = :'run';`, harness.Var(obs.dlqRun[file]))
@@ -224,32 +289,38 @@ func TestNothingReachedAWorker(t *testing.T) {
 	}
 }
 
-// TestUnreachableTimeoutAndNon2xxAllReadUnreachable pins SPEC.md 6.5's first
-// planner reason, which deliberately covers three different events with one
-// value: "the planner could not be called: connection refused, timeout,
-// non-2xx".
+// TestEachCallSaysHowItFailed is where the amendment pays for itself. SPEC.md
+// 5.8 gives a planner call the same three failure reasons SPEC.md 5.3 gives an
+// attempt, and each fixture produces one of them in a different way:
 //
-// The three fixtures produce one each - a host that does not resolve, a planner
-// that sleeps past planner_timeout_seconds, and a planner that answers 500 -
-// and the column must not tell them apart.
-func TestUnreachableTimeoutAndNon2xxAllReadUnreachable(t *testing.T) {
-	for _, file := range []string{fileUnreachable, fileSlow, fileHTTP500} {
-		t.Run(file, func(t *testing.T) {
-			assertReason(t, file, "planner_unreachable",
-				"SPEC.md 6.5: connection refused, timeout and non-2xx are one reason")
-		})
+//	unreachable  a host that does not resolve   -> transport_error
+//	http500      an answer, but a non-2xx one   -> transport_error
+//	slow         no answer before the deadline  -> timeout
+//	garbage      a status outside SPEC.md 9.3's -> invalid_response
+//	badstep      a StepSpec SPEC.md 9.8 rejects -> invalid_response
+//
+// The pairing of `unreachable` and `slow` is SPEC.md 5.8's clock rule, which
+// this milestone can test only because the two now land on different rows:
+// "an exchange is timeout ONLY if the deadline passed; a connection refused at
+// second 3 of a 30-second budget is transport_error."
+func TestEachCallSaysHowItFailed(t *testing.T) {
+	want := map[string]string{
+		fileUnreachable: "transport_error",
+		fileHTTP500:     "transport_error",
+		fileSlow:        "timeout",
+		fileGarbage:     "invalid_response",
+		fileBadStep:     "invalid_response",
 	}
-}
-
-// TestAnUnusableAnswerReadsInvalidResponse pins SPEC.md 6.5's second reason:
-// "the planner replied with something 9.3 / 9.8 rejects". The two fixtures are
-// the two halves of that sentence - a status outside SPEC.md 9.3's three, and a
-// StepSpec that SPEC.md 9.8 rule 6 rejects for an unknown top-level key.
-func TestAnUnusableAnswerReadsInvalidResponse(t *testing.T) {
-	for _, file := range []string{fileGarbage, fileBadStep} {
+	for file, reason := range want {
 		t.Run(file, func(t *testing.T) {
-			assertReason(t, file, "planner_invalid_response",
-				"SPEC.md 6.5, 9.3, 9.8: an answer the system cannot act on")
+			harness.Bool(t, fmt.Sprintf("SPEC.md 5.8, 6.8: every failed call of this run reads %s", reason),
+				fmt.Sprintf(`SELECT count(*) > 0 AND bool_and(failure_reason = '%s')
+                               FROM planner_calls WHERE run_id = :'run' AND status = 'FAILED';`, reason),
+				harness.Var(obs.dlqRun[file]))
+			harness.Bool(t, "SPEC.md 6.8 invariant 1: a FAILED call names a reason and carries no answer",
+				`SELECT count(*) = 0 FROM planner_calls
+                  WHERE run_id = :'run' AND status = 'FAILED'
+                    AND (failure_reason IS NULL OR answer IS NOT NULL);`, harness.Var(obs.dlqRun[file]))
 		})
 	}
 }
@@ -266,31 +337,43 @@ func TestAnInvalidStepSpecNeverCreatesAStep(t *testing.T) {
 		"SELECT count(*) = 0 FROM steps WHERE run_id = :'run';", harness.Var(obs.dlqRun[fileBadStep]))
 }
 
-// TestMixedFailuresReadBudgetExhausted pins the sentence that gives SPEC.md
-// 6.5's third reason its meaning: planner_budget_exhausted is "set instead of
-// the two above when the round's failures were not all of one kind".
+// TestTwoKindsOfFailureInOneDecisionPoint is what the `mixed` fixture tests now.
 //
-// The fixture answers 500 once and then an unknown status, so the round holds
-// one of each. An implementation that simply reported the last failure's kind,
-// or always reported budget exhaustion, gets exactly one of these three tests
-// wrong.
-func TestMixedFailuresReadBudgetExhausted(t *testing.T) {
-	assertReason(t, fileMixed, "planner_budget_exhausted",
-		"SPEC.md 6.5: a round whose failures were not all of one kind")
+// It used to exist for a rule that no longer does: the dead-letter entry had to
+// choose a single word for a set of failures, and a special value existed for a
+// set that was not all of one kind. That rule was unsatisfiable from stored
+// state, which is why SPEC.md 6.8 exists. What the fixture demonstrates instead
+// is the thing the rule was reaching for: one decision point, two failures, two
+// kinds, each on its own row and each true at the moment it was written.
+func TestTwoKindsOfFailureInOneDecisionPoint(t *testing.T) {
+	harness.Bool(t, "SPEC.md 5.8, 6.8: the round holds one transport_error and one invalid_response",
+		`SELECT count(*) FILTER (WHERE failure_reason = 'transport_error') = 1
+            AND count(*) FILTER (WHERE failure_reason = 'invalid_response') = 1
+           FROM planner_calls WHERE run_id = :'run' AND status = 'FAILED';`,
+		harness.Var(obs.dlqRun[fileMixed]))
+	harness.Bool(t, "SPEC.md 6.5: and the entry says only that the budget ran out",
+		"SELECT reason = 'planner_budget_exhausted' FROM dead_letter_queue WHERE run_id = :'run';",
+		harness.Var(obs.dlqRun[fileMixed]))
 }
 
 // TestADeclaredFailIsNotAFailure is SPEC.md 12.1's exception, and the only
 // dead-letter entry in this suite that costs nothing: "a fail response is not a
 // planner failure - it is a valid answer, and it sends the run to DLQ
-// immediately without consuming budget".
+// immediately without consuming budget."
+//
+// SPEC.md 12.1 also fixes how it is recorded - "it is written as a DONE row
+// whose answer is fail" - which is what makes the distinction inspectable
+// rather than merely stated.
 func TestADeclaredFailIsNotAFailure(t *testing.T) {
 	run := obs.dlqRun[fileFail]
-	assertReason(t, fileFail, "planner_declared_fail",
-		"SPEC.md 6.5: the planner answered fail")
-	harness.Bool(t, "SPEC.md 12.1: a fail answer consumes no budget",
-		"SELECT planner_attempt_count = 0 FROM runs WHERE run_id = :'run';", harness.Var(run))
-	harness.Bool(t, "SPEC.md 6.5: the entry records the budget consumed at the verdict, which is none",
-		"SELECT attempt_count = 0 FROM dead_letter_queue WHERE run_id = :'run';", harness.Var(run))
+	harness.Bool(t, "SPEC.md 12.1, 6.8: one call, DONE, answering fail, and saying why",
+		`SELECT count(*) = 1
+                AND bool_and(status = 'DONE' AND answer = 'fail' AND length(coalesce(error_text, '')) > 0)
+           FROM planner_calls WHERE run_id = :'run';`, harness.Var(run))
+	harness.Bool(t, "SPEC.md 12.1: no call failed, so no budget was consumed",
+		`SELECT (SELECT count(*) FROM planner_calls WHERE run_id = :'run' AND status = 'FAILED') = 0
+            AND (SELECT planner_attempt_count FROM runs WHERE run_id = :'run') = 0;`,
+		harness.Var(run))
 	harness.Bool(t, "SPEC.md 12.4: the entry still says why it stopped",
 		"SELECT length(error_text) > 0 FROM dead_letter_queue WHERE run_id = :'run';", harness.Var(run))
 }
@@ -301,9 +384,9 @@ func TestADeclaredFailIsNotAFailure(t *testing.T) {
 // retry count. The expected value is read from each fixture rather than written
 // as a literal.
 //
-// SPEC.md 6.5's attempt_count column must agree with the run's: "the budget
-// consumed at the moment of the verdict ... runs.planner_attempt_count for a
-// planner-side one".
+// The counter and the rows must agree. SPEC.md 12.2 writes them in one
+// transaction, so a disagreement would mean one of the two was written outside
+// it.
 func TestTheBudgetStopsExactlyAtMaxAttempts(t *testing.T) {
 	for _, file := range dlqFiles {
 		if file == fileFail {
@@ -315,33 +398,29 @@ func TestTheBudgetStopsExactlyAtMaxAttempts(t *testing.T) {
 				"calls, its total budget", budget),
 				fmt.Sprintf("SELECT planner_attempt_count = %d FROM runs WHERE run_id = :'run';", budget),
 				harness.Var(obs.dlqRun[file]))
-			harness.Bool(t, "SPEC.md 6.5: the entry records the same number the run does",
-				`SELECT d.attempt_count = r.planner_attempt_count
-                   FROM dead_letter_queue d JOIN runs r ON r.run_id = d.run_id
-                  WHERE d.run_id = :'run';`, harness.Var(obs.dlqRun[file]))
+			harness.Bool(t, fmt.Sprintf("SPEC.md 6.8, 12.2: and %d FAILED calls are on the record", budget),
+				fmt.Sprintf(`SELECT count(*) = %d FROM planner_calls
+                               WHERE run_id = :'run' AND status = 'FAILED';`, budget),
+				harness.Var(obs.dlqRun[file]))
 		})
 	}
 }
 
-// TestTheDiagnosisIsInTheDatabase: SPEC.md 6.2 keeps last_planner_error because
-// "a planner failure happens where there is no step" and there is no attempts
-// row to hold it, and SPEC.md 17.3 requires error text to live in the database
-// rather than only in logs. SPEC.md 12.4 requires the same of the entry.
-//
-// The declared-fail run is excluded from the first half: SPEC.md 6.2 defines
-// last_planner_error as the text of the most recent FAILED call, and SPEC.md
-// 12.1 says a fail answer is not one. SPEC.md does not say what the column
-// holds in that case, so this suite asserts nothing about it (R37-g).
+// TestTheDiagnosisIsInTheDatabase: SPEC.md 6.2 no longer keeps a copy of the
+// newest planner error on the run, so the diagnosis has exactly one home - the
+// call that produced it. SPEC.md 17.3 requires it to be in the database at all,
+// and SPEC.md 6.8 invariant 3 requires a failed call to carry it.
 func TestTheDiagnosisIsInTheDatabase(t *testing.T) {
 	for _, file := range dlqFiles {
 		if file == fileFail {
-			continue
+			continue // Covered by TestADeclaredFailIsNotAFailure, which has no failed call.
 		}
 		t.Run(file, func(t *testing.T) {
-			harness.Bool(t, "SPEC.md 6.2, 17.3: the run names the most recent planner failure",
-				"SELECT length(coalesce(last_planner_error, '')) > 0 FROM runs WHERE run_id = :'run';",
-				harness.Var(obs.dlqRun[file]))
-			harness.Bool(t, "SPEC.md 12.4: the entry says why it stopped",
+			harness.Bool(t, "SPEC.md 6.8 invariant 3, 17.3: every failed call says what went wrong",
+				`SELECT count(*) = 0 FROM planner_calls
+                  WHERE run_id = :'run' AND status = 'FAILED'
+                    AND length(coalesce(error_text, '')) = 0;`, harness.Var(obs.dlqRun[file]))
+			harness.Bool(t, "SPEC.md 12.4: the entry records the most recent failure",
 				"SELECT length(error_text) > 0 FROM dead_letter_queue WHERE run_id = :'run';",
 				harness.Var(obs.dlqRun[file]))
 		})
@@ -370,9 +449,9 @@ func TestTheRunHadNoStepsWhileItWasInDLQ(t *testing.T) {
 // could not reach: "what replay resumes - asking the planner again".
 //
 // Delta's replay re-dispatched a step. This one has no step to re-dispatch, and
-// the only way the run can move is a fresh planner call. The fixture's counter
-// is the direct reading; the steps that now exist are the same fact seen in the
-// database.
+// the only way the run can move is a fresh planner call. There are now two
+// independent readings of that: the fixture's own counter, and - since SPEC.md
+// 6.8 - the calls themselves.
 func TestReplayAsksThePlannerAgain(t *testing.T) {
 	if obs.recoversCallsAfter <= obs.recoversCallsBefore {
 		t.Errorf("SPEC.md 12.3, 14: a replayed planner-side run must be planned again; the planner "+
@@ -381,6 +460,36 @@ func TestReplayAsksThePlannerAgain(t *testing.T) {
 	}
 	harness.Bool(t, "SPEC.md 4.2 L1, 14: steps now exist that could not exist before the replay",
 		"SELECT count(*) = 2 FROM steps WHERE run_id = :'run';", harness.Var(obs.recoversRun))
+}
+
+// TestEachCallSaysWhichRoundItBelongedTo is SPEC.md 14's inspectability rule on
+// the table the amendment added: "because replay_count is incremented first,
+// inside the same transaction, every attempt dispatched and every planner call
+// made afterwards carries the new number. The rows of the round that failed
+// keep the old one, unchanged."
+//
+// It is the assertion that makes the fixture's counter unnecessary rather than
+// merely corroborated - the same fact, in the database, where the operator can
+// read it at a terminal (SPEC.md 17.1).
+func TestEachCallSaysWhichRoundItBelongedTo(t *testing.T) {
+	budget := plannerBudget[fileRecovers]
+	harness.Bool(t, fmt.Sprintf("SPEC.md 14, 6.8: round 0 holds the %d calls that failed", budget),
+		fmt.Sprintf(`SELECT count(*) = %d AND bool_and(status = 'FAILED')
+                       FROM planner_calls WHERE run_id = :'run' AND replay_round = 0;`, budget),
+		harness.Var(obs.recoversRun))
+	harness.Bool(t, "SPEC.md 14, 6.8: round 1 holds the three that answered - continue, continue, done",
+		`SELECT count(*) = 3 AND count(*) FILTER (WHERE status = 'DONE') = 3
+                AND count(*) FILTER (WHERE answer = 'done') = 1
+           FROM planner_calls WHERE run_id = :'run' AND replay_round = 1;`,
+		harness.Var(obs.recoversRun))
+	harness.Bool(t, "SPEC.md 6.8: call_no keeps ordering the whole conversation across both rounds",
+		`SELECT count(*) = 0 FROM (
+             SELECT call_no, row_number() OVER (ORDER BY call_no) AS expected
+               FROM planner_calls WHERE run_id = :'run') t
+          WHERE t.call_no <> t.expected;`, harness.Var(obs.recoversRun))
+	harness.Bool(t, "SPEC.md 6.8, 14: the steps of round 1 were dispatched in round 1",
+		"SELECT bool_and(replay_round = 1) FROM attempts WHERE run_id = :'run';",
+		harness.Var(obs.recoversRun))
 }
 
 // TestTheReplayedRunFinished: SPEC.md 14 puts the run back to RUNNING and
@@ -407,10 +516,10 @@ func TestTheReplayedRunFinished(t *testing.T) {
 		"SELECT planner_attempt_count = 0 FROM runs WHERE run_id = :'run';", harness.Var(obs.recoversRun))
 }
 
-// TestTheFailedRoundIsStillOnTheRecord: SPEC.md 6.7 makes dead_letter_queue
-// append-only and SPEC.md 12.4 says an entry "is written once and never
-// modified". A replay is the one operation that would be tempted to tidy the
-// entry away, since what it recorded is no longer true.
+// TestTheFailedRoundIsStillOnTheRecord: SPEC.md 6.7 makes both history tables
+// append-only, and SPEC.md 12.4 says an entry "is written once and never
+// modified". A replay is the one operation that would be tempted to tidy them
+// away, since what they recorded is no longer true.
 func TestTheFailedRoundIsStillOnTheRecord(t *testing.T) {
 	harness.Equal(t, "SPEC.md 6.7, 12.4: the entry is identical either side of the replay",
 		obs.recoversDLQBefore, obs.recoversDLQAfter)
@@ -419,6 +528,10 @@ func TestTheFailedRoundIsStillOnTheRecord(t *testing.T) {
            FROM dead_letter_queue WHERE run_id = :'run';`, harness.Var(obs.recoversRun))
 	harness.Bool(t, "SPEC.md 14, 6.2: one replay leaves replay_count = 1, and the run keeps its identity",
 		"SELECT replay_count = 1 FROM runs WHERE run_id = :'run';", harness.Var(obs.recoversRun))
+	harness.Bool(t, "SPEC.md 6.7: the failed round's calls survive the round that succeeded",
+		`SELECT count(*) > 0 FROM planner_calls
+          WHERE run_id = :'run' AND replay_round = 0 AND status = 'FAILED';`,
+		harness.Var(obs.recoversRun))
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +604,32 @@ func TestNoImpossibleCombinationExists(t *testing.T) {
                   ('CANCELLED','CANCELLED'), ('CANCELLED','DONE'), ('CANCELLED','DLQ'));`)
 }
 
+// TestEveryPlannerCallSatisfiesItsInvariants sweeps SPEC.md 6.8's three
+// invariants across every row this milestone wrote. They are stated there as
+// obligations on the backend, and this is the assertion that they hold of the
+// system as a whole rather than of the one fixture that happened to be looked
+// at.
+func TestEveryPlannerCallSatisfiesItsInvariants(t *testing.T) {
+	harness.Bool(t, "SPEC.md 6.8 invariant 1: FAILED implies a reason and no answer",
+		`SELECT count(*) = 0 FROM planner_calls
+          WHERE (status = 'FAILED') <> (failure_reason IS NOT NULL);`)
+	harness.Bool(t, "SPEC.md 6.8 invariant 2: DONE implies an answer and no reason",
+		`SELECT count(*) = 0 FROM planner_calls
+          WHERE (status = 'DONE') <> (answer IS NOT NULL);`)
+	harness.Bool(t, "SPEC.md 6.8 invariant 3: a failed call, and a declared fail, both say why",
+		`SELECT count(*) = 0 FROM planner_calls
+          WHERE (status = 'FAILED' OR answer = 'fail')
+            AND length(coalesce(error_text, '')) = 0;`)
+	harness.Bool(t, "SPEC.md 5.8: no planner call carries a reason that belongs to an attempt alone",
+		`SELECT count(*) = 0 FROM planner_calls
+          WHERE failure_reason IS NOT NULL
+            AND failure_reason NOT IN ('transport_error', 'invalid_response', 'timeout');`)
+	harness.Bool(t, "SPEC.md 5.8, 6.8: every call is finished, because the row is written at the outcome",
+		"SELECT count(*) = 0 FROM planner_calls WHERE finished_at IS NULL OR status = 'RUNNING';")
+	harness.Bool(t, "SPEC.md 6.8: every call names the orchestrator that made it",
+		"SELECT count(*) = 0 FROM planner_calls WHERE coalesce(called_by, '') = '';")
+}
+
 // TestEveryRunIsTerminal guards the fixture rather than the system: a leg that
 // silently left a run mid-flight would make several assertions above pass by
 // accident.
@@ -519,13 +658,4 @@ func TestWhatZetaDoesNotDemonstrate(t *testing.T) {
 	harness.Bool(t, "SPEC.md 11.2: step-level overrides are milestone eta and must be absent",
 		`SELECT count(*) = 0 FROM steps
           WHERE decision ? 'timeout_seconds' OR decision ? 'max_attempts';`)
-}
-
-// assertReason checks one fixture's dead-letter reason against SPEC.md 6.5's
-// enumeration.
-func assertReason(t *testing.T, file, want, why string) {
-	t.Helper()
-	harness.Bool(t, fmt.Sprintf("%s: reason must be %q", why, want),
-		fmt.Sprintf("SELECT reason = '%s' FROM dead_letter_queue WHERE run_id = :'run';", want),
-		harness.Var(obs.dlqRun[file]))
 }

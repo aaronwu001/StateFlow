@@ -281,55 +281,138 @@ func (e *Engine) drive(runID string) {
 }
 
 // plan is SPEC.md 4.2's L1: ask the planner, and persist the answer.
+//
+// The two planner types differ in exactly one place - how the decision is
+// obtained - and in nothing after it. SPEC.md 12.1 requires that: "these rules
+// apply to every planner, including the built-in static one, with no
+// exemption ... an implementation that special-cases the static planner out of
+// the budget path has added a branch to work around a situation that cannot
+// occur, and that branch will outlive the reason for it."
+//
+// So a call is timed, classified and recorded the same way whichever planner
+// answered, and SPEC.md 4.2's four rows below are one switch and not two.
 func (e *Engine) plan(st *storage.DriverState) bool {
 	runID := st.Run.RunID
+	startedAt := time.Now().UTC()
 
-	if st.Workflow.PlannerType != model.PlannerStatic {
-		// SPEC.md 19.3 keeps the HTTP planner designed in and unbuilt until
-		// milestone ζ. SPEC.md 16 accepts the workflow, because planner_type
-		// "http" is an enumerated value, so a run against one can exist; it is
-		// reported as a planner call that could not be made, which burns
-		// planner budget and converges to DLQ under SPEC.md 12.2 rather than
-		// leaving the run RUNNING forever.
-		return e.plannerFailed(st, model.DLQPlannerUnreachable, fmt.Sprintf(
-			"piton: planner_type %q is milestone zeta and is not implemented in this build "+
-				"(SPEC.md 19.3)", st.Workflow.PlannerType))
+	var (
+		decision *planner.Decision
+		failure  *planner.Failure
+	)
+
+	switch st.Workflow.PlannerType {
+	case model.PlannerStatic:
+		d, err := planner.Static(st.Workflow, st.StepCount)
+		if err != nil {
+			// SPEC.md 12.1 says this cannot happen - the static planner "holds
+			// no state and makes no network call", and SPEC.md 6.1 validated
+			// its steps at submission. It is routed through the ordinary path
+			// anyway rather than special-cased.
+			failure = &planner.Failure{Reason: model.FailureInvalidResponse, Text: err.Error()}
+		} else {
+			decision = d
+		}
+
+	case model.PlannerHTTP:
+		history, err := e.store.PlannerHistory(e.ctx, runID)
+		if err != nil {
+			// Storage being unreachable is not the planner failing, and must
+			// not burn its budget. SPEC.md 13.1 item 6: "runs orphan intact
+			// and are reclaimed when storage returns."
+			e.logUnexpected(runID, "cannot read the planner history", err)
+			return false
+		}
+		decision, failure = planner.HTTP(e.ctx, e.client, st.Workflow.PlannerURL,
+			planner.Request{
+				RunID:         runID,
+				WorkflowInput: st.Run.Input,
+				History:       historyRows(history),
+				FetchBaseURL:  st.Workflow.FetchBaseURL,
+			},
+			time.Duration(st.Workflow.PlannerTimeoutSeconds)*time.Second)
+
+	default:
+		// SPEC.md 6.1 enumerates two planner types and SPEC.md 16 rule 1
+		// rejects anything else before a run can exist, so an accepted
+		// workflow cannot reach here. It is reported rather than ignored,
+		// because a run that cannot be planned must converge (SPEC.md 12.2)
+		// instead of sitting RUNNING for ever.
+		failure = &planner.Failure{Reason: model.FailureInvalidResponse,
+			Text: fmt.Sprintf("piton: workflow %s has planner_type %q, which SPEC.md 6.1 does not define",
+				st.Workflow.WorkflowID, st.Workflow.PlannerType)}
 	}
 
-	decision, err := planner.Static(st.Workflow, st.StepCount)
-	if err != nil {
-		// SPEC.md 12.1 says this cannot happen: the static planner "holds no
-		// state and makes no network call", and SPEC.md 6.1 validated its
-		// steps at submission. It is still routed through the budget path
-		// rather than special-cased, because SPEC.md 12.1 forbids exempting
-		// the static planner: "an implementation that special-cases the static
-		// planner out of the budget path has added a branch to work around a
-		// situation that cannot occur, and that branch will outlive the reason
-		// for it."
-		return e.plannerFailed(st, model.DLQPlannerInvalidResponse, err.Error())
+	if failure != nil {
+		return e.plannerFailed(st, startedAt, failure)
 	}
+
+	// SPEC.md 4.2: the answer and its effect are written together, and SPEC.md
+	// 6.8 is where the answer itself is written.
+	call := storage.PlannerCallRecord{StartedAt: startedAt, FinishedAt: time.Now().UTC()}
 
 	switch decision.Status {
 	case planner.StatusDone:
-		if err := e.store.CompleteRun(e.ctx, e.ID, runID); err != nil {
+		call.Answer = model.AnswerDone
+		if err := e.store.CompleteRun(e.ctx, e.ID, runID, call); err != nil {
 			e.logUnexpected(runID, "cannot complete the run", err)
 		}
 		return false
 
 	case planner.StatusContinue:
-		return e.beginStep(st, decision.Step)
+		call.Answer = model.AnswerContinue
+		return e.beginStep(st, decision.Step, call)
+
+	case planner.StatusFail:
+		// SPEC.md 12.1: "a fail response is not a planner failure - it is a
+		// valid answer, and it sends the run to DLQ immediately without
+		// consuming budget."
+		call.Answer = model.AnswerFail
+		call.ErrorText = decision.Reason
+		if err := e.store.DeadLetterPlannerFail(e.ctx, e.ID, storage.PlannerDeclaredFailInput{
+			RunID:     runID,
+			Call:      call,
+			ErrorText: decision.Reason,
+		}); err != nil {
+			e.logUnexpected(runID, "cannot dead-letter the run the planner refused", err)
+		}
+		return false
 
 	default:
-		// SPEC.md 6.1: the static planner "never answers fail". Reaching here
-		// would mean this function and planner.Static disagree.
-		e.logf("run %s: the static planner answered %q, which SPEC.md 6.1 does not permit",
+		// planner.HTTP and planner.Static both answer with one of the three or
+		// with a failure, so reaching here would mean this function and one of
+		// them disagree about SPEC.md 9.3.
+		e.logf("run %s: the planner answered %q, which SPEC.md 9.3 does not define",
 			runID, decision.Status)
 		return false
 	}
 }
 
+// historyRows turns SPEC.md 9.2's catalogue into the wire shape. The timestamp
+// is rendered as RFC 3339 in UTC, which is what SPEC.md 9.2's example shows.
+func historyRows(steps []storage.HistoryStep) []planner.HistoryRow {
+	rows := make([]planner.HistoryRow, 0, len(steps))
+	for _, s := range steps {
+		row := planner.HistoryRow{
+			StepID:       s.StepID,
+			StepName:     s.StepName,
+			Seq:          s.Seq,
+			Status:       s.Status,
+			OutputBytes:  s.OutputBytes,
+			AttemptCount: s.AttemptCount,
+		}
+		if s.CompletedAt != nil {
+			at := s.CompletedAt.UTC().Format(time.RFC3339)
+			row.CompletedAt = &at
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
 // beginStep persists a `continue` decision and dispatches its first attempt.
-func (e *Engine) beginStep(st *storage.DriverState, decision []byte) bool {
+func (e *Engine) beginStep(st *storage.DriverState, decision []byte,
+	call storage.PlannerCallRecord) bool {
+
 	runID := st.Run.RunID
 
 	// SPEC.md 9.8: an invalid StepSpec "is a planner failure and consumes
@@ -337,10 +420,17 @@ func (e *Engine) beginStep(st *storage.DriverState, decision []byte) bool {
 	// step." For the static planner this is unreachable — SPEC.md 6.1 rejected
 	// such a StepSpec at POST /workflows — and it is checked here anyway
 	// because the rule is about planners, not about one planner.
+	//
+	// The call that carried it is therefore recorded as FAILED rather than as
+	// the `continue` it claimed to be: SPEC.md 5.8 gives that invalid_response,
+	// and the run gains no step (SPEC.md 6.8's invariants keep the two facts
+	// from contradicting each other).
 	spec, rej := validate.StepSpec(decision)
 	if rej != nil {
-		return e.plannerFailed(st, model.DLQPlannerInvalidResponse,
-			"piton: the planner returned an invalid StepSpec: "+rej.Message)
+		return e.plannerFailed(st, call.StartedAt, &planner.Failure{
+			Reason: model.FailureInvalidResponse,
+			Text:   "piton: the planner returned an invalid StepSpec: " + rej.Message,
+		})
 	}
 
 	d, err := e.store.BeginStep(e.ctx, e.ID, storage.BeginStepInput{
@@ -349,6 +439,7 @@ func (e *Engine) beginStep(st *storage.DriverState, decision []byte) bool {
 		Decision:       decision,
 		ConnectionMode: spec.ConnectionMode,
 		TimeoutSeconds: st.Workflow.StepTimeoutSeconds,
+		Call:           call,
 	})
 	if err != nil {
 		e.logUnexpected(runID, "cannot create the next step", err)
@@ -571,11 +662,25 @@ func (e *Engine) assembleInputs(runID string, seq int, spec *validate.Spec) (map
 // plannerFailed is SPEC.md 4.2's fourth L1 row: "increment
 // runs.planner_attempt_count; if it has reached planner_max_attempts,
 // planner-side dead-letter; otherwise the loop retries the call".
-func (e *Engine) plannerFailed(st *storage.DriverState, reason, errText string) bool {
+func (e *Engine) plannerFailed(st *storage.DriverState, startedAt time.Time,
+	f *planner.Failure) bool {
+
+	// A call cut short because this process is stopping is not the planner's
+	// failure, and must not move the run towards DLQ for something the planner
+	// did not do. SPEC.md 13.2 item 4 says what happens instead: the run is
+	// reclaimed and the planner is asked again.
+	if f.Interrupted() || e.ctx.Err() != nil {
+		return false
+	}
+
 	deadLettered, err := e.store.RecordPlannerFailure(e.ctx, e.ID, storage.PlannerFailureInput{
-		RunID:     st.Run.RunID,
-		Reason:    reason,
-		ErrorText: errText,
+		RunID: st.Run.RunID,
+		Call: storage.PlannerCallRecord{
+			FailureReason: f.Reason,
+			ErrorText:     f.Text,
+			StartedAt:     startedAt,
+			FinishedAt:    time.Now().UTC(),
+		},
 	})
 	if err != nil {
 		e.logUnexpected(st.Run.RunID, "cannot record the planner failure", err)
@@ -584,10 +689,15 @@ func (e *Engine) plannerFailed(st *storage.DriverState, reason, errText string) 
 	if deadLettered {
 		return false
 	}
-	// A pause before the retry, so that a planner that is refusing connections
-	// is retried rather than spun on. The budget, not this pause, is what makes
-	// the run converge (SPEC.md 12.2).
-	return e.pause(time.Second)
+
+	// SPEC.md 11.1's planner_retry_delay_seconds, which exists so that a
+	// planner refusing connections is retried rather than spun on. The same
+	// section forbids the fixed interval this line used to hold: "an
+	// implementation that waits a fixed interval of its own between planner
+	// calls has invented a value the operator cannot see, cannot change, and
+	// will not find in this document." The budget, never the wait, is what
+	// makes the run converge (SPEC.md 12.2).
+	return e.pause(time.Duration(st.Workflow.PlannerRetryDelaySeconds) * time.Second)
 }
 
 // pause waits, and reports whether the driver should carry on afterwards.

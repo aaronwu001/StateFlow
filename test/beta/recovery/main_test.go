@@ -151,7 +151,7 @@ const runDigest = `SELECT md5(
                 coalesce(a.finished_at::text, '') || a.dispatched_by AS x
            FROM attempts a WHERE a.run_id = :'run') t3)
    || (SELECT coalesce(string_agg(x, '|' ORDER BY x), '') FROM (
-         SELECT d.dlq_id::text || d.reason || d.replay_round || d.attempt_count ||
+         SELECT d.dlq_id::text || d.reason || d.replay_round ||
                 coalesce(d.step_id::text, '') AS x
            FROM dead_letter_queue d WHERE d.run_id = :'run') t4));`
 

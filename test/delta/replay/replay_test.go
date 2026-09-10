@@ -491,6 +491,35 @@ func TestAttemptNumbersStayContiguousAcrossRounds(t *testing.T) {
 		"SELECT count(*) = 0 FROM attempts WHERE (status = 'RUNNING') <> (finished_at IS NULL);")
 }
 
+// TestEveryAttemptSaysWhichRoundItBelongedTo is SPEC.md 6.4's replay_round, and
+// delta is the only milestone so far that can test it: nowhere else does a step
+// hold rows from more than one round.
+//
+// SPEC.md 14 is what makes it necessary — "because replay_count is incremented
+// first, inside the same transaction, every attempt dispatched afterwards
+// carries the new number. The rows of the round that failed keep the old one,
+// unchanged." So the leg that failed twice and then succeeded must show a
+// boundary in this column, and the attempts before it must still read 0.
+func TestEveryAttemptSaysWhichRoundItBelongedTo(t *testing.T) {
+	harness.Bool(t, "SPEC.md 6.4: no attempt claims a round the run has not reached",
+		`SELECT count(*) = 0 FROM attempts a JOIN runs r ON r.run_id = a.run_id
+          WHERE a.replay_round < 0 OR a.replay_round > r.replay_count;`)
+	harness.Bool(t,
+		"SPEC.md 14, 6.4: leg 1's step was dispatched in round 0 until its budget ran out, and again in round 1",
+		`SELECT count(*) FILTER (WHERE a.replay_round = 0) = :budget
+            AND count(*) FILTER (WHERE a.replay_round = 1) = 1
+           FROM attempts a JOIN steps s ON s.step_id = a.step_id
+          WHERE a.run_id = :'run' AND s.step_name = 'stumbles';`,
+		harness.Var(obs.resumesRun),
+		fmt.Sprintf("budget=%d", maxAttempts[fileResumes]))
+	harness.Bool(t,
+		"SPEC.md 6.4, 6.5: the round an attempt names is the round the dead-letter entry named",
+		`SELECT count(*) = 0 FROM dead_letter_queue d
+          WHERE d.step_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM attempts a
+                             WHERE a.step_id = d.step_id AND a.replay_round = d.replay_round);`)
+}
+
 // TestNoImpossibleCombinationSurvivedAReplay: SPEC.md 5.6 calls these
 // impossible "because of a transaction boundary, not because of a check
 // somewhere", and SPEC.md 14 performs its work "in one transaction". A replay
@@ -536,8 +565,8 @@ func TestDeltaIsWorkerSideOnly(t *testing.T) {
 		"SELECT bool_and(reason = 'worker_budget_exhausted') FROM dead_letter_queue;")
 	harness.Bool(t, "SPEC.md 12.1: the static planner cannot fail, so planner_attempt_count stays 0",
 		"SELECT bool_and(planner_attempt_count = 0) FROM runs;")
-	harness.Bool(t, "SPEC.md 12.1: and no run carries a planner error",
-		"SELECT count(*) = 0 FROM runs WHERE last_planner_error IS NOT NULL;")
+	harness.Bool(t, "SPEC.md 12.1, 6.8: and not one planner call in this milestone failed",
+		"SELECT count(*) = 0 FROM planner_calls WHERE status = 'FAILED';")
 }
 
 // TestWhatDeltaDoesNotDemonstrate asserts the absence of everything this

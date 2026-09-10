@@ -181,8 +181,12 @@ diagnose() {
   hr "DIAGNOSTICS"
   say "SPEC.md 17.3 keeps error text in the database, not only in logs. Read the"
   say "database first; the container logs are the second resort."
-  show "SELECT status, planner_attempt_count, replay_count, last_planner_error
+  show "SELECT status, planner_attempt_count, replay_count
           FROM runs WHERE run_id = :'run';"
+  say "SPEC.md 6.8: the planner's own calls. This is where a planner-side"
+  say "diagnosis lives, now that SPEC.md 6.2 keeps no copy of it on the run."
+  show "SELECT call_no, replay_round, status, answer, failure_reason
+          FROM planner_calls WHERE run_id = :'run' ORDER BY call_no;"
   show "SELECT seq, step_name, status, attempt_count FROM steps
          WHERE run_id = :'run' ORDER BY seq;"
   show "SELECT attempt_no, status, connection_mode, failure_reason,

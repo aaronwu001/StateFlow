@@ -361,15 +361,15 @@ services:
                     return {"status": "fail",
                             "reason": "could not fetch the classify output: %s" % exc}
 
-                # SPEC.md 6.3: steps.output is the worker's WHOLE response
-                # body, verbatim - and SPEC.md 9.6's sync+envelope success
-                # shape wraps the worker's own output one level down, inside
-                # {"status":"success","output":{...}}. The classify verdict
-                # therefore sits at body["output"]["kind"], not body["kind"].
-                # Read defensively: a wrong shape must become a visible "fail"
-                # answer, never a silent wrong branch.
-                output = body.get("output") if isinstance(body, dict) else None
-                kind = output.get("kind") if isinstance(output, dict) else None
+                # SPEC.md 9.6 fixes what a step's stored output is, per mode:
+                # in envelope mode it is the response's `output` field alone,
+                # because {"status":..., "output":...} is Piton's protocol and
+                # not the worker's data. So the read API hands back the
+                # worker's result unwrapped, and the classify verdict sits at
+                # body["kind"].
+                # Read defensively all the same: a wrong shape must become a
+                # visible "fail" answer, never a silent wrong branch.
+                kind = body.get("kind") if isinstance(body, dict) else None
 
                 if kind == "invoice":
                     print("planner: run %s - classify said invoice, "
@@ -384,7 +384,7 @@ services:
                           "kind: %r" % (run_id, body), flush=True)
                     return {"status": "fail",
                             "reason": "could not fetch the classify output: "
-                                      "expected body.output.kind to be "
+                                      "expected body.kind to be "
                                       "\"invoice\" or \"receipt\", got %r" % (body,)}
 
                 return {"status": "continue", "step": {

@@ -192,12 +192,23 @@ func TestDeadLetterEntry(t *testing.T) {
 					"FROM dead_letter_queue WHERE run_id = :'run';", v)
 
 			// SPEC.md 6.5: replay_round is runs.replay_count at the moment of
-			// the verdict, and attempt_count is the budget consumed -
-			// steps.attempt_count for a worker-side entry.
+			// the verdict.
+			harness.Bool(t, "SPEC.md 6.5: replay_round = 0",
+				"SELECT replay_round = 0 FROM dead_letter_queue WHERE run_id = :'run';", v)
+
+			// The budget the round consumed is no longer copied onto the
+			// entry. SPEC.md 6.5: "replay_round on every attempt and every
+			// planner call now carries that history on the rows themselves, so
+			// the number is a count rather than a copy - and a copy of a
+			// counter is one more thing that can disagree with the rows it
+			// summarises." So the same claim is made of the rows that hold it.
 			harness.Bool(t,
-				fmt.Sprintf("SPEC.md 6.5: replay_round = 0 and attempt_count = %d", maxAttempts),
-				fmt.Sprintf("SELECT replay_round = 0 AND attempt_count = %d "+
-					"FROM dead_letter_queue WHERE run_id = :'run';", maxAttempts),
+				fmt.Sprintf("SPEC.md 6.4, 6.5: the round that ended in this entry burned %d attempts",
+					maxAttempts),
+				fmt.Sprintf(`SELECT count(*) = %d FROM attempts a
+                               JOIN dead_letter_queue d ON d.step_id = a.step_id
+                              WHERE d.run_id = :'run' AND a.replay_round = d.replay_round;`,
+					maxAttempts),
 				v)
 
 			// SPEC.md 12.4: error_text records the most recent failure, and

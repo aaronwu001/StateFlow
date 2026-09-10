@@ -60,6 +60,12 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /runs/{run_id}/replay", a.replayRun)
 	mux.HandleFunc("GET /runs/{run_id}", a.getRun)
 	mux.HandleFunc("GET /runs/{run_id}/steps", a.getRunSteps)
+	// SPEC.md 10.2, added at milestone zeta. It is the endpoint a planner reads
+	// with: SPEC.md 9.2 sends it a catalogue that carries output_bytes and no
+	// content, "and a planner that wants an output fetches it from the read
+	// API". SPEC.md 4.1 makes that the same surface the operator uses, "one
+	// surface, not two", so nothing about it is planner-specific.
+	mux.HandleFunc("GET /steps/{step_id}/output", a.getStepOutput)
 	return mux
 }
 
@@ -425,9 +431,12 @@ type runBody struct {
 	Status     string          `json:"status"`
 	Input      json.RawMessage `json:"input"`
 
-	PlannerAttemptCount int     `json:"planner_attempt_count"`
-	ReplayCount         int     `json:"replay_count"`
-	LastPlannerError    *string `json:"last_planner_error"`
+	// SPEC.md 6.2 keeps no copy of the newest planner error on the run: the
+	// diagnosis lives on the call that produced it (SPEC.md 6.8), where it is
+	// one row among the run's whole conversation with its planner rather than
+	// a single value overwritten by the next failure.
+	PlannerAttemptCount int `json:"planner_attempt_count"`
+	ReplayCount         int `json:"replay_count"`
 
 	OwnerID   *string    `json:"owner_id"`
 	ClaimedAt *time.Time `json:"claimed_at"`
@@ -475,7 +484,6 @@ func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
 		Input:               json.RawMessage(run.Input),
 		PlannerAttemptCount: run.PlannerAttemptCount,
 		ReplayCount:         run.ReplayCount,
-		LastPlannerError:    run.LastPlannerError,
 		OwnerID:             run.OwnerID,
 		ClaimedAt:           run.ClaimedAt,
 		CreatedAt:           run.CreatedAt,
@@ -536,4 +544,46 @@ func (a *API) getRunSteps(w http.ResponseWriter, r *http.Request) {
 		out = append(out, summary)
 	}
 	a.writeJSON(w, http.StatusOK, map[string]any{"run_id": runID, "steps": out})
+}
+
+// getStepOutput is SPEC.md 10.2's GET /steps/{step_id}/output: "that step's
+// stored output bytes, verbatim".
+//
+// Verbatim is the whole contract. SPEC.md 7.1 keeps every JSON document opaque
+// []byte end to end and SPEC.md 6.3 stores "the worker's whole response body",
+// so this handler re-serialises nothing and selects nothing out of it:
+// "selecting a field out of a worker's response is the planner's job, not the
+// engine's".
+func (a *API) getStepOutput(w http.ResponseWriter, r *http.Request) {
+	stepID := r.PathValue("step_id")
+
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	defer cancel()
+
+	step, err := a.store.GetStep(ctx, stepID)
+	if err != nil {
+		a.writeStorageError(w, "no step with that step_id", err)
+		return
+	}
+
+	// SPEC.md 6.3: "a step's completion is signalled by status = 'DONE' and by
+	// nothing else. No rule, query or implementation may treat 'output is
+	// present' as meaning the step finished." So the status is what is tested,
+	// and a step that has not finished is refused with the state it is in -
+	// SPEC.md 10.5's 409, which "states the actual current state, not merely
+	// that the request was refused".
+	if step.Status != model.StatusDone {
+		a.writeError(w, http.StatusConflict, errorBody{
+			Error:      slugConflict,
+			Message:    "step has no stored output because it has not completed",
+			RunID:      step.RunID,
+			StepID:     step.StepID,
+			StepStatus: step.Status,
+		})
+		return
+	}
+
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(step.Output)
 }
