@@ -1183,15 +1183,22 @@ mode.
 which would force this document to define what happens when it does. Omission is unambiguous because
 `connection_mode` is always present.
 
-**Raw** (`dispatch_style: "raw"`) — the body is `params`, verbatim, and nothing else:
+**Raw** (`dispatch_style: "raw"`) — the body is `params`, verbatim and nothing else, sent with
+`content-type: application/json`:
 
 ```json
 POST {worker_url}
 { "lang": "zh-TW" }
 ```
 
-**Why `raw` exists:** any unmodifiable HTTP endpoint — an existing internal API, a third-party API —
-is then a valid worker. You cannot add fields to such an endpoint's request body.
+**Why the header is stated rather than left open:** §9.4 already requires `params` to be an object,
+so a raw request is a JSON request and says so. Omitting the header would leave most frameworks
+refusing the body or guessing at it, and letting a StepSpec choose it is an optional field that
+belongs in `BACKLOG.md`.
+
+**Why `raw` exists:** any unmodifiable HTTP endpoint that speaks JSON — an existing internal API, a
+third-party API — is then a valid worker. You cannot add fields to such an endpoint's request body.
+**Its limit:** the endpoint must also *answer* JSON. §9.6 says what happens when it does not.
 
 A key literally named `input_from` **inside `params`** is ordinary data and is transmitted verbatim,
 becoming a top-level key of the raw body. `raw` does not interpret payload content.
@@ -1213,6 +1220,16 @@ storing the envelope whole would keep this system's wrapper inside the user's re
 would then hand it to the next worker as `inputs`, and every planner reading an output would have to
 strip it. A raw worker was never told about Piton, so its whole reply is the result and there is
 nothing to unwrap.
+
+**A raw worker's response body MUST be a valid JSON document.** A 2xx whose body cannot be parsed as
+JSON is `invalid_response` (§5.3) and burns one attempt like any other failure.
+**Why:** §6.3 and §6.4 store an output as JSON bytes, and the alternatives are worse. Wrapping a
+non-JSON body in a JSON string is Piton shaping the worker's result, which §6.3 forbids — and it
+cannot distinguish a worker that returned the string `"hello"` from one that returned the bare text
+`hello`. Storing bytes instead would leave §9.5's `inputs` undefined the moment it hands a non-JSON
+output to the next worker.
+**The cost, stated plainly:** an endpoint that answers XML, CSV or plain text is not a worker. A
+user who has one writes the same small adapter §9.7 already sends him to write.
 
 **A transport-level failure is always a failure regardless of body** — non-2xx, connection refused,
 timeout. A business-level failure and a transport-level failure burn one attempt alike.
