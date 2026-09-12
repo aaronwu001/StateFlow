@@ -1,0 +1,107 @@
+# Deployment overlay for the console environment.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# WHY THIS IS AN OVERLAY AND NOT AN EDIT
+#   docker-compose.yml is the file test/console runs against, and CLAUDE.md
+#   5.5.4 requires the suite and the owner's hand-run demo to exercise an
+#   IDENTICAL definition. Adding a proxy and withdrawing published ports would
+#   change what the suite tests. Layering leaves the tested definition untouched
+#   and adds only what deployment needs.
+#
+# WHAT IT CHANGES
+#   * Nothing is published to the internet except Caddy.
+#   * Caddy demands a shared secret header on every request and routes one
+#     public port to three internal services.
+#
+# WHAT IT DOES NOT DO, AND WHY YOU STILL NEED THE PROXY IN FRONT
+#   It does not validate `worker_url`. A StepSpec's worker_url is any absolute
+#   HTTP(S) URL and the orchestrator will POST to it (SPEC.md 9.4, 9.5), so
+#   anyone who can reach POST /workflows can make this host issue requests to
+#   anything it can reach. The shared secret limits WHO can do that; it does not
+#   limit WHERE. Checking worker_url against an allowlist needs the request body
+#   read, which belongs in the application proxy that builds the request — not
+#   in Caddy.
+#
+#   Deploy this on a host that runs nothing else. That is not advice, it is the
+#   condition under which the remaining risk is acceptable.
+#
+# THE SECRET
+#   Put it in a .env file beside this one:
+#
+#       DEMO_KEY=$(openssl rand -hex 24)
+#
+#   Compose reads .env automatically. The browser must never see this value:
+#   only your server-side proxy holds it.
+
+services:
+
+  # Postgres already publishes nothing. Listed here so that a reader of this
+  # file sees every service accounted for rather than wondering.
+  postgres:
+    ports: !override []
+
+  orchestrator:
+    ports: !override []
+
+  worker:
+    ports: !override []
+
+  planner:
+    ports: !override []
+
+  # ------------------------------------------------------------------- caddy
+  #
+  # One public port, three destinations, one gate.
+  #
+  # WHY PATH ROUTING RATHER THAN THREE PUBLISHED PORTS
+  #   Three ports means three firewall rules, three URLs for the front end to
+  #   hold, and three places to forget the secret. One port with a path prefix
+  #   costs a line of config each and leaves exactly one thing exposed.
+  #
+  #     /demo/worker/*   -> worker:9090     pause and resume the worker
+  #     /demo/planner/*  -> planner:9100    pause and resume the planner
+  #     everything else  -> orchestrator    the Piton API of SPEC.md 10
+  caddy:
+    image: caddy:2.10-alpine
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      DEMO_KEY: ${DEMO_KEY:?set DEMO_KEY in demos/console/.env - see the header of this file}
+    command:
+      - sh
+      - -c
+      - |
+        cat > /etc/caddy/Caddyfile <<EOF
+        {
+            admin off
+        }
+
+        :8080 {
+            @unauthorised not header X-Demo-Key "$${DEMO_KEY}"
+            respond @unauthorised 401 {
+                body "{\"error\":\"not_authorised\",\"message\":\"X-Demo-Key header is missing or wrong\"}"
+                close
+            }
+
+            handle_path /demo/worker/* {
+                reverse_proxy worker:9090
+            }
+            handle_path /demo/planner/* {
+                reverse_proxy planner:9100
+            }
+            handle {
+                reverse_proxy orchestrator:8080
+            }
+        }
+        EOF
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- --header='X-Demo-Key: '\"$$DEMO_KEY\" http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 3s

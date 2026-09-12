@@ -114,8 +114,21 @@ services:
       - |
         import json, threading, time
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import urlparse, parse_qs
 
-        PAUSED = False
+        # PAUSED IS PER RUN, and that is the whole design.
+        #
+        # A single global switch works for one operator at a terminal and fails
+        # the moment two people watch the same demo: one presses pause and the
+        # other's run dies for a reason they did not cause. SPEC.md 9.5's
+        # envelope carries run_id, so the worker can go silent for exactly one
+        # run and answer everyone else normally.
+        #
+        # PAUSED_ALL stays for the single-operator case - `curl -X POST
+        # .../pause` with no run - because a demo run by one person is still
+        # the common case at a terminal.
+        PAUSED_ALL = False
+        PAUSED_RUNS = set()
         SEEN = {}                      # step_id -> how many times it was called
         LOCK = threading.Lock()
 
@@ -124,41 +137,74 @@ services:
         # workflow files here set step_timeout_seconds to 5.
         MAX_HOLD_SECONDS = 120
 
+        def split(path):
+            u = urlparse(path)
+            q = parse_qs(u.query)
+            return u.path, (q.get("run") or [None])[0]
+
+        def is_paused(run_id):
+            with LOCK:
+                return PAUSED_ALL or (run_id in PAUSED_RUNS)
+
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def do_GET(self):
-                if self.path == "/healthz":
+                route, _ = split(self.path)
+                if route == "/healthz":
                     self._reply(200, {"status": "ok"})
-                elif self.path == "/state":
+                elif route == "/state":
                     with LOCK:
-                        self._reply(200, {"paused": PAUSED, "calls": dict(SEEN)})
+                        self._reply(200, {"paused_all": PAUSED_ALL,
+                                          "paused_runs": sorted(PAUSED_RUNS),
+                                          "calls": dict(SEEN)})
                 else:
                     self._reply(404, {"status": "failure", "error": "no such path"})
 
             def do_POST(self):
-                global PAUSED
+                global PAUSED_ALL
+                route, run = split(self.path)
                 length = int(self.headers.get("content-length") or 0)
                 body = self.rfile.read(length) if length else b""
 
-                if self.path == "/pause":
+                if route == "/pause":
                     with LOCK:
-                        PAUSED = True
-                    print("worker: PAUSED - attempts will now expire at deadline_at", flush=True)
-                    self._reply(200, {"paused": True})
+                        if run:
+                            PAUSED_RUNS.add(run)
+                        else:
+                            PAUSED_ALL = True
+                        state = {"paused_all": PAUSED_ALL, "paused_runs": sorted(PAUSED_RUNS)}
+                    print("worker: PAUSED %s - its attempts will now expire at deadline_at"
+                          % (run or "EVERY run"), flush=True)
+                    self._reply(200, state)
                     return
-                if self.path == "/resume":
+                # EACH SWITCH DOES EXACTLY ONE THING.
+                #
+                # /resume with no run lifts the GLOBAL pause and leaves per-run
+                # pauses alone. Having it also clear the per-run set made a race
+                # unavoidable: going from "everything paused" to "one run
+                # paused" then needed two requests, and the hold loop re-reads
+                # the state every 200 ms, so a run could escape in the gap
+                # between them. Use /reset to clear everything.
+                if route == "/resume":
                     with LOCK:
-                        PAUSED = False
-                    print("worker: resumed", flush=True)
-                    self._reply(200, {"paused": False})
+                        if run:
+                            PAUSED_RUNS.discard(run)
+                        else:
+                            PAUSED_ALL = False
+                        state = {"paused_all": PAUSED_ALL, "paused_runs": sorted(PAUSED_RUNS)}
+                    print("worker: resumed %s" % (run or "the global pause"), flush=True)
+                    self._reply(200, state)
                     return
-                if self.path == "/reset":
+                if route == "/reset":
                     with LOCK:
+                        PAUSED_ALL = False
+                        PAUSED_RUNS.clear()
                         SEEN.clear()
-                    self._reply(200, {"calls": {}})
+                    print("worker: reset - nothing paused, call counts cleared", flush=True)
+                    self._reply(200, {"paused_all": False, "paused_runs": [], "calls": {}})
                     return
-                if self.path != "/step":
+                if route != "/step":
                     self._reply(404, {"status": "failure", "error": "no such path"})
                     return
 
@@ -170,17 +216,15 @@ services:
 
                 params = env.get("params") or {}
                 step_id = env.get("step_id") or "?"
+                run_id = env.get("run_id")
                 with LOCK:
                     SEEN[step_id] = SEEN.get(step_id, 0) + 1
                     seen = SEEN[step_id]
 
-                # Hold silent while paused. This is the whole point of the
-                # service: the attempt expires against attempts.deadline_at.
+                # Hold silent while THIS RUN is paused. The attempt expires
+                # against attempts.deadline_at while every other run carries on.
                 waited = 0.0
-                while waited < MAX_HOLD_SECONDS:
-                    with LOCK:
-                        if not PAUSED:
-                            break
+                while waited < MAX_HOLD_SECONDS and is_paused(run_id):
                     time.sleep(0.2)
                     waited += 0.2
 
@@ -259,57 +303,94 @@ services:
       - |
         import json, threading, time
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import urlparse, parse_qs
 
-        PAUSED = False
+        # Per run, for the same reason the worker is: SPEC.md 9.2 puts run_id in
+        # every planner request, so one viewer pausing a planner must not kill
+        # another viewer's run.
+        PAUSED_ALL = False
+        PAUSED_RUNS = set()
         LOCK = threading.Lock()
         MAX_HOLD_SECONDS = 120
+
+        def split(path):
+            u = urlparse(path)
+            q = parse_qs(u.query)
+            return u.path, (q.get("run") or [None])[0]
+
+        def is_paused(run_id):
+            with LOCK:
+                return PAUSED_ALL or (run_id in PAUSED_RUNS)
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def do_GET(self):
-                if self.path == "/healthz":
+                route, _ = split(self.path)
+                if route == "/healthz":
                     self._reply(200, {"status": "ok"})
-                elif self.path == "/state":
+                elif route == "/state":
                     with LOCK:
-                        self._reply(200, {"paused": PAUSED})
+                        self._reply(200, {"paused_all": PAUSED_ALL,
+                                          "paused_runs": sorted(PAUSED_RUNS)})
                 else:
                     self._reply(404, {"error": "no such path"})
 
             def do_POST(self):
-                global PAUSED
+                global PAUSED_ALL
+                route, run = split(self.path)
                 length = int(self.headers.get("content-length") or 0)
                 body = self.rfile.read(length) if length else b""
 
-                if self.path == "/pause":
+                if route == "/pause":
                     with LOCK:
-                        PAUSED = True
-                    print("planner: PAUSED - calls will now expire", flush=True)
-                    self._reply(200, {"paused": True})
+                        if run:
+                            PAUSED_RUNS.add(run)
+                        else:
+                            PAUSED_ALL = True
+                        state = {"paused_all": PAUSED_ALL, "paused_runs": sorted(PAUSED_RUNS)}
+                    print("planner: PAUSED %s - its calls will now expire"
+                          % (run or "EVERY run"), flush=True)
+                    self._reply(200, state)
                     return
-                if self.path == "/resume":
+                # As in the worker: /resume with no run lifts only the global
+                # pause, so that narrowing a global pause to one run cannot
+                # leave a gap the held call escapes through. /reset clears
+                # everything.
+                if route == "/resume":
                     with LOCK:
-                        PAUSED = False
-                    print("planner: resumed", flush=True)
-                    self._reply(200, {"paused": False})
+                        if run:
+                            PAUSED_RUNS.discard(run)
+                        else:
+                            PAUSED_ALL = False
+                        state = {"paused_all": PAUSED_ALL, "paused_runs": sorted(PAUSED_RUNS)}
+                    print("planner: resumed %s" % (run or "the global pause"), flush=True)
+                    self._reply(200, state)
                     return
-                if self.path != "/plan":
+                if route == "/reset":
+                    with LOCK:
+                        PAUSED_ALL = False
+                        PAUSED_RUNS.clear()
+                    print("planner: reset - nothing paused", flush=True)
+                    self._reply(200, {"paused_all": False, "paused_runs": []})
+                    return
+                if route != "/plan":
                     self._reply(404, {"error": "no such path"})
                     return
-
-                waited = 0.0
-                while waited < MAX_HOLD_SECONDS:
-                    with LOCK:
-                        if not PAUSED:
-                            break
-                    time.sleep(0.2)
-                    waited += 0.2
 
                 try:
                     req = json.loads(body or b"{}")
                 except Exception as exc:
                     self._reply(400, {"error": "unparseable: %s" % exc})
                     return
+
+                # The body is parsed BEFORE the hold, because the run this call
+                # belongs to is inside it: a planner cannot know whose call to
+                # go silent for until it has read run_id (SPEC.md 9.2).
+                waited = 0.0
+                while waited < MAX_HOLD_SECONDS and is_paused(req.get("run_id")):
+                    time.sleep(0.2)
+                    waited += 0.2
 
                 # SPEC.md 9.2: history is a catalogue of COMPLETED steps,
                 # oldest first, and every row is DONE. Its length is therefore

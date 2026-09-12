@@ -236,31 +236,50 @@ func WaitHealthy(timeout time.Duration) error {
 // The pause switches
 // ---------------------------------------------------------------------------
 
-func switchTo(base, action string) error {
-	code, body, err := do(http.MethodPost, base+action, []byte("{}"))
+func switchTo(base, action, runID string) error {
+	url := base + action
+	if runID != "" {
+		url += "?run=" + runID
+	}
+	code, body, err := do(http.MethodPost, url, []byte("{}"))
 	if err != nil {
-		return fmt.Errorf("POST %s%s: %w", base, action, err)
+		return fmt.Errorf("POST %s: %w", url, err)
 	}
 	if code != http.StatusOK {
-		return fmt.Errorf("POST %s%s returned %d: %s", base, action, code, body)
+		return fmt.Errorf("POST %s returned %d: %s", url, code, body)
 	}
 	return nil
 }
 
 // PauseWorker makes the worker hold its connections open and answer nothing, so
 // that attempts expire at attempts.deadline_at and are classified `timeout`
-// (SPEC.md 5.3).
-func PauseWorker() error { return switchTo(WorkerURL, "/pause") }
+// (SPEC.md 5.3). With no run named it applies to every run.
+func PauseWorker() error { return switchTo(WorkerURL, "/pause", "") }
 
-// ResumeWorker undoes it.
-func ResumeWorker() error { return switchTo(WorkerURL, "/resume") }
+// ResumeWorker undoes it, for every run.
+func ResumeWorker() error { return switchTo(WorkerURL, "/resume", "") }
+
+// PauseWorkerRun silences the worker for ONE run and leaves every other run
+// running normally. SPEC.md 9.5's envelope carries run_id, which is what makes
+// this possible without Piton knowing anything about it.
+func PauseWorkerRun(runID string) error { return switchTo(WorkerURL, "/pause", runID) }
+
+// ResumeWorkerRun undoes it for that run.
+func ResumeWorkerRun(runID string) error { return switchTo(WorkerURL, "/resume", runID) }
 
 // PausePlanner does the same to the planner, which is what produces a
 // planner-side dead-letter entry (SPEC.md 12.3).
-func PausePlanner() error { return switchTo(PlannerURL, "/pause") }
+func PausePlanner() error { return switchTo(PlannerURL, "/pause", "") }
 
 // ResumePlanner undoes it.
-func ResumePlanner() error { return switchTo(PlannerURL, "/resume") }
+func ResumePlanner() error { return switchTo(PlannerURL, "/resume", "") }
+
+// PausePlannerRun silences the planner for one run only. SPEC.md 9.2 puts
+// run_id in every planner request.
+func PausePlannerRun(runID string) error { return switchTo(PlannerURL, "/pause", runID) }
+
+// ResumePlannerRun undoes it for that run.
+func ResumePlannerRun(runID string) error { return switchTo(PlannerURL, "/resume", runID) }
 
 // ---------------------------------------------------------------------------
 // Fixtures

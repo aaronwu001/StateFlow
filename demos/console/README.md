@@ -29,12 +29,36 @@ already doomed. That demonstrates the mechanism and not the experience. These tw
 other half — **a run that is already healthy, interrupted while it is in flight**.
 
 ```bash
-curl -X POST localhost:9090/pause     # the worker stops answering
-curl -X POST localhost:9090/resume
-curl -X POST localhost:9100/pause     # the planner stops answering
-curl -X POST localhost:9100/resume
-curl localhost:9090/state             # paused? and how many times each step was called
+# Break it for ONE run - what a shared demo should use
+curl -X POST "localhost:9090/pause?run=$RUN"    # the worker goes silent for that run
+curl -X POST "localhost:9090/resume?run=$RUN"
+curl -X POST "localhost:9100/pause?run=$RUN"    # the planner goes silent for that run
+curl -X POST "localhost:9100/resume?run=$RUN"
+
+# Break it for everything - one operator at a terminal
+curl -X POST localhost:9090/pause
+curl -X POST localhost:9090/resume              # lifts ONLY the global pause
+curl -X POST localhost:9090/reset               # clears everything
+
+curl localhost:9090/state    # {"paused_all":false,"paused_runs":[...],"calls":{...}}
+curl localhost:9100/state    # {"paused_all":false,"paused_runs":[...]}
 ```
+
+**Each switch does exactly one thing**, and that is not cosmetic. An earlier
+version had `/resume` also clear every per-run pause, which made going from
+"everything paused" to "one run paused" take two requests — and the hold loop
+re-reads the state every 200 ms, so a run could escape through the gap between
+them. The isolation suite caught it.
+
+**Prefer the per-run form.** A single global switch works for one person at a
+terminal and fails the moment two people watch the same demo: one presses pause
+and the other's run dies for a reason they did not cause — and it dies
+convincingly, with real `timeout` attempts and a real dead-letter entry, so
+nothing on screen says it was somebody else's doing.
+
+Per-run works because `SPEC.md § 9.5`'s envelope carries `run_id` and `§ 9.2`'s
+planner request carries it too. **Piton knows nothing about any of this** — it
+keeps POSTing to the same `worker_url`; what changes is what answers.
 
 **Paused means silent, not refusing.** The connection is accepted and nothing is written. That
 matters: `SPEC.md § 5.3` decides between `timeout` and `transport_error` **by the clock, not by the
@@ -95,8 +119,10 @@ client.
   one per step.
 - Show **why** a run stopped, by fetching `GET /runs/{run_id}/dlq` whenever `status` is `DLQ`. A DLQ
   run whose reason is not on screen is the one state that looks like a bug when it is not.
-- Offer the two pause switches as plain buttons, with the current state read back from
-  `GET /state` on each service rather than remembered locally — two people can be watching.
+- Offer the two pause switches as plain buttons **scoped to the run on screen** —
+  `POST /pause?run={run_id}` — with the current state read back from `GET /state` on each service
+  rather than remembered locally. Never offer the global form to a public audience: it lets one
+  viewer kill every other viewer's run, invisibly.
 - Offer **replay** on any DLQ'd run, and show `replay_count` afterwards.
 
 **It must not:**
