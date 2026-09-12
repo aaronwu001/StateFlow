@@ -81,9 +81,20 @@ For each milestone:
 5. **The owner runs the demo by hand** and inspects database truth from a terminal.
 6. **The automated suite then guards it.** Its job is to guarantee that what the owner saw by hand
    stays true.
+7. **Sweep `SPEC.md` for statements the landing has made false**, and propose the correction. Today
+   that is `SPEC.md § 19.3`'s table — a row leaves it when the thing is built — but the sweep is for
+   *any* sentence that describes what exists in the code rather than how the system must behave.
+   You propose; the owner rules (§2 rule 1).
 
 Step 5 is not optional and is not replaceable by step 6. A green suite that the owner has never
 seen behind is not evidence the milestone landed.
+
+**Why step 7 exists.** `SPEC.md § 19.3` was written once, before any milestone was implemented, and
+was never updated. It still announced the HTTP planner as unbuilt four rounds after milestone ζ had
+landed and been hand-verified. Nothing caught it, because nothing was responsible for catching it:
+every other step of this flow is about making the code match the document, and this is the one place
+where the document must be made to match the code. A section that goes stale by someone doing their
+job correctly needs a step that says whose job the update is.
 
 ---
 

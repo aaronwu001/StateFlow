@@ -2065,10 +2065,17 @@ property later and mistaking it for a defect.
 |---|---|---|
 | Multi-replica orchestration | §4.4, §8.4, §8.5 | Not scheduled. A constraint on the design, never a milestone |
 | Run-level and step-level overrides | §11.2, §9.4 | Milestone η |
-| `raw` dispatch | §9.5 | Milestone θ |
 | `async` connection mode | §9.5, §9.6, §8.4 | Milestone ε |
-| HTTP planner | §6.1 | Milestone ζ |
 | Cancellation | §15 | Milestone ι |
+
+**A row leaves this table when the thing is built**, and `CLAUDE.md § 4` makes that removal part of
+landing a milestone. Two rows have already left it this way: the HTTP planner, built at milestone ζ,
+and `raw` dispatch, built at milestone θ.
+**Why the rule is stated rather than assumed:** this table is the one place in this document that
+describes *what exists in the code* rather than *how the system must behave*. Everywhere else, "if
+the code and this document disagree, the code is wrong" (`CLAUDE.md § 1`). Here that is reversed —
+the code being written is exactly what makes a row false — so this is the only section that goes
+stale by someone doing their job correctly, and it needs a rule of its own to stay true.
 
 Everything else that has been considered and set aside is in `BACKLOG.md`, which is authority on
 nothing.
