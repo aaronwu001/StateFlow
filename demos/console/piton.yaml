@@ -1,0 +1,28 @@
+# The console environment - the orchestrator's boot configuration.
+#
+# SPEC.md 4.4: "The orchestrator reads one YAML configuration file at boot. It
+# declares at minimum the storage backend and its connection details, the HTTP
+# listen address, the sweep interval, the heartbeat interval and the lease TTL."
+#
+# The key names are the ones every other environment in this repository uses.
+# Nothing here is console-specific: what differs about this environment is what
+# the worker and the planner will do when called, and the per-workflow timeouts
+# in workflow.json - not how the orchestrator boots.
+
+storage:
+  backend: postgres
+  dsn: "postgres://piton:piton@postgres:5432/piton?sslmode=disable"
+
+http:
+  listen_address: "0.0.0.0:8080"
+
+# SPEC.md 8.6 and 8.7's defaults, written out so an operator sees all three.
+#
+# sweep_interval_seconds matters more here than elsewhere: SPEC.md 13.3 says a
+# timeout is a LOWER bound, and that an attempt whose owner is dead expires
+# somewhere in [deadline, deadline + sweep_interval]. While the owner is live -
+# which it is throughout this demo - failure is declared precisely at the
+# deadline, so a paused worker fails 5 seconds after dispatch and not later.
+sweep_interval_seconds: 5
+heartbeat_interval_seconds: 10
+lease_ttl_seconds: 30

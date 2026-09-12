@@ -1322,8 +1322,31 @@ The two-layer split is deliberate: the catalogue is cheap and may be fetched who
 may be large and are fetched individually, so a planner pulls only what it needs.
 `/output` returns the stored bytes verbatim (§7.1).
 
+**`GET /runs` is the one read endpoint whose result set grows without bound**, so its contract is
+fixed here rather than left to the implementation:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `status` | all | Repeatable. Only runs in one of §5.1's states |
+| `limit` | 50 | 1–200 |
+| `cursor` | — | Opaque, taken from the previous response's `next_cursor` |
+
+Runs are returned **newest first by `created_at`, with `run_id` breaking ties**, and a cursor resumes
+exactly after the run it names.
+**Why the ordering is fixed rather than left to the backend:** a page boundary is meaningless without
+a total order, and two runs created in the same millisecond are ordinary rather than exotic.
+
+An unknown `status` value is a 400, as §16 requires of every other input.
+**Why this endpoint is paged when no other read endpoint is:** every other one names a single entity.
+This one names a table that grows for the life of the deployment, and a consumer that discovers
+pagination in its second year rewrites its client. §3's admission test therefore settles it now.
+
 **Why the dead-letter history is its own endpoint** rather than a field of `GET /runs/{run_id}`: it
 accumulates across replay rounds, and keeping it separate keeps the base run read cheap.
+
+`GET /runs/{run_id}/dlq` returns entries **oldest first**, and a run with no entries is an empty list
+with a 200 — not a 404. §10.5 reserves 404 for an entity that does not exist, and a run with a clean
+history exists.
 
 **These endpoints are required early, not late.** A planner must be able to fetch what §9.2's
 catalogue cap omits.

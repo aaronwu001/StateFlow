@@ -12,6 +12,7 @@ in `BACKLOG.md`).
 |---|---|---|
 | `SPEC.md` | "the system MUST…", each non-obvious rule carrying a `Why:` | **The only authority on behaviour.** If code and SPEC disagree, the code is wrong |
 | `CLAUDE.md` | "you (Claude) MUST…" | Authority on how work is done |
+| `API.md` | "a client receives…", field by field | **Authority on the wire only** — the JSON field names and shapes a consumer builds against. It may never state a rule about behaviour: where it describes *what* a value means, it cites the `SPEC.md` section that rules it, and if the two disagree, `SPEC.md` wins and `API.md` is wrong |
 | `BACKLOG.md` | "not scheduled, may never happen" | Authority on nothing. A parking lot |
 | `notes/` | "what we discussed, what we eliminated, why" | **Explanatory only.** May never be cited as justification for a behaviour |
 | `GRILLING_LOG.md` | the record of every ruling and its reasoning | **Explanatory only**, same rule as `notes/` |

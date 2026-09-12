@@ -25,7 +25,10 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	migratepg "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
-	_ "github.com/lib/pq"
+	// Imported for its side effect — registering the "postgres" driver — and
+	// now also for pq.Array, which is how a Go slice reaches a text[]
+	// parameter in SPEC.md 10.2's repeatable `status` filter.
+	"github.com/lib/pq"
 
 	"github.com/aaronwu001/piton/internal/model"
 	"github.com/aaronwu001/piton/internal/storage"
@@ -306,6 +309,101 @@ func (s *Store) ListAttempts(ctx context.Context, runID string) ([]*model.Attemp
 			return nil, fmt.Errorf("postgres: cannot read an attempt: %w", err)
 		}
 		out = append(out, at)
+	}
+	return out, rows.Err()
+}
+
+// ListRuns is SPEC.md 10.2's GET /runs.
+//
+// WHY THE ORDER IS (created_at DESC, run_id DESC) AND NOT created_at ALONE
+//
+//	SPEC.md 10.2: "newest first by created_at, with run_id breaking ties", and
+//	"a cursor resumes exactly after the run it names". A sort on created_at
+//	alone is not a total order — two runs created in the same microsecond may
+//	come back in either order — and a page boundary inside such a tie loses or
+//	repeats a run. The tiebreak is what makes the cursor exact.
+//
+// WHY THE CURSOR IS A ROW COMPARISON
+//
+//	`(created_at, run_id) < ($2, $3)` is the same lexicographic order the
+//	ORDER BY applies, expressed as one predicate. Written as separate AND/OR
+//	clauses it is easy to get subtly wrong at the tie, which is the one place
+//	it matters.
+func (s *Store) ListRuns(ctx context.Context, q storage.RunQuery) ([]*model.Run, error) {
+	var statuses any
+	if len(q.Statuses) > 0 {
+		statuses = pq.Array(q.Statuses)
+	}
+	var cursorAt any
+	var cursorID any
+	if q.Cursor != nil {
+		cursorAt = q.Cursor.CreatedAt
+		cursorID = q.Cursor.RunID
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+runColumns+` FROM runs
+		  WHERE ($1::text[] IS NULL OR status = ANY($1::text[]))
+		    AND ($2::timestamptz IS NULL OR (created_at, run_id) < ($2::timestamptz, $3::uuid))
+		  ORDER BY created_at DESC, run_id DESC
+		  LIMIT $4;`,
+		statuses, cursorAt, cursorID, q.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot list runs: %w", err)
+	}
+	defer rows.Close()
+
+	out := []*model.Run{}
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: cannot read a run: %w", err)
+		}
+		out = append(out, run)
+	}
+	return out, rows.Err()
+}
+
+const dlqColumns = `dlq_id, run_id, step_id, reason, replay_round, error_text, created_at`
+
+// ListDeadLetters is SPEC.md 10.2's GET /runs/{run_id}/dlq.
+//
+// Oldest first, because SPEC.md 10.2 calls this a history that "accumulates
+// across replay rounds": read in that order the rows are the story of the run
+// in the order it happened, and each carries the replay_round it belonged to.
+//
+// A run that exists with no entries returns an empty slice, not ErrNotFound.
+// SPEC.md 10.5 reserves 404 for an entity that does not exist, and the run does
+// — which is why the existence check is a separate lookup rather than being
+// inferred from an empty result.
+func (s *Store) ListDeadLetters(ctx context.Context, runID string) ([]*model.DeadLetterEntry, error) {
+	if !isUUID(runID) {
+		return nil, storage.ErrNotFound
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+dlqColumns+` FROM dead_letter_queue WHERE run_id = $1
+		  ORDER BY created_at, dlq_id;`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: cannot list dead-letter entries: %w", err)
+	}
+	defer rows.Close()
+
+	out := []*model.DeadLetterEntry{}
+	for rows.Next() {
+		var (
+			e      model.DeadLetterEntry
+			stepID sql.NullString
+		)
+		if err := rows.Scan(&e.DLQID, &e.RunID, &stepID, &e.Reason,
+			&e.ReplayRound, &e.ErrorText, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("postgres: cannot read a dead-letter entry: %w", err)
+		}
+		// SPEC.md 6.5: step_id is NULL for a planner-side entry.
+		if stepID.Valid {
+			id := stepID.String
+			e.StepID = &id
+		}
+		out = append(out, &e)
 	}
 	return out, rows.Err()
 }

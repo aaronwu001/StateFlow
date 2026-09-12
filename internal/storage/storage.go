@@ -151,6 +151,33 @@ type AttemptFailure struct {
 	ErrorText string
 }
 
+// RunQuery is the filter and the page SPEC.md 10.2 gives GET /runs.
+//
+// The cursor is a KEYSET, not an offset: it names the last run of the previous
+// page and the query resumes strictly after it. SPEC.md 10.2 requires that a
+// cursor "resumes exactly after the run it names", which an offset cannot
+// promise — rows inserted between two requests shift every later offset, so an
+// offset-paged walk of a table that is still being written to silently repeats
+// and skips runs.
+type RunQuery struct {
+	// Statuses filters by SPEC.md 5.1's states. Empty means every state.
+	Statuses []string
+
+	// Limit is how many runs to return, already validated against SPEC.md
+	// 10.2's 1–200 range by the caller.
+	Limit int
+
+	// Cursor is nil for the first page.
+	Cursor *RunCursor
+}
+
+// RunCursor is the position a page resumes after: the sort key of the last run
+// of the previous page, which is the pair SPEC.md 10.2 orders by.
+type RunCursor struct {
+	CreatedAt time.Time
+	RunID     string
+}
+
 // StepDeadLetterInput is the worker-side dead-letter of SPEC.md 12.2 and 12.3:
 // step → DLQ, run → DLQ and the dead-letter entry, in one transaction.
 type StepDeadLetterInput struct {
@@ -253,6 +280,24 @@ type Store interface {
 	GetRun(ctx context.Context, runID string) (*model.Run, error)
 	ListSteps(ctx context.Context, runID string) ([]*model.Step, error)
 	ListAttempts(ctx context.Context, runID string) ([]*model.Attempt, error)
+
+	// ListRuns is SPEC.md 10.2's GET /runs, and the only read in this
+	// interface that returns a page rather than everything it matched.
+	//
+	// SPEC.md 10.2 fixes the ordering — newest first by created_at, run_id
+	// breaking ties — and it is the storage layer's job because a page
+	// boundary is meaningless without a total order applied by the query
+	// itself.
+	ListRuns(ctx context.Context, q RunQuery) ([]*model.Run, error)
+
+	// ListDeadLetters is SPEC.md 10.2's GET /runs/{run_id}/dlq: "the
+	// append-only dead-letter history for this run", oldest first.
+	//
+	// It returns an empty slice and no error for a run that exists and has
+	// stopped for no reason — a clean history is not a missing entity.
+	// ErrNotFound is reserved for a run that does not exist, because SPEC.md
+	// 10.5 gives 404 exactly that meaning.
+	ListDeadLetters(ctx context.Context, runID string) ([]*model.DeadLetterEntry, error)
 
 	// ReplayRun is SPEC.md 14, and it returns the run's new replay_count.
 	//

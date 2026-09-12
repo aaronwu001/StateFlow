@@ -1,0 +1,361 @@
+# The console environment - the read API, and a worker and planner you can
+# break by hand.
+#
+# WHAT THIS IS FOR
+#   Two jobs, deliberately one environment:
+#
+#   1. It is what `test/console` runs against, because GET /runs and
+#      GET /runs/{run_id}/dlq can only be asserted against a database holding
+#      runs in several states and dead-letter entries of both kinds.
+#   2. It is the backend a browser-based demo points at. SPEC.md 2.2 keeps a
+#      user interface out of Piton's scope and BACKLOG.md B7 records that a UI
+#      was deprioritised rather than cut - "terminal-first is the requirement,
+#      not terminal-only" - so a front end is a CONSUMER of this API, never a
+#      part of the engine.
+#
+# WHY THE WORKER AND THE PLANNER CAN BE PAUSED
+#   Every earlier milestone declares its failures up front, in a StepSpec's
+#   params: the run is started already doomed. That demonstrates the mechanism
+#   and not the experience. Pausing is the other half - a run that is already
+#   healthy, interrupted while it is in flight - and it is the only way to see
+#   an attempt burn a `timeout` rather than a `transport_error` (SPEC.md 5.3
+#   decides between them by the clock, not by the shape of the error).
+#
+#   Nothing about this needs Piton to change. The orchestrator keeps POSTing to
+#   the same worker_url; what changes is what the thing on the other end does
+#   when it is called.
+#
+# WHY THE TIMEOUTS ARE 5 SECONDS AND NOT 300
+#   SPEC.md 11.1 ranges step_timeout_seconds and planner_timeout_seconds at >= 1
+#   and defaults them to 300 and 30. At the defaults, pausing a worker means
+#   watching nothing happen for five minutes. The workflow files here set 5,
+#   which is legal, needs no code, and makes the wait watchable - and SPEC.md
+#   13.3 guarantees that while the run's owner is live, failure is declared
+#   PRECISELY at the deadline.
+#
+# Teardown is `docker compose down -v`. The volume wipe is not optional:
+# CLAUDE.md 5.5.2 requires every group to start from a clean database.
+
+name: piton-console
+
+services:
+
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: piton
+      POSTGRES_PASSWORD: piton
+      POSTGRES_DB: piton
+    volumes:
+      # Postgres 18+ wants ONE mount at /var/lib/postgresql. See
+      # docker-library/postgres#1259.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piton -d piton"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------ orchestrator
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile_inline: |
+        FROM golang:1.27-alpine AS build
+        WORKDIR /src
+        COPY . .
+        RUN CGO_ENABLED=0 go build -trimpath -o /out/piton ./cmd/piton
+
+        FROM alpine:3.22
+        COPY --from=build /out/piton /usr/local/bin/piton
+        ENTRYPOINT ["/usr/local/bin/piton"]
+    command: ["--config", "/etc/piton/piton.yaml"]
+    volumes:
+      - ./piton.yaml:/etc/piton/piton.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      planner:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+
+  # ------------------------------------------------------------------ worker
+  #
+  # A sync + envelope worker (SPEC.md 9.5, 9.6) with a pause switch.
+  #
+  #   POST /step      the worker itself
+  #   POST /pause     stop answering - hold the connection open and say nothing
+  #   POST /resume    answer again
+  #   GET  /state     paused or not, and what it has seen
+  #
+  # PAUSED MEANS SILENT, NOT REFUSING. The connection is accepted and then
+  # nothing is written, which is what makes the attempt expire at deadline_at
+  # and be classified `timeout` (SPEC.md 5.3). A worker that refused the
+  # connection instead would be `transport_error` - a different row, a different
+  # repair, and worth being able to show separately.
+  worker:
+    image: python:3.13-alpine
+    ports:
+      - "9090:9090"
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json, threading, time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        PAUSED = False
+        SEEN = {}                      # step_id -> how many times it was called
+        LOCK = threading.Lock()
+
+        # A paused handler cannot wait forever or its thread leaks. Piton will
+        # have declared the attempt failed long before this, because the
+        # workflow files here set step_timeout_seconds to 5.
+        MAX_HOLD_SECONDS = 120
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply(200, {"status": "ok"})
+                elif self.path == "/state":
+                    with LOCK:
+                        self._reply(200, {"paused": PAUSED, "calls": dict(SEEN)})
+                else:
+                    self._reply(404, {"status": "failure", "error": "no such path"})
+
+            def do_POST(self):
+                global PAUSED
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+
+                if self.path == "/pause":
+                    with LOCK:
+                        PAUSED = True
+                    print("worker: PAUSED - attempts will now expire at deadline_at", flush=True)
+                    self._reply(200, {"paused": True})
+                    return
+                if self.path == "/resume":
+                    with LOCK:
+                        PAUSED = False
+                    print("worker: resumed", flush=True)
+                    self._reply(200, {"paused": False})
+                    return
+                if self.path == "/reset":
+                    with LOCK:
+                        SEEN.clear()
+                    self._reply(200, {"calls": {}})
+                    return
+                if self.path != "/step":
+                    self._reply(404, {"status": "failure", "error": "no such path"})
+                    return
+
+                try:
+                    env = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply(400, {"status": "failure", "error": "unparseable: %s" % exc})
+                    return
+
+                params = env.get("params") or {}
+                step_id = env.get("step_id") or "?"
+                with LOCK:
+                    SEEN[step_id] = SEEN.get(step_id, 0) + 1
+                    seen = SEEN[step_id]
+
+                # Hold silent while paused. This is the whole point of the
+                # service: the attempt expires against attempts.deadline_at.
+                waited = 0.0
+                while waited < MAX_HOLD_SECONDS:
+                    with LOCK:
+                        if not PAUSED:
+                            break
+                    time.sleep(0.2)
+                    waited += 0.2
+
+                # params-driven behaviour, so a run can also be started already
+                # doomed - the pattern every earlier milestone uses.
+                mode = params.get("mode", "ok")
+                fail_first = int(params.get("fail_first") or 0)
+                sleep_seconds = float(params.get("sleep_seconds") or 0)
+                if sleep_seconds:
+                    time.sleep(sleep_seconds)
+
+                if seen <= fail_first:
+                    print("worker: step %s call %d of first %d - failing on purpose"
+                          % (step_id, seen, fail_first), flush=True)
+                    self._reply(200, {"status": "failure",
+                                      "error": "failing the first %d calls on purpose" % fail_first})
+                    return
+
+                if mode == "worker_error":
+                    self._reply(200, {"status": "failure", "error": "the work itself failed"})
+                elif mode == "http_500":
+                    self._raw(500, "application/json", b'{"error":"the worker is broken"}')
+                elif mode == "not_json":
+                    self._raw(200, "text/plain; charset=utf-8", b"prose, not JSON")
+                else:
+                    self._reply(200, {"status": "success", "output": {
+                        "step_id": step_id, "call": seen, "params": params,
+                        "inputs_seen": sorted(env.get("inputs") or {}),
+                    }})
+
+            def _reply(self, code, payload):
+                self._raw(code, "application/json", json.dumps(payload).encode("utf-8"))
+
+            def _raw(self, code, ctype, raw):
+                self.send_response(code)
+                self.send_header("content-type", ctype)
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("worker: " + (fmt % args), flush=True)
+
+        print("worker: listening on 0.0.0.0:9090", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ----------------------------------------------------------------- planner
+  #
+  # An HTTP planner (SPEC.md 9.2, 9.3) with the same pause switch.
+  #
+  #   POST /plan      the planner itself
+  #   POST /pause     stop answering
+  #   POST /resume    answer again
+  #
+  # It decides from the run's own input: workflow_input.steps says how many
+  # steps to produce and workflow_input.worker becomes each step's params. One
+  # workflow definition therefore drives every scenario a front end needs -
+  # only the run's input changes.
+  #
+  # Pausing THIS is what produces a planner-side dead-letter entry
+  # (planner_budget_exhausted, SPEC.md 12.3), which is the one thing a run that
+  # died on its worker cannot show.
+  planner:
+    image: python:3.13-alpine
+    ports:
+      - "9100:9100"
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json, threading, time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        PAUSED = False
+        LOCK = threading.Lock()
+        MAX_HOLD_SECONDS = 120
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply(200, {"status": "ok"})
+                elif self.path == "/state":
+                    with LOCK:
+                        self._reply(200, {"paused": PAUSED})
+                else:
+                    self._reply(404, {"error": "no such path"})
+
+            def do_POST(self):
+                global PAUSED
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+
+                if self.path == "/pause":
+                    with LOCK:
+                        PAUSED = True
+                    print("planner: PAUSED - calls will now expire", flush=True)
+                    self._reply(200, {"paused": True})
+                    return
+                if self.path == "/resume":
+                    with LOCK:
+                        PAUSED = False
+                    print("planner: resumed", flush=True)
+                    self._reply(200, {"paused": False})
+                    return
+                if self.path != "/plan":
+                    self._reply(404, {"error": "no such path"})
+                    return
+
+                waited = 0.0
+                while waited < MAX_HOLD_SECONDS:
+                    with LOCK:
+                        if not PAUSED:
+                            break
+                    time.sleep(0.2)
+                    waited += 0.2
+
+                try:
+                    req = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply(400, {"error": "unparseable: %s" % exc})
+                    return
+
+                # SPEC.md 9.2: history is a catalogue of COMPLETED steps,
+                # oldest first, and every row is DONE. Its length is therefore
+                # how far the run has got.
+                history = req.get("history") or []
+                wf_input = req.get("workflow_input") or {}
+                want = int(wf_input.get("steps") or 3)
+                worker_params = wf_input.get("worker") or {}
+
+                if len(history) >= want:
+                    print("planner: run %s - %d of %d steps done, answering done"
+                          % (req.get("run_id"), len(history), want), flush=True)
+                    self._reply(200, {"status": "done"})
+                    return
+
+                n = len(history) + 1
+                params = dict(worker_params)
+                params["stage"] = "step-%d" % n
+                # SPEC.md 9.3: the StepSpec is ONE FIELD of the response, never
+                # the response itself.
+                self._reply(200, {"status": "continue", "step": {
+                    "step_name": "step-%d" % n,
+                    "worker_url": "http://worker:9090/step",
+                    "connection_mode": "sync",
+                    "dispatch_style": "envelope",
+                    "params": params,
+                }})
+
+            def _reply(self, code, payload):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("planner: " + (fmt % args), flush=True)
+
+        print("planner: listening on 0.0.0.0:9100", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9100), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9100/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  pgdata:

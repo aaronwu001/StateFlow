@@ -22,6 +22,27 @@ const (
 	StatusFailed    = "FAILED"
 )
 
+// RunStatuses is SPEC.md 5.1's four run states, in the order that section lists
+// them.
+//
+// StatusFailed is deliberately absent: SPEC.md 5.3 gives it to an ATTEMPT, and
+// no run is ever FAILED. Returning it from a filter over runs would offer a
+// caller a state that can never match.
+func RunStatuses() []string {
+	return []string{StatusRunning, StatusDone, StatusDLQ, StatusCancelled}
+}
+
+// IsRunStatus reports whether s is one of them. SPEC.md 10.2 makes an unknown
+// value a 400 rather than an empty result, so something has to be able to tell.
+func IsRunStatus(s string) bool {
+	for _, known := range RunStatuses() {
+		if s == known {
+			return true
+		}
+	}
+	return false
+}
+
 // Failure reasons (SPEC.md 5.3). Each is "a diagnostic label, not a distinct
 // mechanism"; every value below burns one unit of budget except Cancelled.
 //

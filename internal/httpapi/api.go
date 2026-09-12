@@ -20,11 +20,15 @@ package httpapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aaronwu001/piton/internal/engine"
@@ -58,8 +62,16 @@ func (a *API) Handler() http.Handler {
 	// SPEC.md 10.1, added at milestone δ (SPEC.md 18, order 4: "replay in its
 	// variants"). It is the first control endpoint since α.
 	mux.HandleFunc("POST /runs/{run_id}/replay", a.replayRun)
+	// SPEC.md 10.2's two remaining read endpoints. They were designed from the
+	// start and implemented late, which SPEC.md 10.2 itself argues against —
+	// "these endpoints are required early, not late" — and the reason they
+	// could wait is that until now every consumer was a planner or an operator
+	// at a terminal, and SPEC.md 17.1 makes database truth the interface. A
+	// client that cannot open psql has neither.
+	mux.HandleFunc("GET /runs", a.listRuns)
 	mux.HandleFunc("GET /runs/{run_id}", a.getRun)
 	mux.HandleFunc("GET /runs/{run_id}/steps", a.getRunSteps)
+	mux.HandleFunc("GET /runs/{run_id}/dlq", a.getRunDLQ)
 	// SPEC.md 10.2, added at milestone zeta. It is the endpoint a planner reads
 	// with: SPEC.md 9.2 sends it a catalogue that carries output_bytes and no
 	// content, "and a planner that wants an output fetches it from the read
@@ -413,8 +425,19 @@ type stepSummary struct {
 }
 
 type attemptSummary struct {
-	AttemptID      string     `json:"attempt_id"`
-	AttemptNo      int        `json:"attempt_no"`
+	AttemptID string `json:"attempt_id"`
+	AttemptNo int    `json:"attempt_no"`
+
+	// ReplayRound is SPEC.md 6.4's "value of runs.replay_count when this
+	// attempt was dispatched".
+	//
+	// It is on the wire because SPEC.md 14 resets steps.attempt_count on a
+	// replay: after one, the live counter no longer says what the failed round
+	// burned, and attempt_no stays contiguous across rounds, so nothing else in
+	// this response distinguishes an attempt of round 0 from one of round 1.
+	// The column has always been there; only the client could not see it.
+	ReplayRound int `json:"replay_round"`
+
 	Status         string     `json:"status"`
 	ConnectionMode string     `json:"connection_mode"`
 	DeadlineAt     time.Time  `json:"deadline_at"`
@@ -526,6 +549,7 @@ func (a *API) getRunSteps(w http.ResponseWriter, r *http.Request) {
 		byStep[at.StepID] = append(byStep[at.StepID], attemptSummary{
 			AttemptID:      at.AttemptID,
 			AttemptNo:      at.AttemptNo,
+			ReplayRound:    at.ReplayRound,
 			Status:         at.Status,
 			ConnectionMode: at.ConnectionMode,
 			DeadlineAt:     at.DeadlineAt,
@@ -544,6 +568,210 @@ func (a *API) getRunSteps(w http.ResponseWriter, r *http.Request) {
 		out = append(out, summary)
 	}
 	a.writeJSON(w, http.StatusOK, map[string]any{"run_id": runID, "steps": out})
+}
+
+// ---------------------------------------------------------------------------
+// SPEC.md 10.2 — the collection reads
+// ---------------------------------------------------------------------------
+
+// runSummary is one row of GET /runs.
+//
+// It carries neither the run's input nor its steps. SPEC.md 10.2 calls the
+// catalogue "cheap and may be fetched whole" against outputs that "may be large
+// and are fetched individually", and the same split applies one level up: a
+// list of every run this deployment has ever executed is no place to inline a
+// workflow input of unknown size.
+type runSummary struct {
+	RunID               string     `json:"run_id"`
+	WorkflowID          string     `json:"workflow_id"`
+	Status              string     `json:"status"`
+	PlannerAttemptCount int        `json:"planner_attempt_count"`
+	ReplayCount         int        `json:"replay_count"`
+	OwnerID             *string    `json:"owner_id"`
+	ClaimedAt           *time.Time `json:"claimed_at"`
+	CreatedAt           time.Time  `json:"created_at"`
+}
+
+// SPEC.md 10.2's limits on GET /runs.
+const (
+	runsLimitDefault = 50
+	runsLimitMax     = 200
+)
+
+// listRuns is SPEC.md 10.2's GET /runs.
+func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
+	q, bad := parseRunQuery(r)
+	if bad != nil {
+		a.writeError(w, http.StatusBadRequest, *bad)
+		return
+	}
+
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	defer cancel()
+
+	// One more than asked for. Whether a further page exists is a question
+	// about the row AFTER this page, and fetching it is the only way to answer
+	// it without a second query — a count would be a second query whose answer
+	// could already be stale.
+	q.Limit++
+	runs, err := a.store.ListRuns(ctx, q)
+	if err != nil {
+		a.writeStorageError(w, "cannot list runs", err)
+		return
+	}
+
+	body := map[string]any{}
+	if len(runs) == q.Limit {
+		last := runs[q.Limit-2]
+		runs = runs[:q.Limit-1]
+		body["next_cursor"] = encodeCursor(last.CreatedAt, last.RunID)
+	}
+
+	out := make([]runSummary, 0, len(runs))
+	for _, run := range runs {
+		out = append(out, runSummary{
+			RunID:               run.RunID,
+			WorkflowID:          run.WorkflowID,
+			Status:              run.Status,
+			PlannerAttemptCount: run.PlannerAttemptCount,
+			ReplayCount:         run.ReplayCount,
+			OwnerID:             run.OwnerID,
+			ClaimedAt:           run.ClaimedAt,
+			CreatedAt:           run.CreatedAt,
+		})
+	}
+	body["runs"] = out
+	a.writeJSON(w, http.StatusOK, body)
+}
+
+// parseRunQuery reads SPEC.md 10.2's three parameters, refusing anything it
+// does not recognise.
+//
+// SPEC.md 10.2 says an unknown `status` is a 400 "as §16 requires of every
+// other input", and §16's strictness principle is why the same applies to a
+// limit out of range and a cursor that does not decode: silently clamping a
+// limit of 5000 to 200, or ignoring a corrupt cursor and returning page one,
+// hands the caller a plausible answer to a question it did not ask.
+func parseRunQuery(r *http.Request) (storage.RunQuery, *errorBody) {
+	q := storage.RunQuery{Limit: runsLimitDefault}
+	values := r.URL.Query()
+
+	// SPEC.md 10.2: `status` is repeatable.
+	for _, s := range values["status"] {
+		if !model.IsRunStatus(s) {
+			return q, &errorBody{
+				Error: slugInvalidRequest,
+				Message: fmt.Sprintf("status %q is not one of %s (SPEC.md 5.1, SPEC.md 10.2)",
+					s, strings.Join(model.RunStatuses(), ", ")),
+			}
+		}
+		q.Statuses = append(q.Statuses, s)
+	}
+
+	if raw := values.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > runsLimitMax {
+			return q, &errorBody{
+				Error: slugInvalidRequest,
+				Message: fmt.Sprintf("limit must be an integer from 1 to %d (SPEC.md 10.2); got %q",
+					runsLimitMax, raw),
+			}
+		}
+		q.Limit = n
+	}
+
+	if raw := values.Get("cursor"); raw != "" {
+		cursor, err := decodeCursor(raw)
+		if err != nil {
+			return q, &errorBody{
+				Error:   slugInvalidRequest,
+				Message: "cursor is not one this API issued (SPEC.md 10.2): " + err.Error(),
+			}
+		}
+		q.Cursor = cursor
+	}
+
+	return q, nil
+}
+
+// The cursor is opaque to the client by SPEC.md 10.2 and carries the sort key
+// of the last run of the previous page — the pair the ordering is defined on.
+//
+// Opaque means the client must not parse it, not that it must be encrypted:
+// nothing in it is secret, and a run_id is already in the response beside it.
+// The encoding exists so that a change of sort key is not a change of wire
+// format.
+func encodeCursor(createdAt time.Time, runID string) string {
+	return base64.RawURLEncoding.EncodeToString(
+		[]byte(createdAt.UTC().Format(time.RFC3339Nano) + "|" + runID))
+}
+
+func decodeCursor(raw string) (*storage.RunCursor, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, errors.New("it is not valid base64")
+	}
+	at, id, ok := strings.Cut(string(decoded), "|")
+	if !ok {
+		return nil, errors.New("it does not name a position")
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return nil, errors.New("it does not carry a timestamp")
+	}
+	return &storage.RunCursor{CreatedAt: createdAt, RunID: id}, nil
+}
+
+// dlqEntryBody is one row of GET /runs/{run_id}/dlq (SPEC.md 6.5).
+type dlqEntryBody struct {
+	DLQID string `json:"dlq_id"`
+
+	// StepID is null for a planner-side entry (SPEC.md 6.5). It is the field
+	// that tells a client which side of SPEC.md 12.3 killed the run, and it is
+	// a pointer rather than an empty string for exactly that reason: "" and
+	// "no step" are different answers.
+	StepID *string `json:"step_id"`
+
+	Reason      string    `json:"reason"`
+	ReplayRound int       `json:"replay_round"`
+	ErrorText   string    `json:"error_text"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// getRunDLQ is SPEC.md 10.2's GET /runs/{run_id}/dlq.
+func (a *API) getRunDLQ(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("run_id")
+
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	defer cancel()
+
+	// The run is read first, so that a request for a run that does not exist
+	// is SPEC.md 10.5's 404 rather than an empty history — which would say
+	// "this run stopped for no reason" about a run that is not there. SPEC.md
+	// 10.2 requires the two answers to be distinguishable: "a run with no
+	// entries is an empty list with a 200, not a 404".
+	if _, err := a.store.GetRun(ctx, runID); err != nil {
+		a.writeStorageError(w, "no run with that run_id", err)
+		return
+	}
+	entries, err := a.store.ListDeadLetters(ctx, runID)
+	if err != nil {
+		a.writeStorageError(w, "cannot read the run's dead-letter history", err)
+		return
+	}
+
+	out := make([]dlqEntryBody, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, dlqEntryBody{
+			DLQID:       e.DLQID,
+			StepID:      e.StepID,
+			Reason:      e.Reason,
+			ReplayRound: e.ReplayRound,
+			ErrorText:   e.ErrorText,
+			CreatedAt:   e.CreatedAt,
+		})
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"run_id": runID, "entries": out})
 }
 
 // getStepOutput is SPEC.md 10.2's GET /steps/{step_id}/output: "that step's
