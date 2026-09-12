@@ -332,6 +332,26 @@ the second is the serious one:
    point it at cloud metadata addresses or anything else your host can reach.
 
 A public deployment therefore needs something in front that holds a credential, rate-limits run
-creation, and **validates `worker_url` against an allowlist before forwarding `POST /workflows`**.
-That is a deployment concern and not part of Piton, which is why it is a warning here rather than a
-rule in `SPEC.md`.
+creation, and **checks `worker_url` before forwarding `POST /workflows`**. That is a deployment
+concern and not part of Piton, which is why it is a warning here rather than a rule in `SPEC.md`.
+
+**The check is a property of the address, not a list of hosts.** Blocking everything except a few
+known workers would keep the host safe and destroy the point of the system — `§ 9.5` exists so that
+*any* unmodifiable HTTP endpoint is a valid worker. Resolve the hostname instead and refuse only
+what is not public:
+
+| Refuse | |
+|---|---|
+| `127.0.0.0/8` | loopback |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | private networks — Docker's bridge is in the second |
+| `169.254.0.0/16` | link-local, where cloud metadata lives |
+| `::1`, `fc00::/7`, `fe80::/10` | the IPv6 equivalents |
+
+Everything else is allowed, so a user can still point a step at their own public endpoint.
+
+**Why this matters more than it looks:** the worker's response becomes the step's stored output, and
+the same caller can read it back with `GET /steps/{step_id}/output`. An unchecked `worker_url` is
+not a blind request — it returns the contents of whatever it reached.
+
+A fuller account, including the residual DNS-rebinding risk this does not close, is in
+`demos/console/README.md`.

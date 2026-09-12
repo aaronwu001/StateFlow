@@ -144,18 +144,82 @@ client.
 
 ---
 
-## Before this is reachable from the internet
+## Deploying this where other people can reach it
 
-`SPEC.md § 2.2`: **"Authentication or authorisation — out of scope entirely."** Two consequences,
-and the second is the serious one.
+### The machine
 
-A publicly reachable Piton is an unauthenticated control plane: anyone can create workflows and
-start runs against your database. And a StepSpec's `worker_url` is **any absolute HTTP(S) URL that
-the orchestrator will POST to** (`§ 9.4`, `§ 9.5`) — so an exposed deployment is a server-side
-request forgery engine, able to reach cloud metadata addresses and anything else on your host's
-network.
+A $12/month VPS is enough — DigitalOcean's 2 GB droplet, Ubuntu 24.04 LTS, with their Docker
+one-click image so Docker and Compose are already installed. It idles at roughly 150 MB; the 2 GB is
+for the **first build**, which compiles the Go binary on the machine. You can drop to 1 GB
+afterwards.
 
-A public deployment needs something in front of it that holds a credential, rate-limits run
-creation, and validates `worker_url` against an allowlist before forwarding `POST /workflows`. That
-is a deployment concern rather than a rule about the system, which is why it is a warning here and
-not a line in `SPEC.md`.
+**Run nothing else on that host.** That is not tidiness — it is the condition under which the
+residual risk below is acceptable.
+
+```bash
+git clone <repo> piton && cd piton/demos/console
+
+echo "DEMO_KEY=$(openssl rand -hex 24)" > .env
+
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+`ufw allow 22 && ufw allow 8080 && ufw enable`. Nothing but Caddy is published.
+
+### The two gates, and why there are two
+
+```
+browser ──▶ your app's backend ──▶ Caddy ──▶ Piton
+              (gate 2)            (gate 1)
+```
+
+| | **Caddy** | **Your app's backend** |
+|---|---|---|
+| Where | on this host, from `docker-compose.prod.yml` | wherever the front end is hosted |
+| Checks | the `X-Demo-Key` header | the **`worker_url`** in the request body |
+| Why it cannot do the other one | it does not read request bodies | it is not on this host |
+
+The key lives only in the backend's environment. **A browser must never hold it** — anything the
+browser holds is public.
+
+### The `worker_url` rule
+
+`SPEC.md § 2.2` puts authorisation out of Piton's scope, and `§ 9.5` makes `worker_url` **any
+absolute HTTP(S) URL that the orchestrator will POST to**. That is the product, not a defect: raw
+dispatch exists so that *"any unmodifiable HTTP endpoint is a valid worker"*. Piton has no notion of
+a caller, so it cannot ask whether *this* caller may aim at *that* address.
+
+The danger is not a stranger's URL. It is an **internal** one:
+
+```
+http://169.254.169.254/...   cloud metadata — leaks the host's credentials
+http://127.0.0.1:5432        this deployment's own Postgres
+http://10.x.x.x/...          anything else on the private network
+```
+
+and it is worse than a blind request: the response becomes the step's stored output, which the same
+person then reads back with `GET /steps/{step_id}/output`.
+
+**So the rule is not a list of allowed hosts — it is a property of the address.** Resolve the
+hostname and refuse anything that is not a public address:
+
+| Blocked | |
+|---|---|
+| `127.0.0.0/8` | loopback |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | private — Docker's own bridge lives in the second |
+| `169.254.0.0/16` | link-local, which is where cloud metadata sits |
+| `::1`, `fc00::/7`, `fe80::/10` | the IPv6 equivalents |
+
+Everything else is allowed. A visitor can point a step at their own `https://…` endpoint and watch
+it run, which is the demonstration this whole environment exists for — an allowlist of only the
+services in this compose file would keep the machine safe and throw that away.
+
+**Where it goes: the app backend**, because `worker_url` is in the request body and Caddy cannot see
+it. Coverage is complete as long as the key is the only way in: every `POST /workflows` must pass
+through the backend that holds it.
+
+**Residual risk, stated rather than implied.** DNS rebinding defeats a check-then-connect approach —
+the name resolves to a public address when the backend checks it and to a private one when the
+orchestrator connects. Closing that properly means resolving once and connecting to the pinned IP,
+which Piton does not do. For a demo on a host that runs nothing else, that is the risk you are
+accepting.
