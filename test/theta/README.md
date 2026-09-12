@@ -63,11 +63,14 @@ mean two places to fix when one rule changes.
 `CLAUDE.md § 5.1` permits exactly one source: `SPEC.md`. Every assertion names the section it came
 from, and a failure reports that section rather than only the query that returned false.
 
-Nothing was derived by reading the implementation. At the time this suite was written raw dispatch
-does not exist — `internal/dispatch` answers a raw step with an explicit *"milestone theta and is
-not implemented in this build"* failure — so **every group here fails until the code lands**, and
-both runs in `rawfailure` reach DLQ for the wrong reason. That is the expected state, not a defect,
-and it is what `§ 4` step 3 is for.
+Nothing was derived by reading the implementation, and the order is on the record rather than
+claimed. When this suite was written raw dispatch did not exist: `internal/dispatch` answered every
+raw step with an explicit *"milestone theta and is not implemented in this build"* failure. It was
+**run in that state**, and what it reported is what `§ 4` step 3 exists to produce — every
+assertion in `rawpath` red, and `rawfailure` reporting that the not-JSON run had been labelled
+`transport_error` rather than `invalid_response`, because nothing had been sent to the endpoint at
+all. The implementation landed afterwards, and the same assertions went green without one of them
+being edited.
 
 One rule in this suite is younger than the rest. `§ 9.6`'s requirement that a raw worker's body be a
 valid JSON document was ruled at round 48, because `§ 9.6` promised that the entire body verbatim is

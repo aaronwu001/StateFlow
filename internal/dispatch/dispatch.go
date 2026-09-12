@@ -87,38 +87,55 @@ func Do(ctx context.Context, client *http.Client, spec *validate.Spec, id Identi
 	inputs map[string][]byte, timeout time.Duration) Outcome {
 
 	// SPEC.md 9.7's table of legal mode combinations names the milestone each
-	// one arrives in. α implements the first: sync + envelope. The other two
-	// legal combinations are θ and ε, and SPEC.md 19.3 keeps them designed in
-	// and unbuilt.
+	// one arrives in. α implemented sync + envelope and θ adds sync + raw; the
+	// remaining legal combination is async + envelope, which is ε, and SPEC.md
+	// 19.3 keeps it designed in and unbuilt. async + raw never becomes legal,
+	// and internal/validate rejects it at submission (SPEC.md 9.8 rule 3), so
+	// it cannot arrive here.
 	//
 	// An unimplemented combination is reported as one failed attempt rather
 	// than silently skipped, so that the run converges to DLQ under SPEC.md
 	// 12.2's budget instead of sitting RUNNING forever, and so that the reason
 	// is legible in the database (SPEC.md 17.3) rather than only in a log.
-	switch {
-	case spec.ConnectionMode == model.ConnectionSync && spec.DispatchStyle == model.DispatchEnvelope:
-	case spec.DispatchStyle == model.DispatchRaw:
-		return failure(model.FailureTransportError,
-			"piton: dispatch_style %q is milestone theta and is not implemented in this build "+
-				"(SPEC.md 9.7, SPEC.md 19.3); nothing was sent to %s",
-			spec.DispatchStyle, spec.WorkerURL)
-	default:
+	if spec.ConnectionMode != model.ConnectionSync {
 		return failure(model.FailureTransportError,
 			"piton: connection_mode %q is milestone epsilon and is not implemented in this build "+
 				"(SPEC.md 9.7, SPEC.md 19.3); nothing was sent to %s",
 			spec.ConnectionMode, spec.WorkerURL)
 	}
 
-	body, err := json.Marshal(envelope{
-		RunID:          id.RunID,
-		StepID:         id.StepID,
-		AttemptID:      id.AttemptID,
-		ConnectionMode: spec.ConnectionMode,
-		Params:         spec.Params,
-		Inputs:         rawInputs(inputs),
-	})
-	if err != nil {
-		return failure(model.FailureTransportError, "piton: cannot build the dispatch envelope: %v", err)
+	// What goes on the wire, per SPEC.md 9.5.
+	//
+	// In raw mode the body is "params, verbatim and nothing else" — no run_id,
+	// no step_id, no attempt_id, no connection_mode, no inputs. SPEC.md 9.5
+	// says why: raw exists so that an unmodifiable endpoint is a valid worker,
+	// and "you cannot add fields to such an endpoint's request body".
+	//
+	// `inputs` is therefore not assembled into anything here. A raw StepSpec
+	// cannot carry input_from at all (SPEC.md 9.8 rule 4), so nothing the
+	// planner asked for is being dropped.
+	var body []byte
+	if spec.DispatchStyle == model.DispatchRaw {
+		// spec.Params is already defaulted to {} when the StepSpec omitted the
+		// key (SPEC.md 9.4), so this is never empty and never needs shaping.
+		// Shaping it is precisely what raw forbids: a key inside params named
+		// input_from is ordinary data and becomes a top-level key of this body
+		// (SPEC.md 9.5), which is true here by construction rather than by a
+		// rule this function has to remember.
+		body = spec.Params
+	} else {
+		var err error
+		body, err = json.Marshal(envelope{
+			RunID:          id.RunID,
+			StepID:         id.StepID,
+			AttemptID:      id.AttemptID,
+			ConnectionMode: spec.ConnectionMode,
+			Params:         spec.Params,
+			Inputs:         rawInputs(inputs),
+		})
+		if err != nil {
+			return failure(model.FailureTransportError, "piton: cannot build the dispatch envelope: %v", err)
+		}
 	}
 
 	// SPEC.md 13.3: the in-process timer is "a latency optimisation that makes
@@ -151,9 +168,36 @@ func Do(ctx context.Context, client *http.Client, spec *validate.Spec, id Identi
 
 	// SPEC.md 9.6: "a transport-level failure is always a failure regardless of
 	// body — non-2xx, connection refused, timeout."
+	//
+	// One rule, both dispatch styles. In raw mode SPEC.md 9.6 adds what becomes
+	// of the body — "the truncated body is stored as error text" — and that is
+	// what this ErrorText is; the 4 KB cut is applied at the write (SPEC.md
+	// 6.4: "the orchestrator truncates before writing").
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return Outcome{ErrorText: fmt.Sprintf("piton: worker %s answered HTTP %d: %s",
 			spec.WorkerURL, resp.StatusCode, string(raw))}
+	}
+
+	// SPEC.md 9.6, raw mode: "any 2xx" succeeds and "the entire response body
+	// verbatim is the output". The reply is NOT inspected — a raw worker was
+	// never told about Piton, so a body that happens to carry the words
+	// `status` and `error` is a stranger's document and not this system's
+	// protocol. Reading it as an envelope would put Piton's meaning on a value
+	// the worker never intended.
+	//
+	// The one thing required of it is that it be a JSON document. SPEC.md 9.6:
+	// a 2xx whose body cannot be parsed as JSON is invalid_response, because
+	// SPEC.md 6.3 and 6.4 store an output as JSON bytes and the alternatives —
+	// wrapping the body in a JSON string, or widening the column — were ruled
+	// against. An empty body is caught by the same check: it is not a document.
+	if spec.DispatchStyle == model.DispatchRaw {
+		if !json.Valid(raw) {
+			return failure(model.FailureInvalidResponse,
+				"piton: worker %s answered HTTP %d with a body that is not a JSON document "+
+					"(SPEC.md 9.6 requires one in raw mode): %s",
+				spec.WorkerURL, resp.StatusCode, string(raw))
+		}
+		return Outcome{Success: true, Output: raw}
 	}
 
 	var reply workerReply
