@@ -192,9 +192,14 @@ diagnose() {
   show "SELECT attempt_no, status, connection_mode, failure_reason,
                left(coalesce(error_text, ''), 200) AS error_text_200
           FROM attempts WHERE run_id = :'run' ORDER BY started_at;"
-  show "SELECT reason, replay_round, attempt_count,
+  show "SELECT reason, replay_round,
                left(error_text, 200) AS error_text_200
           FROM dead_letter_queue WHERE run_id = :'run' ORDER BY created_at;"
+  # SPEC.md 6.5 no longer copies the budget consumed onto the entry. How much a
+  # round burned is a count of the attempts carrying its replay_round, read from
+  # the table that owns the number.
+  show "SELECT a.replay_round, count(*) AS attempts_in_that_round
+          FROM attempts a WHERE a.run_id = :'run' GROUP BY 1 ORDER BY 1;"
   hr "orchestrator logs (last 60 lines)"
   docker compose logs --tail=60 orchestrator || true
 }

@@ -1,0 +1,18 @@
+{
+  "name": "theta-raw-not-json",
+  "planner_type": "static",
+  "step_timeout_seconds": 300,
+  "step_max_attempts": 2,
+  "step_retry_delay_seconds": 0,
+  "planner_timeout_seconds": 30,
+  "planner_max_attempts": 3,
+  "planner_static_steps": [
+    {
+      "step_name": "prose",
+      "worker_url": "http://rawapi:9091/plaintext",
+      "connection_mode": "sync",
+      "dispatch_style": "raw",
+      "params": { "note": "this endpoint answers 200 with prose; SPEC.md 9.6 requires a raw worker's body to be a valid JSON document" }
+    }
+  ]
+}

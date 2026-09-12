@@ -1,0 +1,40 @@
+# Milestone theta - the orchestrator's boot configuration.
+#
+# SPEC.md 4.4: "The orchestrator reads one YAML configuration file at boot. It
+# declares at minimum the storage backend and its connection details, the HTTP
+# listen address, the sweep interval, the heartbeat interval and the lease TTL."
+#
+# SPEC.md fixes WHAT this file must declare, not the key names. The names below
+# are the ones every other milestone's environment already uses; theta changes
+# none of them, because theta changes nothing about how the orchestrator boots.
+# What it changes is what a step may talk to (SPEC.md 9.5, 9.6), and that lives
+# in workflow.json, not here.
+
+storage:
+  # SPEC.md 4.4: "The storage backend is a value in that file", in support of
+  # the storage abstraction of SPEC.md 7. Postgres is today's only
+  # implementation, not a hard-coded assumption.
+  backend: postgres
+
+  # `postgres` is the compose service name (docker-compose.yml), not localhost:
+  # SPEC.md 4.4 states the database "is not assumed to be on the same host".
+  dsn: "postgres://piton:piton@postgres:5432/piton?sslmode=disable"
+
+http:
+  # Container-internal. The host reaches this through the published port in
+  # docker-compose.yml.
+  listen_address: "0.0.0.0:8080"
+
+# The three numbers that govern ownership, written out at their SPEC defaults so
+# that an operator reading this file sees all three in one place.
+#
+#   sweep_interval_seconds     SPEC.md 8.6 - "5 seconds by default". It is also
+#                              the width of SPEC.md 13.3's uncertainty window.
+#   heartbeat_interval_seconds SPEC.md 8.7 - heartbeat every 10 s.
+#   lease_ttl_seconds          SPEC.md 8.7 - 30 s, which tolerates two missed
+#                              heartbeats before another orchestrator may take
+#                              over. An orchestrator is live iff
+#                              last_seen_at > now() - lease_ttl.
+sweep_interval_seconds: 5
+heartbeat_interval_seconds: 10
+lease_ttl_seconds: 30

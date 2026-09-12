@@ -259,8 +259,15 @@ show "the state SPEC.md 5.5 calls L4 - run DLQ, last step DLQ" \
     WHERE r.run_id = :'run' ORDER BY s.seq;" "run=$RUN1"
 
 show "SPEC.md 6.5: the dead-letter entry, and the round it belonged to" \
-  "SELECT reason, replay_round, attempt_count, left(error_text, 60) AS error_text
+  "SELECT reason, replay_round, left(error_text, 60) AS error_text
      FROM dead_letter_queue WHERE run_id = :'run';" "run=$RUN1"
+
+# SPEC.md 6.5 no longer copies the budget consumed onto the entry. How much the
+# failed round burned is a count of the attempts carrying its replay_round, read
+# from the table that owns the number (SPEC.md 6.4).
+show "SPEC.md 6.4, 6.5: how many attempts that round actually burned" \
+  "SELECT a.replay_round, count(*) AS attempts_in_that_round
+     FROM attempts a WHERE a.run_id = :'run' GROUP BY 1 ORDER BY 1;" "run=$RUN1"
 
 STEPS_BEFORE="$(psql_q "SELECT count(*) FROM steps WHERE run_id = :'run';" "run=$RUN1")"
 DLQ_BEFORE="$(psql_q "SELECT md5(string_agg(dlq_id::text || reason || replay_round ||

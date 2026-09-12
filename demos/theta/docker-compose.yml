@@ -1,0 +1,295 @@
+# Milestone theta - environment definition.
+#
+# SPEC.md 18's table gives theta one capability: "sync raw body - an
+# unmodifiable HTTP endpoint works as a worker". The whole point of the
+# milestone is that the endpoint was never told about Piton, so this file has
+# FOUR services rather than alpha's three: the third is Piton's own echo worker,
+# which speaks the envelope, and the fourth is an ordinary JSON API that does
+# not.
+#
+# WHY BOTH WORKERS
+#   A raw-only environment would show that raw dispatch works and nothing about
+#   what it is for. SPEC.md 9.5's inputs is "a map from step_id to that step's
+#   stored output", with no exemption for a step that ran in raw mode - so a raw
+#   worker's result must reach the next worker like any other. That claim needs
+#   one of each in a single run, which is what workflow.json builds.
+#
+# SPEC.md 4.4 requires the orchestrator and the database to be separate
+# containers, and requires that the automated suite reference THIS file rather
+# than define an environment of its own (CLAUDE.md 5.5.4), so that the owner's
+# hand-run demo and the suite run against an identical definition.
+#
+# Teardown between runs is `docker compose down -v`. The volume wipe is not
+# optional: CLAUDE.md 5.5.2 requires every group to start from a clean database.
+
+name: piton-theta
+
+services:
+
+  # ---------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: piton
+      POSTGRES_PASSWORD: piton
+      POSTGRES_DB: piton
+    volumes:
+      # Postgres 18+ wants ONE mount at /var/lib/postgresql, not at
+      # /var/lib/postgresql/data as every pre-18 example shows. The image
+      # refuses to start with the older mount point. See
+      # docker-library/postgres#1259.
+      - pgdata:/var/lib/postgresql
+    # No host port is published, deliberately - a fixed one collides with any
+    # Postgres the operator already runs. SPEC.md 17.1's terminal access is
+    #
+    #   docker compose exec -T postgres psql -U piton -d piton
+    #
+    # which needs nothing installed on the host, and is what demo.sh uses.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piton -d piton"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------ orchestrator
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile_inline: |
+        FROM golang:1.27-alpine AS build
+        WORKDIR /src
+        COPY . .
+        RUN CGO_ENABLED=0 go build -trimpath -o /out/piton ./cmd/piton
+
+        FROM alpine:3.22
+        COPY --from=build /out/piton /usr/local/bin/piton
+        ENTRYPOINT ["/usr/local/bin/piton"]
+    command: ["--config", "/etc/piton/piton.yaml"]
+    volumes:
+      - ./piton.yaml:/etc/piton/piton.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Demo determinism, not an architectural dependency: a worker that was
+      # not yet listening when a step dispatched would fail the attempt with
+      # transport_error (SPEC.md 5.3) and be retried, and theta's assertion
+      # that the happy path takes exactly one attempt would then fail for a
+      # reason unrelated to the code under test.
+      worker:
+        condition: service_healthy
+      rawapi:
+        condition: service_healthy
+    # The orchestrator applies migrations at boot and binds its listener only
+    # afterwards, so a 200 from /healthz is proof that migrations finished.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+
+  # ------------------------------------------------------------------ worker
+  #
+  # Piton's own echo worker: sync + envelope, alpha's service unchanged in
+  # contract. It exists here for one assertion - that a raw step's stored output
+  # reaches the next step as SPEC.md 9.5's `inputs`, exactly as an envelope
+  # step's would.
+  worker:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        # The fields SPEC.md 9.5 defines for a sync envelope.
+        REQUIRED = ("run_id", "step_id", "attempt_id",
+                    "connection_mode", "params", "inputs")
+        KNOWN = set(REQUIRED) | {"callback_url"}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._reply(200, {"status": "ok"})
+                else:
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+
+            def do_POST(self):
+                if self.path != "/echo":
+                    self._reply(404, {"status": "failure",
+                                      "error": "no such path: " + self.path})
+                    return
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length) if length else b""
+                try:
+                    env = json.loads(body or b"{}")
+                except Exception as exc:
+                    self._reply(400, {"status": "failure",
+                                      "error": "unparseable body: %s" % exc})
+                    return
+                if not isinstance(env, dict):
+                    self._reply(400, {"status": "failure",
+                                      "error": "envelope is not a JSON object"})
+                    return
+
+                inputs = env.get("inputs")
+                observed = {
+                    "run_id": env.get("run_id"),
+                    "step_id": env.get("step_id"),
+                    "attempt_id": env.get("attempt_id"),
+                    "connection_mode": env.get("connection_mode"),
+                    "params": env.get("params"),
+                    # SPEC.md 9.5: inputs maps step_id -> that step's output.
+                    # theta asserts the VALUES, not only the keys: the previous
+                    # step ran in raw mode, and what it deposited is what must
+                    # arrive here.
+                    "inputs": inputs if isinstance(inputs, dict) else None,
+                    "input_step_ids": sorted(inputs) if isinstance(inputs, dict) else None,
+                    "input_count": len(inputs) if isinstance(inputs, dict) else None,
+                    # SPEC.md 9.5: present iff connection_mode == "async".
+                    "has_callback_url": "callback_url" in env,
+                    "missing_envelope_fields": sorted(k for k in REQUIRED if k not in env),
+                    "unknown_envelope_fields": sorted(set(env) - KNOWN),
+                }
+                # SPEC.md 9.6, the sync + envelope success shape.
+                self._reply(200, {"status": "success", "output": {"echo": observed}})
+
+            def _reply(self, code, payload):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("worker: " + (fmt % args), flush=True)
+
+        print("worker: listening on 0.0.0.0:9090", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9090/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  # ------------------------------------------------------------------ rawapi
+  #
+  # THE MILESTONE'S SUBJECT: an ordinary JSON API that has never heard of Piton.
+  #
+  # It is written the way a third-party service is written. It does not know
+  # what a run, a step or an attempt is; it does not look for `status` or
+  # `output`; it has no idea that anything is retrying it. SPEC.md 9.5's reason
+  # for raw existing is exactly this endpoint: "you cannot add fields to such an
+  # endpoint's request body".
+  #
+  # WHY IT ECHOES WHAT IT RECEIVED
+  #   SPEC.md 9.5 says the raw body is "params, verbatim and nothing else", sent
+  #   with content-type: application/json. Those are claims about a wire that
+  #   leaves no trace of its own. By returning what it saw, the wire becomes a
+  #   value in steps.output that demo.sh can assert in SQL and the owner can
+  #   read at a terminal (SPEC.md 17.1). Echoing a request back for debugging is
+  #   something an ordinary API does; it is not Piton knowledge.
+  rawapi:
+    image: python:3.13-alpine
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                if self.path == "/healthz":
+                    self._json(200, {"ok": True})
+                else:
+                    self._json(404, {"error": "no such path: " + self.path})
+
+            def do_POST(self):
+                length = int(self.headers.get("content-length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                ctype = self.headers.get("content-type")
+
+                # /boom answers non-2xx and never looks at the body. SPEC.md
+                # 9.6: "any non-2xx" is a failure and "the truncated body is
+                # stored as error text". The body is deliberately far longer
+                # than SPEC.md 6.4's 4 KB limit, so that the truncation is
+                # observable rather than assumed.
+                if self.path == "/boom":
+                    self._raw(500, "application/json",
+                              json.dumps({"error": "B" * 10000}).encode("utf-8"))
+                    return
+
+                # /plaintext answers 2xx with a body that is not JSON. SPEC.md
+                # 9.6 makes that invalid_response (SPEC.md 5.3): a reply
+                # arrived and could not be parsed as the mode requires.
+                if self.path == "/plaintext":
+                    self._raw(200, "text/plain; charset=utf-8",
+                              b"hello - this endpoint answers prose, not JSON")
+                    return
+
+                try:
+                    body = json.loads(raw or b"{}")
+                except Exception as exc:
+                    self._json(400, {"error": "unparseable body: %s" % exc})
+                    return
+
+                # /looks-like-envelope answers 2xx with a document that happens
+                # to use the words `status` and `error`. Plenty of real APIs do.
+                # SPEC.md 9.6's raw row says "any 2xx" succeeds and "the entire
+                # response body verbatim is the output" - raw does not inspect
+                # payload content, so this must be stored whole and its step
+                # must reach DONE.
+                if self.path == "/looks-like-envelope":
+                    self._json(200, {"status": "failure",
+                                     "error": "this endpoint has never heard of Piton"})
+                    return
+
+                if self.path != "/uppercase":
+                    self._json(404, {"error": "no such path: " + self.path})
+                    return
+
+                text = body.get("text") if isinstance(body, dict) else None
+                self._json(200, {
+                    "upper": text.upper() if isinstance(text, str) else None,
+                    # What actually arrived on the wire.
+                    "seen_body": body,
+                    "seen_content_type": ctype,
+                    "seen_top_level_keys": sorted(body) if isinstance(body, dict) else None,
+                })
+
+            def _json(self, code, payload):
+                self._raw(code, "application/json",
+                          json.dumps(payload).encode("utf-8"))
+
+            def _raw(self, code, ctype, raw):
+                self.send_response(code)
+                self.send_header("content-type", ctype)
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt, *args):
+                print("rawapi: " + (fmt % args), flush=True)
+
+        print("rawapi: listening on 0.0.0.0:9091", flush=True)
+        ThreadingHTTPServer(("0.0.0.0", 9091), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:9091/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  pgdata:

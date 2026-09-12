@@ -1,0 +1,18 @@
+{
+  "name": "theta-raw-non2xx",
+  "planner_type": "static",
+  "step_timeout_seconds": 300,
+  "step_max_attempts": 2,
+  "step_retry_delay_seconds": 0,
+  "planner_timeout_seconds": 30,
+  "planner_max_attempts": 3,
+  "planner_static_steps": [
+    {
+      "step_name": "boom",
+      "worker_url": "http://rawapi:9091/boom",
+      "connection_mode": "sync",
+      "dispatch_style": "raw",
+      "params": { "note": "this endpoint answers HTTP 500 with a body far longer than SPEC.md 6.4's 4 KB limit" }
+    }
+  ]
+}

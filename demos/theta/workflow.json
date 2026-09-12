@@ -1,0 +1,37 @@
+{
+  "name": "theta-raw-pipeline",
+  "planner_type": "static",
+  "step_timeout_seconds": 300,
+  "step_max_attempts": 3,
+  "step_retry_delay_seconds": 0,
+  "planner_timeout_seconds": 30,
+  "planner_max_attempts": 3,
+  "planner_static_steps": [
+    {
+      "step_name": "uppercase",
+      "worker_url": "http://rawapi:9091/uppercase",
+      "connection_mode": "sync",
+      "dispatch_style": "raw",
+      "params": {
+        "text": "hello",
+        "input_from": "SPEC.md 9.5: a key literally named input_from INSIDE params is ordinary data, transmitted verbatim, and becomes a top-level key of the raw body"
+      }
+    },
+    {
+      "step_name": "masquerade",
+      "worker_url": "http://rawapi:9091/looks-like-envelope",
+      "connection_mode": "sync",
+      "dispatch_style": "raw",
+      "params": {
+        "note": "this endpoint answers 2xx with a document that happens to use the words status and error; SPEC.md 9.6 says any 2xx succeeds and the entire body verbatim is the output"
+      }
+    },
+    {
+      "step_name": "report",
+      "worker_url": "http://worker:9090/echo",
+      "connection_mode": "sync",
+      "dispatch_style": "envelope",
+      "params": { "stage": "report" }
+    }
+  ]
+}
